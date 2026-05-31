@@ -1,0 +1,83 @@
+# Per-PR regex benchmark: build the zeetah runtime + comptime-DFA harnesses
+# against this PR (candidate) and its base branch (baseline), diff the
+# per-workload throughput, and post the result as a sticky PR comment. The job
+# turns red on a correctness divergence or a >REGRESSION_PCT slowdown.
+#
+# The benchmark harness lives in a SEPARATE repo (zeetah-benchmark); this
+# workflow clones it. Set the two BENCH_REPO_* values below to point at it.
+#
+# Runs on macOS because the harness timing uses a Darwin-only monotonic clock
+# (clock_gettime UPTIME_RAW). Only the zeetah engine is built — the cross-engine
+# competitors don't change between branches — so no Homebrew/cargo/dotnet is
+# needed, just zig + python3.
+name: Benchmark (PR compare)
+
+on:
+  pull_request:
+    branches: [main]
+
+# Cancel a stale run when the PR is updated.
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write   # to post / update the sticky comment
+
+env:
+  # --- benchmark harness repo (EDIT THESE) -------------------------------
+  BENCH_REPO_URL: https://github.com/DaliVana/zeetah-benchmark.git
+  BENCH_REPO_REF: main
+  # --- zig toolchain -----------------------------------------------------
+  # Must match the version that compiles BOTH the engine and the harness. The
+  # harness is validated on 0.16.0 (the benchmark's pinned toolchain). Note the
+  # engine's own ci.yml builds on 0.17.0-dev.56+a8226cd53 — if the engine source
+  # ever needs that newer toolchain, bump this to match. First knob on a build break.
+  ZIG_VERSION: '0.16.0'
+  # Fail the job if any reliably-measured workload slows by more than this %.
+  REGRESSION_PCT: '10'
+
+jobs:
+  compare:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout zeetah PR (candidate)
+        uses: actions/checkout@v6
+        with:
+          path: zeetah
+          # Full history so the base branch is available for the baseline build.
+          fetch-depth: 0
+
+      - name: Checkout benchmark harness
+        uses: actions/checkout@v6
+        with:
+          repository: DaliVana/zeetah-benchmark   # keep in sync with BENCH_REPO_URL
+          ref: ${{ env.BENCH_REPO_REF }}
+          path: zeetah-benchmark
+        # If the harness repo is private, add: token: ${{ secrets.BENCH_REPO_TOKEN }}
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Make base branch fetchable for the worktree
+        working-directory: zeetah
+        run: git fetch --no-tags origin ${{ github.base_ref }}
+
+      - name: Run comparison
+        id: bench
+        working-directory: zeetah-benchmark
+        env:
+          ZEETAH_DIR: ${{ github.workspace }}/zeetah
+          BENCH_TARGET_REF: origin/${{ github.base_ref }}
+          REGRESSION_PCT: ${{ env.REGRESSION_PCT }}
+        run: ./run_compare.sh
+
+      - name: Post result as sticky PR comment
+        # Post even when the comparison failed, so the regression is visible.
+        if: always()
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: zeetah-bench
+          path: zeetah-benchmark/compare.md
