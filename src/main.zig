@@ -1,3 +1,8 @@
+//! Command-line front-end for Zeetah — a thin `argv`/stdin wrapper over the
+//! public `zeetah` module: first match by default, `-g` all matches, `-i`
+//! case-insensitive, `-r <repl>` replace, `-m` multiline, `-v`/`-h`. Not part
+//! of the default build; see the CLI section of the README to wire it up.
+
 const std = @import("std");
 const Io = std.Io;
 const regex = @import("zeetah");

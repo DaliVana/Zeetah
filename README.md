@@ -232,85 +232,34 @@ defer re.deinit();
 
 ## The meta engine
 
-"Meta engine" means Zeetah does not have *one* matcher — `compile` analyzes the
-pattern (a pure pass over the parsed HIR) and dispatches it to the cheapest
-correct executor. There are two layers of routing.
+"Meta engine" means Zeetah has no *single* matcher: at `compile` time it analyzes
+the pattern (a pure pass over the parsed HIR) and routes it to the cheapest
+correct executor — a SIMD literal scan, a compiled DFA, or a bounded backtracker
+for features no finite automaton can express. You call one API; the engine picks
+the machine.
 
-### Layer 1 — the runtime dispatcher
+Routing happens in two layers: a runtime dispatcher that selects one of ~12
+executors (literal / Teddy-prefix / eager- and lazy-DFA / class-span / keyword
+Aho-Corasick / backtracker / …), driven by a **pure planner** `plan(properties,
+flags)` that never reads the haystack — so for a comptime-known pattern the
+routing decision runs entirely at compile time. A handful of prefilters (required
+byte, first-byte SIMD set, Teddy, Aho-Corasick, seek) skip work before any
+automaton runs.
 
-`Regex.compile` selects one of roughly a dozen executors. The most important:
+The **ReDoS contract** is precise about which patterns get linear time:
 
-| Executor | Chosen for | How it runs |
-|----------|-----------|-------------|
-| **literal** | a single literal, or an exact literal alternation (`cat\|dog\|bird`) | SIMD substring / Teddy multi-literal scan — **no automaton** |
-| **lit_prefix** | a literal prefix ≥ 3 bytes, unanchored (`hello.*world`) | Teddy-locate the prefix, then verify with an anchored DFA |
-| **reverse_suffix** | a selective trailing literal, weak prefix (`[A-Z].*foobar`) | use the suffix as a sound fast-negative, then a forward DFA |
-| **dfa** | the general regular case | eager DFA table walk (`Dfa256`) |
-| **dense_search** | bare unanchored DFA, narrow shape | frozen dense single-pass unanchored DFA |
-| **lazy_dfa** | when the eager DFA exceeds its state ceiling | the same subset construction, evaluated on demand |
-| **class_span** | one greedy single-range `class+`/`class*` | SIMD member-run scan, no automaton |
-| **boundary_lits** | `\b(?:kw1\|kw2\|…)\b` keyword alternations | Aho-Corasick locate + O(1) `\b` verify |
-| **bt_look** | plain look-assertions (`\b`, `\B`, mid `^`/`$`, `(?m)`) | bounded backtracker (the DFA does not fold look-assertions) |
-| **backtrack** | lookaround / backreferences | HIR tree backtracker with a `seek` prefilter + regular-island delegation |
-| **split_alt** | top-level alternation mixing regular and non-regular branches | regular branches → anchored DFAs, the rest → tree backtracker |
-| **dup_word** | the adjacent-duplicate-word shape `(\b\w+\b)\s+\1` | a single O(n) linear scan |
+- **Regular patterns are linear by construction** — a DFA table walk, O(n) per
+  scan. Classic "catastrophic" shapes (`(a+)+$`, `(a*)*$`, `(.*)*$`) compile and
+  run linearly; they are *not* rejected. If the eager DFA explodes it falls back
+  to a bit-identical lazy DFA, never to backtracking.
+- **Non-regular patterns** (backreferences, lookaround, atomic groups,
+  lazy-with-end-anchor) run on a step-budgeted backtracker and return a typed
+  **`error.MatchBudgetExceeded`** at match time — never a hang.
+- **Construction ceilings** raise **`error.PatternTooComplex`** at compile time
+  for patterns too large to build.
 
-### Layer 2 — the planner
-
-The regular-tier decision is a **pure function** `plan(properties, flags) → Strategy`
-that never reads the haystack — so for a comptime-known pattern the whole
-routing decision evaluates *at compile time*. It returns one of five strategies
-(`.literal`, `.prefix_prefilter`, `.reverse_suffix`, `.core`, and a `.backtrack`
-sentinel for non-regular patterns, which Layer 1 has already intercepted).
-
-### Prefilters
-
-Before (or instead of) running an automaton, Zeetah tries to skip work:
-
-- **Required byte** — a single byte every accepting path must consume; if a
-  `memchr` finds none, the answer is "no match" in one pass.
-- **Required literal anywhere** — a rare mandatory literal plus a recipe to
-  recover the match start; drives a `memchr` instead of a broad restart loop.
-- **First-byte SIMD set** — a 256-bit start-byte set scanned with `@Vector`
-  (specialized to single-byte / multi-equality / range / bitset).
-- **Teddy** — SIMD multi-substring locator (≤ 8 needles, adaptive nibble masks)
-  backing the literal / prefix / suffix executors.
-- **Aho-Corasick** — multi-keyword locator for the `boundary_lits` executor.
-- **Seek** — a regular over-approximation that skips proven-dead prefixes for
-  the backtracking tier.
-
-### Safety & the ReDoS contract
-
-Zeetah's linear-time guarantee is precise about *which* patterns get it:
-
-- **Regular patterns are linear by construction.** Matching is a DFA table
-  walk, O(n) per scan. If the eager DFA would explode, it falls back to the
-  **lazy DFA** — the bit-identical subset construction built incrementally —
-  never to backtracking. Classic catastrophic shapes (`(a+)+$`, `(a*)*$`,
-  `(.*)*$`) **compile and run linearly**; they are *not* rejected.
-- **Non-regular patterns** (backreferences, lookaround) run on a backtracker
-  under an explicit **step budget** (`8000 + (len+1)·4000`) plus a recursion-depth
-  guard. Exceeding it returns a typed **`error.MatchBudgetExceeded`** at match
-  time — the .NET-style runtime contract, never a hang.
-- **Construction ceilings** (NFA states, edges, DFA states, HIR nodes, capture
-  groups) raise `error.PatternTooComplex` at compile time for patterns that are
-  simply too large to build. (Distinct from the match-time budget error above.)
-
-```zig
-// Regular "catastrophic" pattern: compiles and runs as a linear DFA.
-var re = try Regex.compile(allocator, "(a+)+$");
-defer re.deinit();
-_ = try re.isMatch("aaaaaaaaaaaaaaaaX"); // fast, linear — no error
-
-// Non-regular catastrophe (inside a lookahead): bounded at match time.
-var re2 = try Regex.compile(allocator, "(?=(a+)+$)a");
-defer re2.deinit();
-const r = re2.isMatch("aaaaaaaaaaaaaaaaaaaaaaaaX");
-_ = r catch |e| switch (e) {
-    error.MatchBudgetExceeded => {}, // budget exceeded -> typed error, not a hang
-    else => return e,
-};
-```
+Full details — the executor table, the planner, the prefilters, and the
+compile-time path — live in **[Architecture](docs/ARCHITECTURE.md)**.
 
 ## Feature support
 
@@ -319,7 +268,7 @@ _ = r catch |e| switch (e) {
 | Literals | `abc`, `123` | ✅ |
 | Quantifiers | `*`, `+`, `?`, `{n}`, `{m,n}` | ✅ counts > 1000 → `NotImplemented`; very large in-budget counts → `PatternTooComplex` |
 | Lazy quantifiers | `*?`, `+?`, `??`, `{m,n}?` | ✅ lazy **+ end-anchor** (`a*?$`) runs on the backtracker (match-budget bounded) |
-| Possessive quantifiers | `*+`, `++`, `?+`, `{m,n}+` | ❌ rejected with `error.NotImplemented`¹ |
+| Possessive quantifiers | `*+`, `++`, `?+`, `{m,n}+` | ✅ lower to atomic groups; run on the backtracker (match-budget bounded)¹ |
 | Alternation | `a\|b\|c` | ✅ |
 | Predefined classes | `\d \w \s \D \W \S` | ✅ (including inside `[…]`) |
 | Custom classes | `[abc]`, `[a-z]`, `[^0-9]`, `[[:alpha:]]` | ✅ unknown POSIX name → `NotImplemented` |
@@ -337,11 +286,12 @@ _ = r catch |e| switch (e) {
 | Compile flags | `.unicode` (codepoint mode) | ❌ `NotImplemented`⁵ |
 | Escaping | `\\`, `\.`, `\n`, `\t`, `\r` | ✅ |
 
-> **¹ Possessive quantifiers** (`*+`/`++`/`?+`/`{m,n}+`) are **rejected** with
-> `error.NotImplemented` rather than silently treated as greedy — silent greedy
-> would give wrong results versus an atomic-aware engine (e.g. `a*+a` must not
-> match `"aaa"`). True possessive/atomic semantics may be added later; rejecting
-> now keeps that addition non-breaking.
+> **¹ Possessive quantifiers** (`*+`/`++`/`?+`/`{m,n}+`) lower to **atomic
+> groups** (`a*+` ≡ `(?>a*)`) with true atomic semantics — they commit and never
+> give back, so `a*+a` does **not** match `"aaa"`. Like the other non-regular
+> constructs they run on the bounded backtracker (match-budget bounded), not a
+> DFA, so they are runtime-only — a `@compileError` under the comptime
+> [`Pattern`](#compile-time-patterns).
 >
 > **² Unicode `\p`** currently covers **General_Category** for codepoints in the
 > Latin-1 range (bytes `0x00`–`0xFF`): one/two-letter categories (`L`, `Lu`,

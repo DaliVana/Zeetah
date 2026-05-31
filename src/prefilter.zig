@@ -599,7 +599,7 @@ pub const Teddy = struct {
     /// separate the needle set, so the necessary condition stays selective.
     nmask: u8 = 0,
 
-    // --- Fix 3: per-needle scan vectors baked once at `build` time ---
+    // --- Build-time bake: per-needle scan vectors materialized once at `build` ---
     // `find` is called once per match (`count`/`nextSpanFrom` loop), so
     // re-deriving these splats / tiled nibble tables on every call was a
     // per-call tax on dense-hit workloads. `build` is comptime-evaluable, so
@@ -689,7 +689,7 @@ pub const Teddy = struct {
                 t.mask_hi[j][c >> 4] |= bit;
             }
         }
-        // Fix 3: bake the per-needle scan vectors once (build is comptime).
+        // Build-time bake: per-needle scan vectors materialized once (build is comptime).
         for (0..t.n) |k| {
             t.splat_b1[k] = @splat(t.b1[k]);
             t.splat_b2[k] = @splat(t.b2[k]);
@@ -808,7 +808,7 @@ pub const Teddy = struct {
     /// needle's (first byte AND rare byte) mask, then declared-order verify.
     fn findMulti(self: *const Teddy, input: []const u8, pos: usize) ?Hit {
         const n: usize = self.n;
-        // Fix 3: per-needle splats / bitmasks / maxo baked at `build` time.
+        // Build-time bake: per-needle splats / bitmasks / maxo baked at `build` time.
         const fv = &self.splat_b1;
         const s2v = &self.splat_b2;
         const bitv = &self.splat_bit;
@@ -845,7 +845,7 @@ pub const Teddy = struct {
         const nm: usize = self.nmask; // ≥2 (all_ge2 ⇒ min_len≥2); ≤ min_len
         const lo4: VT = @splat(0x0F);
         const sh4: @Vector(TW, u3) = @splat(4);
-        // Fix 3: tiled nibble tables baked at `build` time (also bakes the
+        // Build-time bake: tiled nibble tables baked at `build` time (also bakes the
         // AVX2 both-128-lane duplication once instead of per call).
         const tlv = &self.tlv;
         const thv = &self.thv;

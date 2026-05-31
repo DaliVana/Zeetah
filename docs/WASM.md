@@ -30,7 +30,7 @@ This page shows the two realistic paths:
 
 The published package (`build.zig.zon`: `.name = .zeetah`) exposes a single Zig
 **module**, `zeetah`, rooted at `src/root.zig`. The repository's `build.zig`
-defines only the `test` and `parity` steps plus the implicit `install` (which
+defines the `test`, `doctest`, `bench-tokenizer`, and `parity` steps plus the implicit `install` (which
 builds the internal `parity_harness`). It does **not** build a shared library, a
 C header, or a `.wasm` file, and `src/root.zig` exports no `extern`/`export`
 functions.
@@ -259,8 +259,9 @@ console.log('matched:', result === 1);
 > shared buffer (a length-prefixed encoding works well) and decode them on the
 > JS side. Keep in mind the semantics of the underlying API: `find` returns a
 > whole-match span only, `captures` (which allocates) is the opt-in path for
-> submatch slices, and `replace`/`replaceAll` insert the replacement string
-> verbatim (no `$0`/`$1` substitution).
+> submatch slices, `replace`/`replaceAll` expand `$`-references in the template
+> (`$0`/`$&`, `$1`..`$N`, `${name}`), and `replaceLiteral`/`replaceAllLiteral`
+> insert the replacement verbatim (no `$`-substitution).
 
 ---
 
@@ -296,9 +297,9 @@ a `Pattern`); for those, use the runtime `Regex` shim above.
   instead use a `DebugAllocator` or wrap the host's memory growth, but a
   reset-per-call arena is the simplest correct choice for a stateless ABI.
 - **No hidden allocation.** Every Zeetah heap allocation goes through the
-  allocator you pass. `find` / `isMatch` / `findAll` (and all `Pattern` methods
-  except `findAll`) compute whole-match results without allocating; `captures`
-  and `findAll`/`split`/`replace` are the allocating calls.
+  allocator you pass. `find` / `isMatch` / `count` (and all `Pattern` methods
+  except `findAll`) compute whole-match results without allocating; `captures`,
+  `findAll`, `split`, and `replace` are the allocating calls.
 - **Borrowed match views.** A `Match.slice` aliases the input bytes — in the
   shim those bytes live in the shared linear-memory buffer. Read any result out
   (e.g. copy it back into the buffer for JS) *before* the buffer is overwritten

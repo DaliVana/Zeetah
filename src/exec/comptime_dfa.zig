@@ -93,7 +93,7 @@ pub fn Dfa(comptime n_states: usize, comptime n_classes: usize) type {
         n_start_bytes: usize,
         /// Same membership as `start_bytes[0..n_start_bytes]`, as a 256-bit
         /// set, so the start-skip can use the fully vectorized
-        /// `prefilter.nextCandidate` (single / multi / range / bitset SIMD)
+        /// `prefilter.nextCandidatePF` (single / multi / range / bitset SIMD)
         /// instead of the limited scalar `std.mem` path — in particular it
         /// removes the old ">8 distinct bytes => no skip" cliff and adds
         /// vectorized range scanning for class-led starts (`[0-9]`, `\w`, …).

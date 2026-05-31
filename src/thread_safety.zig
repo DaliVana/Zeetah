@@ -150,7 +150,9 @@ pub fn SharedRegex(comptime Regex: type) type {
         pub const Reference = struct {
             shared: *Self,
 
-            /// Access the underlying regex (safe to call from multiple threads)
+            /// Access the underlying regex as a `*const` pointer — safe to
+            /// share and match on from multiple threads (the compiled regex is
+            /// immutable, and matching keeps no shared mutable state).
             pub fn regex(self: Reference) *const Regex {
                 return &self.shared.regex;
             }

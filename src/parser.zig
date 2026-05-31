@@ -75,8 +75,10 @@ const MAX_RANGES: usize = 64; // ranges per `[...]`
 
 /// Per-parse mode flags. `ci`/`dot_all`/`extended` are scoped by `(?flags)` /
 /// `(?flags:..)` exactly like the legacy `(?i)` handling and inherited by the
-/// `{m,n}` re-parse sub-parser. `multiline`/`unicode` are still rejected
-/// upstream (anchors are prescan-only; Unicode is a later phase).
+/// `{m,n}` re-parse sub-parser. `multiline` and `unicode` are deliberately not
+/// scoped flags here: `multiline` `^`/`$` line anchors are resolved by a
+/// separate prescan (not threaded through this struct), and `unicode` is
+/// rejected upstream as a later-phase feature.
 pub const ParseFlags = struct {
     ci: bool = false,
     dot_all: bool = false,

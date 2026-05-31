@@ -15,7 +15,7 @@ For the conceptual overview and the full feature matrix see the
 - [Finding Many Matches](#finding-many-matches) — `findAll`, `iterator`, `count`
 - [Replacing Text](#replacing-text) — `replace`, `replaceAll` ($-templates)
 - [Splitting](#splitting) — `split`
-- [Capture Groups](#capture-groups) — `captures`, `groupByName`
+- [Capture Groups](#capture-groups) — `captures`, `capturesAll`, `capturesIterator`, `groupByName`
 - [Compile Flags](#compile-flags) — `compileWithFlags` and inline `(?i)`/`(?s)`/`(?x)`/`(?m)`
 - [Compile-Time Patterns](#compile-time-patterns) — `Pattern`
 - [Builder](#builder) — fluent pattern construction
@@ -293,6 +293,34 @@ pub fn main() !void {
 > A group that did not participate (e.g. an optional branch that wasn't taken)
 > is a `null` slot — always check before unwrapping. Named-group lookup via
 > `groupByName` is only meaningful on a `captures()` result.
+
+### Every match — `capturesAll` / `capturesIterator`
+
+`captures` returns the **first** match's groups. For **every** match, use
+`capturesAll` (an owned slice — each element owns its groups) or
+`capturesIterator` (streaming, lower peak memory). Either way, each yielded
+`Match` must be `deinit`-ed.
+
+```zig
+var kv = try Regex.compile(allocator, "(?<k>\\w+)=(?<v>\\d+)");
+defer kv.deinit();
+
+// Streaming — free each match as you go:
+var it = kv.capturesIterator("a=1 bb=22");
+defer it.deinit();
+while (try it.next(allocator)) |mm| {
+    var m = mm;
+    defer m.deinit(allocator);
+    std.debug.print("{s} -> {s}\n", .{ m.groupByName("k").?.slice, m.groupByName("v").?.slice });
+}
+
+// Or the whole slice at once — free each element's groups, then the slice:
+const all = try kv.capturesAll(allocator, "a=1 bb=22");
+defer {
+    for (all) |*m| m.deinit(allocator);
+    allocator.free(all);
+}
+```
 
 ---
 
@@ -621,6 +649,8 @@ A quick reference for who owns what:
 | `find` / `iterator.next` `?Match` | no | none (`Match.deinit` is a harmless no-op) |
 | `findAll` `[]Match` | the **slice** only | `allocator.free(slice)` |
 | `captures` `?Match` | the `groups` array | `match.deinit(allocator)` — **required** |
+| `capturesAll` `[]Match` | each `Match`'s `groups` **and** the slice | `for (s) \|*m\| m.deinit(allocator)` then `allocator.free(s)` |
+| `capturesIterator.next` `?Match` | the yielded `Match`'s `groups` | `match.deinit(allocator)` per match — **required** |
 | `split` `[][]const u8` | the **outer slice** only | `allocator.free(slice)` (elements alias the input) |
 | `replace` / `replaceAll` `[]u8` | yes | `allocator.free(result)` |
 | `Builder.build` `[]const u8` | yes | `allocator.free(pattern)` |
@@ -640,4 +670,4 @@ Key points:
 ---
 
 **Last Updated:** 2026-05-30
-**Version:** 0.1.1
+**Version:** 0.16.0

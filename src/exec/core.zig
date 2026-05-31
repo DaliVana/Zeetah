@@ -1,7 +1,7 @@
 //! The runtime "core" executor over the meta engine's runtime DFA table
 //! (`full_dfa.Dfa256`) plus the planner's literal / prefix-prefilter fast
 //! paths. The table-walk semantics are the same algorithm as the comptime
-//! `dfa.Dfa(...)` executor (`runFrom`/`findLeftmost`/`isMatch`), only here
+//! `comptime_dfa.Dfa(...)` executor (`runFrom`/`findLeftmost`/`isMatch`), only here
 //! the table dimensions are runtime values instead of comptime type
 //! parameters; the comptime↔runtime agreement is guarded by
 //! `tests/feat_api.zig`'s `Pattern`⇄`Regex` differential.
@@ -36,7 +36,7 @@ pub fn matchEndFrom(d: *const Dfa, input: []const u8, start_pos: usize) ?usize {
     return d.runFrom(input, start_pos);
 }
 
-/// Verbatim port of `dfa.Dfa.skipToStart` (the unanchored leading-region
+/// Verbatim port of `comptime_dfa.Dfa.skipToStart` (the unanchored leading-region
 /// prefilter). Only sound when `start` is non-accepting.
 inline fn skipToStart(d: *const Dfa, input: []const u8, from: usize) ?usize {
     const n = d.n_start_bytes;
@@ -56,7 +56,7 @@ inline fn skipToStart(d: *const Dfa, input: []const u8, from: usize) ?usize {
 /// Selective-literal-prefix leftmost search (the planner's `.prefix_prefilter`
 /// / `.lit_prefix`). Thin wrapper over the shared, table-type-agnostic
 /// `search.litPrefixFind` (which both this runtime `Dfa256` and the comptime
-/// `dfa.Dfa(ns,nk)` drive). Caller guarantees `!d.a_start` (`runFrom` does not
+/// `comptime_dfa.Dfa(ns,nk)` drive). Caller guarantees `!d.a_start` (`runFrom` does not
 /// enforce `^`).
 pub fn litPrefixFind(d: *const Dfa, t: *const pf.Teddy, input: []const u8) ?Span {
     return search.litPrefixFind(d, t, input);
@@ -66,7 +66,7 @@ pub fn litPrefixIsMatch(d: *const Dfa, t: *const pf.Teddy, input: []const u8) bo
     return search.litPrefixIsMatch(d, t, input);
 }
 
-/// Verbatim port of `dfa.Dfa.findLeftmost`.
+/// Verbatim port of `comptime_dfa.Dfa.findLeftmost`.
 pub fn findLeftmost(d: *const Dfa, input: []const u8) ?Span {
     // Necessary-condition prefilter: a byte every accepting path must consume.
     // Absent ⇒ no match, proved in one memchr — this is what collapses the

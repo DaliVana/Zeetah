@@ -6,18 +6,23 @@ const RegexError = @import("errors.zig").RegexError;
 ///
 /// This builder provides a fluent interface for creating regex patterns without
 /// dealing with raw regex syntax, reducing errors and improving code readability.
+/// `init` returns a `Builder` **by value** (no error union); every build step
+/// appends to an internal buffer and returns `!*Builder`, so steps are threaded
+/// with `try`. Finish with `compile()` (build + compile in one call) or
+/// `build()` (the assembled pattern string, caller-owned). `literal()` escapes
+/// all regex metacharacters so the text matches verbatim; `charClass()` inserts
+/// its characters raw.
 ///
 /// Example:
 /// ```zig
-/// var builder = try Builder.init(allocator);
+/// var builder = Builder.init(allocator); // no `try` — init does not fail
 /// defer builder.deinit();
 ///
-/// try builder
-///     .literal("hello")
-///     .oneOrMore()
-///     .whitespace()
-///     .digit()
-///     .repeatExact(3);
+/// _ = try builder.literal("hello");
+/// _ = try builder.oneOrMore();
+/// _ = try builder.whitespace();
+/// _ = try builder.digit();
+/// _ = try builder.repeatExact(3);
 ///
 /// const regex = try builder.compile();
 /// defer regex.deinit();
@@ -40,7 +45,8 @@ pub const Builder = struct {
         self.parts.deinit(self.allocator);
     }
 
-    /// Add a literal string to the pattern (escaped automatically)
+    /// Append a literal string; **all** regex metacharacters are escaped so the
+    /// text matches verbatim. Returns `!*Builder` for chaining.
     pub fn literal(self: *Builder, text: []const u8) !*Builder {
         const escaped = try escapeLiteral(self.allocator, text);
         try self.parts.append(self.allocator, escaped);

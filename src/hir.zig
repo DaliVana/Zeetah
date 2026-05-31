@@ -201,7 +201,8 @@ pub fn Hir(comptime cap: ?usize) type {
 /// set bitmaps so `dst` is self-contained. `relax_irregular` (comptime):
 ///   * `false` — faithful clone of every tag (the old `split_alt.cloneExact`
 ///     / `delegate.copyReg`).
-///   * `true`  — `look`/`look_around`/`backref` collapse to `empty`, a sound
+///   * `true`  — `look`/`look_around`/`backref` collapse to `empty` and
+///     `atomic` drops its cut (keeping the inner subtree), a sound
 ///     *language-enlarging* relaxation (the old `seek.lowerApprox`): used to
 ///     derive a regular over-approximation.
 /// One definition replaces three near-identical recursive copies.

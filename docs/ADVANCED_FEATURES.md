@@ -74,7 +74,7 @@ if (try re.captures(allocator, "Date: 2024-03-15")) |m| {
 ```
 
 A duplicate group name is rejected at compile time with
-`error.NotImplemented`.
+`error.InvalidPattern`.
 
 ### Optional & non-participating groups
 
@@ -203,7 +203,7 @@ std.debug.print("{s}\n", .{pattern});
 
 ```zig
 // Literals & character classes
-.literal("text")        // escaped literal text (metachars escaped, except ] and })
+.literal("text")        // escaped literal text (all regex metacharacters escaped)
 .any()                  // .   any character
 .digit()                // \d
 .word()                 // \w

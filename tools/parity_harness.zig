@@ -1,5 +1,5 @@
 //! Parity harness — the cross-engine equivalence oracle for the meta-engine
-//! migration (see docs/META_ENGINE_ANALYSIS.md, plan phases 0-6).
+//! migration (see the "Design decisions" section of docs/ARCHITECTURE.md).
 //!
 //! Runs a shared (pattern × input) corpus through the *old* runtime `Regex`
 //! engine and, as the new meta engine lands phase-by-phase, through the new

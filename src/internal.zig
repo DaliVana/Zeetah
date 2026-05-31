@@ -28,7 +28,7 @@ pub const RegexCache = @import("thread_safety.zig").RegexCache(Regex);
 // Internal shared modules
 pub const common = @import("common.zig");
 pub const prefilter = @import("prefilter.zig");
-pub const dfa = @import("exec/comptime_dfa.zig");
+pub const comptime_dfa = @import("exec/comptime_dfa.zig");
 
 // Unified meta-engine pipeline
 pub const hir = @import("hir.zig");

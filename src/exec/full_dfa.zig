@@ -7,7 +7,7 @@
 //! `thompson.zig` (from the unified `parser`→`hir` front-end); the NFA's
 //! state numbering and epsilon priority order are deterministic, so the
 //! construction is reproducible. The comptime path (`pattern.zig` →
-//! `dfa.Dfa`) and this runtime path (`exec/core.zig` over `Dfa256`) must
+//! `comptime_dfa.Dfa`) and this runtime path (`exec/core.zig` over `Dfa256`) must
 //! agree — guarded by `tests/feat_api.zig`'s `Pattern`⇄`Regex` differential.
 
 const std = @import("std");
@@ -36,6 +36,13 @@ pub const Dfa256 = struct {
     a_start: bool,
     a_end: bool,
     accepting: [MAX_DFA]bool,
+    /// Dense transition table, `[state][byte-class] → next state`. The runtime
+    /// `Dfa256` is a pre-sized table at the `MAX_DFA` (256-state) ceiling and
+    /// keeps every cell `u16`-wide unconditionally — it does **not** specialize
+    /// the cell width to the minimized state count the way the comptime
+    /// `comptime_dfa.Dfa(ns, nk)` does (that one narrows `StateInt` to `u8` when
+    /// `ns ≤ 256`). The fixed-size table trades a wider cell for not having to
+    /// monomorphize a table type per pattern on the runtime path.
     trans: [MAX_DFA][256]u16,
     start_bytes: [256]u8,
     n_start_bytes: usize,
@@ -62,7 +69,7 @@ pub const Dfa256 = struct {
     /// only an accepting prefix that consumes through `input.len` qualifies.
     ///
     /// This is the single search primitive the generic prefilter layer
-    /// (`exec/search.zig`) drives; it mirrors the comptime `dfa.Dfa.runFrom`,
+    /// (`exec/search.zig`) drives; it mirrors the comptime `comptime_dfa.Dfa.runFrom`,
     /// and the two are pinned equal by `tests/feat_api.zig`'s differential.
     ///
     /// `inline`: this is the innermost loop body of `core.findLeftmost` /

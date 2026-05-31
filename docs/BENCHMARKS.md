@@ -140,7 +140,7 @@ sentinel for non-regular patterns, which Layer 1 has already intercepted).
 - **Non-regular patterns** (backreferences / lookaround / lazy-with-end-anchor):
   run on the backtracker bounded by the step budget above; worst case is capped
   by that budget rather than the input size, and is reported as
-  `error.PatternTooComplex` rather than as a hang.
+  `error.MatchBudgetExceeded` rather than as a hang.
 
 ### Space
 

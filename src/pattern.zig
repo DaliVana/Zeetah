@@ -1,14 +1,14 @@
 //! `Pattern(src, opts)` — the comptime path of the meta engine, built on the
 //! unified `parser`→`hir`→`thompson`→`exec/full_dfa` pipeline. The whole
 //! pipeline (parse → HIR → NFA → subset-construct/minimize) runs at compile
-//! time and the minimized DFA is monomorphized into a baked `dfa.Dfa(ns,nk)`
+//! time and the minimized DFA is monomorphized into a baked `comptime_dfa.Dfa(ns,nk)`
 //! in `.rodata`; the planner's `.literal` strategy short-circuits to a
 //! comptime Teddy with no DFA table. Same `has_dfa` split / method
 //! signatures / `Options` + explosion semantics as the runtime `Regex`;
 //! the two are differential-tested in `tests/feat_api.zig`.
 
 const std = @import("std");
-const dfa = @import("exec/comptime_dfa.zig");
+const comptime_dfa = @import("exec/comptime_dfa.zig");
 const pf = @import("prefilter.zig");
 const hir = @import("hir.zig");
 const parser = @import("parser.zig");
@@ -208,7 +208,7 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
     if (use_dfa) {
         const ns = m.n_states;
         const nk = m.n_classes;
-        const T = dfa.Dfa(ns, nk);
+        const T = comptime_dfa.Dfa(ns, nk);
         const baked: T = comptime blk: {
             var t: T = undefined;
             t.class_of = m.class_of;
@@ -223,7 +223,7 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
                 // Padding columns `[nk..Stride)` are never indexed (`class_of`
                 // emits only `0..nk`), but must be defined so the baked `.rodata`
                 // is fully initialized rather than `undefined`.
-                while (k < T.Stride) : (k += 1) t.transitions[i][k] = dfa.DEAD;
+                while (k < T.Stride) : (k += 1) t.transitions[i][k] = comptime_dfa.DEAD;
             }
             t.start_bytes = m.start_bytes;
             t.n_start_bytes = m.n_start_bytes;

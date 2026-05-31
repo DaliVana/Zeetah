@@ -3,6 +3,13 @@
 //! Source: Unicode Character Database, DerivedGeneralCategory.txt
 //! Unicode version: 17.0.0
 //! Regenerate with: zig run tools/gen_unicode_tables.zig
+//!
+//! Exports, per Unicode General_Category, a sorted slice of inclusive codepoint
+//! `Range`s named `gc_<Category>` — the two-letter categories `gc_Lu`, `gc_Ll`,
+//! `gc_Lt`, `gc_Lm`, `gc_Lo`, `gc_Mn`, … through `gc_Cn`. Consumed by
+//! `unicode_class.zig` to resolve `\p{…}` / `\P{…}` property classes. (Byte-mode
+//! matching uses only the Latin-1 slice of these — see the Unicode note in the
+//! README.)
 
 pub const unicode_version = "17.0.0";
 

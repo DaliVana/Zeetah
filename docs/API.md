@@ -367,6 +367,33 @@ if (try re.captures(allocator, "2026-05")) |m| {
 > Groups nested inside a lookaround are not reconstructed. Capture groups are
 > bounded at 32 per pattern (a construction ceiling).
 
+### `capturesAll()`
+
+The capture-bearing peer of `findAll`: an allocator-owned `[]Match` for **every**
+non-overlapping match, where **each element owns its `groups`**.
+
+```zig
+pub fn capturesAll(self: *const Regex, allocator: std.mem.Allocator, input: []const u8) ![]Match
+```
+
+Free **both** each match's groups and the outer slice:
+
+```zig
+var re = try Regex.compile(allocator, "(?<k>\\w+)=(?<v>\\d+)");
+defer re.deinit();
+
+const all = try re.capturesAll(allocator, "a=1 bb=22");
+defer {
+    for (all) |*m| m.deinit(allocator); // each Match's groups
+    allocator.free(all);                // then the slice
+}
+// all[0].groupByName("k").?.slice == "a"
+```
+
+`capturesFrom(allocator, input, pos)` is the positional-resume primitive (the
+capture peer of `findFrom`) that both `capturesAll` and `capturesIterator` build
+on: the leftmost capture-bearing match at or after byte offset `pos`.
+
 ---
 
 ## Iteration
@@ -403,6 +430,39 @@ var it = re.iterator("a1 b22 c333");
 defer it.deinit();
 while (try it.next(allocator)) |m| {
     std.debug.print("{s}\n", .{m.slice}); // 1, 22, 333
+}
+```
+
+### `capturesIterator()`
+
+The capture-bearing peer of `iterator`: a `CapturesIterator` yielding successive
+non-overlapping matches lazily, **each owning its `groups`** — lower peak memory
+than `capturesAll`, which materializes the whole slice. Returned by value.
+
+```zig
+pub fn capturesIterator(self: *const Regex, input: []const u8) CapturesIterator
+```
+
+**Methods:**
+
+```zig
+pub fn next(self: *CapturesIterator, allocator: std.mem.Allocator) !?Match
+pub fn deinit(self: *CapturesIterator) void
+```
+
+Unlike `MatchIterator.next`, **`next(allocator)` allocates** the yielded match's
+`groups` — `deinit` each match as you go. `deinit()` on the iterator is a no-op.
+
+```zig
+var re = try Regex.compile(allocator, "(?<k>\\w+)=(?<v>\\d+)");
+defer re.deinit();
+
+var it = re.capturesIterator("a=1 bb=22");
+defer it.deinit();
+while (try it.next(allocator)) |mm| {
+    var m = mm;
+    defer m.deinit(allocator); // each yielded Match owns its groups
+    std.debug.print("{s} -> {s}\n", .{ m.groupByName("k").?.slice, m.groupByName("v").?.slice });
 }
 ```
 
@@ -477,8 +537,18 @@ Replace the first / every match with `replacement` inserted **verbatim** — no
 be treated as a capture reference.
 
 ```zig
-pub fn replaceLiteral(self: *const Regex, allocator, input, replacement) ![]u8
-pub fn replaceAllLiteral(self: *const Regex, allocator, input, replacement) ![]u8
+pub fn replaceLiteral(
+    self: *const Regex,
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    replacement: []const u8,
+) ![]u8
+pub fn replaceAllLiteral(
+    self: *const Regex,
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    replacement: []const u8,
+) ![]u8
 ```
 
 ```zig
@@ -898,7 +968,7 @@ defer allocator.free(matches);
 ## Version
 
 ```zig
-pub const version: std.SemanticVersion; // 0.1.1 (matches build.zig.zon)
+pub const version: std.SemanticVersion; // 0.16.0 (matches build.zig.zon)
 ```
 
 ```zig

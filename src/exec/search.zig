@@ -1,13 +1,14 @@
 //! Table-type-agnostic prefilter search, shared by the runtime `Dfa256`
-//! executor (`exec/core.zig`) and the comptime baked `dfa.Dfa(ns,nk)` executor
+//! executor (`exec/core.zig`) and the comptime baked `comptime_dfa.Dfa(ns,nk)` executor
 //! (`pattern.zig`). Both DFA representations expose the same
 //! `runFrom(input, start_pos) ?usize` primitive (the anchored leftmost-first
 //! run); everything here is written *once* against that single method, so the
 //! necessary-condition literal prefilters that keep unanchored search linear
 //! are identical in both front-ends.
 //!
-//! This closes the comptime/runtime asymmetry from `META_ENGINE_ANALYSIS.md`
-//! §3: previously `required` / `req_lit` lived only on the runtime `Dfa256`,
+//! This closes the comptime/runtime asymmetry noted in `docs/ARCHITECTURE.md`
+//! ("Design decisions"): previously `required` / `req_lit` lived only on the
+//! runtime `Dfa256`,
 //! so a comptime `Pattern("a.*X")` ran the O(n²) per-position DFA restart on
 //! adversarial input while the same pattern at runtime short-circuited on one
 //! `memchr`. With this module both paths get the O(n) guarantee.
@@ -40,7 +41,7 @@ pub inline fn requiredAbsent(required: ?u8, input: []const u8) bool {
 /// `d.runFrom` re-verifies, so this never changes an outcome.
 ///
 /// `d` is any DFA exposing `runFrom(input, pos) ?usize` (the runtime `Dfa256`
-/// or the comptime `dfa.Dfa(ns,nk)`).
+/// or the comptime `comptime_dfa.Dfa(ns,nk)`).
 pub fn findViaReqLit(d: anytype, input: []const u8, rl: ReqLit) ?Span {
     var lower: usize = 0;
     while (lower <= input.len) {

@@ -10,7 +10,7 @@
 //! non-regular tier (lookaround / backref) runs on `exec/backtrack.zig`
 //! (whole-pattern `backtrack`, per-segment `split_alt`, or `bt_look` for
 //! plain assertions) under a step budget that surfaces as
-//! `RegexError.PatternTooComplex`. Still-unmodelled surface
+//! `RegexError.MatchBudgetExceeded`. Still-unmodelled surface
 //! (Unicode `\b`, POSIX classes, `(?m)`/`(?s)` interactions) is reported as
 //! `RegexError.NotImplemented` rather than silently mis-handled.
 
@@ -514,7 +514,7 @@ pub const Regex = struct {
         // Non-regular tier (backreferences / lookaround): the tree
         // backtracker owns the HIR (transfer it off the local stack so the
         // deferred deinit is a no-op). .NET model: compiles and runs,
-        // step-budget → PatternTooComplex (never a hang).
+        // step-budget → MatchBudgetExceeded (never a hang).
         if (props.requires_backtracking) {
             // Per-segment delegation: a top-level alternation with no capture
             // groups and a mix of regular / non-regular branches runs each
@@ -1307,6 +1307,9 @@ pub const Regex = struct {
         return parts.toOwnedSlice(allocator);
     }
 
+    /// Lazy iterator over successive non-overlapping whole-match spans — the
+    /// capture-free peer of `capturesIterator`. Borrows `self` and `input`
+    /// (both must outlive it); each yielded `Match` has empty `groups`.
     pub fn iterator(self: *const Regex, input: []const u8) MatchIterator {
         return .{ .regex = self, .input = input, .pos = 0 };
     }

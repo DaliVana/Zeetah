@@ -59,13 +59,13 @@ IDEAS.md "memory-efficient approximations of backreferences" + memoization
 section. The ReDoS contract is already explicit: regular patterns are linear by
 construction (DFA, never backtracking), and non-regular patterns (backreferences,
 lookaround, lazy+end-anchor) run on the tree backtracker under a step budget
-plus a recursion-depth guard, returning a typed `error.PatternTooComplex` at
+plus a recursion-depth guard, returning a typed `error.MatchBudgetExceeded` at
 match time instead of hanging; the bounded-backtracking *capture* path is already
 O(n·m) via a `(state,pos)` visited bitset. The open idea: add a `(node,pos)`
 visited-set memo (Spencer/"squared" memoization) on the non-backref portions of
 genuinely non-regular patterns to convert worst-case blowup to polynomial while
 keeping backref semantics, so they finish fast instead of hitting the budget.
-Relates to the ReDoS concerns in `docs/SECURITY_PROBLES.md`.
+Relates to the ReDoS concerns in `docs/SECURITY_PROBLEMS.md`.
 
 ### 2.4 Bit-parallel NFA simulation for small patterns
 **Impact: medium-high · Effort: medium · Risk: medium**
@@ -75,6 +75,27 @@ state count fits in a 64/128/256-bit word, simulate the whole NFA with shift/AND
 over a `@Vector` mask — one machine word advances all states per byte. Pairs
 naturally with the existing `@Vector` usage in `src/prefilter.zig`. Big win on
 short-to-medium patterns where a full DFA table is overkill.
+
+### 2.5 SIMD self-loop / "spin-state" skip in the DFA hot loop
+**Impact: high · Effort: medium · Risk: medium**
+
+IDEAS.md "stable local neighborhood … SIMD scan for a delimiter." The hot DFA
+walk (`src/exec/full_dfa.zig`, `lazy_dfa.zig`, `dense_search.zig`, `core.zig`,
+`comptime_dfa.zig`) is a serial state recurrence
+(`sid = trans[sid*nc + class_of[byte]]`) and cannot be lane-parallelized in the
+general case. But a large share of real matching is spent in a state that
+*self-loops over a wide byte class* — `.*` consuming to a delimiter, `[^"]*`
+over a string body, `\d+` munching digits. While the DFA sits in such a state
+the state is invariant across the skipped bytes, so it is sound to SIMD-scan
+ahead to the first byte whose class leaves the state and then resume the scalar
+walk — no semantic change. The scanning primitive already exists and is
+gate-tested: `Ranges.runEnd` in `src/exec/class_span.zig` is exactly "first byte
+not in this class," fully `@Vector`-ized. Work: at DFA build (`freezeDense` /
+`full_dfa.compute`) detect self-loop states, precompute each one's stay-class as
+a `Ranges`, and branch the hot loop into `runEnd` on entry (scalar fallback
+otherwise). This is the legitimate, semantics-preserving form of "accelerate the
+DFA with vectors" — distinct from 2.4's bit-parallel transition, which the
+serial recurrence rules out for the table walk itself.
 
 ---
 
@@ -98,7 +119,12 @@ The literal / literal-prefix fast paths are still gated behind
 `!flags.case_insensitive` in the planner (`src/planner.zig`), so they are
 disabled entirely under `case_insensitive`. Recover them by lowering the
 first-byte set / literals to a case-folded byte set fed into the existing SIMD
-scanner — common real-world case currently left on the table.
+scanner — common real-world case currently left on the table. Concretely a
+`@Vector` extension: it reuses the shipped SIMD scanner in `src/prefilter.zig`
+verbatim, only widening the byte set fed into it — the highest
+value-per-effort SIMD item here. (Likewise 3.1's small-class cross-product
+simply feeds more literals into the already-vectorized Teddy / Aho-Corasick
+path.)
 
 ---
 
@@ -115,6 +141,18 @@ explicit parse-time depth limits + memoization so pathological *nested syntax*
 cannot blow compile-time stack before those ceilings are reached, guaranteeing
 linear-time parsing.
 
+### 4.4 Reuse the vectorized class-span scans in the dup-word backref fast-path
+**Impact: low-medium · Effort: tiny · Risk: low**
+
+The adjacent-duplicate-word backref fast-path (`src/exec/dupword.zig`, the
+`(\bCLASS+\b)SEP\1` shape) still walks its maximal CLASS run one byte at a time
+(`findCap`: the `while (e < n and cc.hasBit(…))` run scan and the outer
+start scan), even though `src/exec/class_span.zig` already provides the
+`@Vector`-ized `Ranges.runEnd` ("first non-member") and `Ranges.firstMember`
+for exactly this. Build a `Ranges` from the CLASS bitmap once and route the run
+scan / start scan through the existing helpers — a drop-in reuse of a
+gate-tested primitive, no new SIMD code.
+
 ---
 
 ## Suggested ordering
@@ -124,15 +162,19 @@ Remaining, roughly in priority:
 1. **3.3** (case-insensitive prefilter) — small, high-value, reuses existing
    SIMD; the literal/prefix fast paths are still gated off under
    `case_insensitive`.
-2. **2.3** (backtracker memoization) — would let genuinely non-regular patterns
+2. **4.4** (dup-word reuse of vectorized class-span scans) — tiny, low-risk
+   drop-in of an already gate-tested `@Vector` primitive.
+3. **2.5** (SIMD self-loop / spin-state skip) — high impact on `.*` /
+   scan-to-delimiter patterns, reuses `class_span.runEnd`, semantics-preserving.
+4. **2.3** (backtracker memoization) — would let genuinely non-regular patterns
    finish fast instead of hitting the step budget; relates to
-   `docs/SECURITY_PROBLES.md`.
-3. **1.2** (two-phase captures) — narrows the capture pass to the match region;
+   `docs/SECURITY_PROBLEMS.md`.
+5. **1.2** (two-phase captures) — narrows the capture pass to the match region;
    complements the already-shipped `onepass` fast-path.
-4. **2.4** (bit-parallel NFA) and the open part of **3.1** (small-class
+6. **2.4** (bit-parallel NFA) and the open part of **3.1** (small-class
    cross-product literal expansion) — opportunistic, pattern-dependent
    accelerators.
-5. **2.2** (bounded backtracker as first-choice capture engine on short inputs)
+7. **2.2** (bounded backtracker as first-choice capture engine on short inputs)
    and **4.3** (packrat/memoized parse guard) — incremental hardening / small
    wins.
 

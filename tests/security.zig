@@ -149,7 +149,7 @@ test "redos: backref / lookaround compile and are step-budget bounded (.NET mode
     }
     // Backtracking is NOT ReDoS-proof by construction — the explicit step
     // budget is the guard: adversarial input on a catastrophic non-regular
-    // pattern yields a *typed* PatternTooComplex, never a hang.
+    // pattern yields a *typed* MatchBudgetExceeded, never a hang.
     {
         // `(?=a)(a+)+$`: the only non-regular part is the benign `(?=a)`;
         // the catastrophic `(a+)+$` is *regular*. The Seek prefilter's

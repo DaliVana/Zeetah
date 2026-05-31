@@ -4,7 +4,7 @@
 //!
 //! Backtracking is NOT ReDoS-proof by construction, so an explicit step
 //! budget (scaled to the input) bounds the work: exceeding it returns
-//! `error.Budget`, which `regex.zig` maps to `RegexError.PatternTooComplex`
+//! `error.Budget`, which `regex.zig` maps to `RegexError.MatchBudgetExceeded`
 //! (a typed error, never a hang). Continuations are CPS frames threaded on
 //! the call stack (no per-step allocation).
 
@@ -59,7 +59,7 @@ pub const Backtracker = struct {
     /// CPS-recursion depth across `m`/`cont`/`loopStep` (each adds a native
     /// stack frame). The step `budget` bounds *total work* (anti-ReDoS) but
     /// not stack depth; this guard surfaces deep recursion as a typed
-    /// `error.Budget` (→ `PatternTooComplex`) instead of a stack overflow.
+    /// `error.Budget` (→ `MatchBudgetExceeded`) instead of a stack overflow.
     depth: u32 = 0,
 
     // `hasBit` / `isWord` / `lookHolds` now live in `charclass.zig` (`cc`).
@@ -194,7 +194,7 @@ pub const Backtracker = struct {
                     const acc: Cont = .accept;
                     ok = try self.m(nd.a, pos, &acc);
                 } else {
-                    const w = self.fixedWidth(nd.a) orelse return Error.Budget; // variable lookbehind → PatternTooComplex
+                    const w = self.fixedWidth(nd.a) orelse return Error.Budget; // variable lookbehind → MatchBudgetExceeded
                     if (w <= pos) {
                         const acc: Cont = .{ .accept_at = pos };
                         ok = try self.m(nd.a, pos - w, &acc);
@@ -281,7 +281,7 @@ pub const Backtracker = struct {
 
     /// Leftmost (leftmost-first) match + capture slots. `slots_out`
     /// (caller-sized `2*(n_groups+1)`) gets group spans (-1 = absent).
-    /// `error.Budget` on step-limit (→ `PatternTooComplex`).
+    /// `error.Budget` on step-limit (→ `MatchBudgetExceeded`).
     pub fn run(self: *Backtracker, input: []const u8, slots_out: []i32) Error!?Span {
         self.input = input;
         self.budget = 8000 + @as(u64, input.len + 1) * 4000; // O(n) work bound
