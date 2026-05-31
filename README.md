@@ -73,8 +73,8 @@ The published module is named **`zeetah`** and is imported as `@import("zeetah")
 ### From source
 
 ```bash
-git clone https://github.com/zig-utils/zig-regex.git
-cd zig-regex
+git clone https://github.com/DaliVana/Zeetah.git
+cd Zeetah
 zig build test     # build + run the full test suite
 ```
 
@@ -558,4 +558,4 @@ MIT — see [LICENSE](LICENSE).
 
 ## Support
 
-- [GitHub Issues](https://github.com/zig-utils/zig-regex/issues)
+- [GitHub Issues](https://github.com/DaliVana/Zeetah/issues)

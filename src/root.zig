@@ -81,8 +81,8 @@ pub const Patterns = @import("builder.zig").Patterns;
 /// `tests/version_sync.zig` guard (build.zig feeds the manifest version in).
 pub const version = std.SemanticVersion{
     .major = 0,
-    .minor = 1,
-    .patch = 1,
+    .minor = 16,
+    .patch = 0,
 };
 
 test {

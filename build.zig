@@ -69,6 +69,9 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path(path),
                 .target = target,
                 .optimize = optimize,
+                // security.zig calls std.c.clock_gettime for its coarse timing
+                // ratios, which needs libc linked explicitly.
+                .link_libc = std.mem.eql(u8, path, "tests/security.zig"),
                 .imports = &.{.{ .name = "zeetah", .module = internal_mod }},
             }),
         });
