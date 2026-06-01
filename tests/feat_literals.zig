@@ -95,6 +95,43 @@ test "case-insensitive: compile flag" {
     try std.testing.expect(!try cs.isMatch("ABC"));
 }
 
+test "case-insensitive: letter-free literal fast paths (3.3) match correctly" {
+    const a = std.testing.allocator;
+    // Under ci, a letter-free literal folds to itself, so the
+    // literal / lit_prefix / reverse_suffix fast paths are now taken and must
+    // still produce the exact same matches as the case-sensitive engine.
+    const Case = struct { pat: []const u8, in: []const u8, s: ?usize, e: ?usize };
+    const cases = [_]Case{
+        .{ .pat = "12345", .in = "xx 12345 yy", .s = 3, .e = 8 }, // .literal
+        .{ .pat = "12|34|56", .in = "aa 34 bb", .s = 3, .e = 5 }, // .literal multi
+        .{ .pat = "1234.*5678", .in = "p 1234xx5678 q", .s = 2, .e = 12 }, // lit_prefix
+        .{ .pat = "[A-Z].*9999", .in = "Order 9999", .s = 0, .e = 10 }, // reverse_suffix
+        .{ .pat = "12345", .in = "no digits here", .s = null, .e = null },
+    };
+    for (cases) |c| {
+        var rx = try Regex.compileWithFlags(a, c.pat, .{ .case_insensitive = true });
+        defer rx.deinit();
+        var m = try rx.find(c.in);
+        defer if (m) |*mm| mm.deinit(a);
+        try std.testing.expectEqual(c.s == null, m == null);
+        if (c.s) |s| {
+            try std.testing.expectEqual(s, m.?.start);
+            try std.testing.expectEqual(c.e.?, m.?.end);
+        }
+        // Must agree byte-for-byte with the case-sensitive engine (the literal
+        // has no letters, so ci changes nothing).
+        var cs = try Regex.compile(a, c.pat);
+        defer cs.deinit();
+        var cm = try cs.find(c.in);
+        defer if (cm) |*mm| mm.deinit(a);
+        try std.testing.expectEqual(cm == null, m == null);
+        if (cm) |x| {
+            try std.testing.expectEqual(x.start, m.?.start);
+            try std.testing.expectEqual(x.end, m.?.end);
+        }
+    }
+}
+
 test "case-insensitive: inline (?i) and scoped (?i:...)/(?-i:...)" {
     const a = std.testing.allocator;
 
