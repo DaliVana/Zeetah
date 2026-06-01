@@ -54,6 +54,27 @@ test "lookaround: combined with quantifiers / anchors" {
     try std.testing.expect(!try isM(a, "^(?=.*a)(?=.*b).+$", "xxyy"));
 }
 
+test "edge-look: trailing width-1 look peeled onto the DFA (scheme-branch shape)" {
+    const a = std.testing.allocator;
+    // `concat(regular_core, trailing (?<![,.]))` — the ghostty URL scheme
+    // branch shape. Runs `core` on the DFA + an O(1) edge verify, and the
+    // verify must pick the longest end whose last byte ∉ {,.} (i.e. trim a
+    // trailing '.'/',' that the greedy core would otherwise include).
+    const P = "(?:https?:\\/\\/|ftp:\\/\\/)[\\w\\-.~:\\/?#@!$&*+,;=%]+(?<![,.])";
+    try std.testing.expectEqualStrings("https://example.com", (try slice(a, P, "see https://example.com. more")).?);
+    try std.testing.expectEqualStrings("https://a.com", (try slice(a, P, "x https://a.com, y")).?);
+    try std.testing.expectEqualStrings("https://a.com/p?q=1", (try slice(a, P, "go https://a.com/p?q=1 ok")).?);
+    // The (a+)+ -shaped input that used to trip the backtracker budget — now a
+    // linear DFA walk.
+    try std.testing.expectEqualStrings("http://example.com", (try slice(a, P, "dot.http://example.com")).?);
+    try std.testing.expect(!try isM(a, P, "no url here just text"));
+
+    // Trailing negative lookahead at the end is the same shape (e.g. last digit
+    // of a run): `\d(?!\d)` and `\w+(?!\w)`.
+    try std.testing.expectEqualStrings("5", (try slice(a, "\\d(?!\\d)", "in 345 end")).?);
+    try std.testing.expectEqualStrings("foo", (try slice(a, "foo(?!bar)", "foobaz")).?);
+}
+
 test "lookbehind: variable-width positive (?<=a+) / (?<=\\d+)" {
     const a = std.testing.allocator;
     // `a+` is variable width: reverse scan finds a span of `a`s ending at pos.
