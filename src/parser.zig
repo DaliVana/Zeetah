@@ -102,12 +102,12 @@ fn posixClass(name: []const u8) ?common.CharClass {
     const C = common.CharClasses;
     const T = struct { n: []const u8, c: common.CharClass };
     const table = [_]T{
-        .{ .n = "alnum", .c = C.posix_alnum },   .{ .n = "alpha", .c = C.posix_alpha },
-        .{ .n = "blank", .c = C.posix_blank },   .{ .n = "cntrl", .c = C.posix_cntrl },
-        .{ .n = "digit", .c = C.posix_digit },   .{ .n = "graph", .c = C.posix_graph },
-        .{ .n = "lower", .c = C.posix_lower },   .{ .n = "print", .c = C.posix_print },
-        .{ .n = "punct", .c = C.posix_punct },   .{ .n = "space", .c = C.posix_space },
-        .{ .n = "upper", .c = C.posix_upper },   .{ .n = "xdigit", .c = C.posix_xdigit },
+        .{ .n = "alnum", .c = C.posix_alnum }, .{ .n = "alpha", .c = C.posix_alpha },
+        .{ .n = "blank", .c = C.posix_blank }, .{ .n = "cntrl", .c = C.posix_cntrl },
+        .{ .n = "digit", .c = C.posix_digit }, .{ .n = "graph", .c = C.posix_graph },
+        .{ .n = "lower", .c = C.posix_lower }, .{ .n = "print", .c = C.posix_print },
+        .{ .n = "punct", .c = C.posix_punct }, .{ .n = "space", .c = C.posix_space },
+        .{ .n = "upper", .c = C.posix_upper }, .{ .n = "xdigit", .c = C.posix_xdigit },
     };
     for (table) |e| if (std.mem.eql(u8, name, e.n)) return e.c;
     return null;
@@ -189,6 +189,62 @@ fn prescan(pattern: []const u8) Pre {
         }
     }
     return .{ .body = s, .a_start = a_start, .a_end = a_end };
+}
+
+/// Count capturing groups in source order (group 0 = whole match; plain `(`
+/// and `(?<name>)`/`(?P<name>)` count, `(?:`/flags/lookaround do not) and
+/// record `(?<name>)` names (aliasing `pattern`) into `gnames[group]`.
+///
+/// This is the **single source of truth** for capture numbering + names, shared
+/// by the runtime (`regex.zig`) and comptime (`pattern.zig`) `.backtrack` paths
+/// so they agree by construction. It is a *source* scan, deliberately distinct
+/// from the parser's HIR group indices: a capture inside a lookaround or a
+/// `{m,n}` re-parse is parsed non-capturing (no `.cap` node), yet its source
+/// `(` still counts here — matching the runtime, which reserves the slot and
+/// reports the (non-participating) group as absent. So this count is a safe
+/// upper bound on the highest HIR `.cap` index, which is exactly what the tree
+/// backtracker needs to size its live slot-reset range.
+pub fn scanGroups(pattern: []const u8, gnames: *[hir.MAX_GROUPS + 1]?[]const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    var in_class = false;
+    while (i < pattern.len) : (i += 1) {
+        const c = pattern[i];
+        if (c == '\\') {
+            i += 1; // skip escaped byte
+            continue;
+        }
+        if (in_class) {
+            if (c == ']') in_class = false;
+            continue;
+        }
+        if (c == '[') {
+            in_class = true;
+            continue;
+        }
+        if (c != '(') continue;
+        if (i + 1 < pattern.len and pattern[i + 1] == '?') {
+            // (?<name>…) / (?P<name>…) capture; everything else non-capturing.
+            var ns: usize = 0;
+            if (i + 2 < pattern.len and pattern[i + 2] == '<' and
+                i + 3 < pattern.len and pattern[i + 3] != '=' and pattern[i + 3] != '!')
+            {
+                ns = i + 3;
+            } else if (i + 3 < pattern.len and pattern[i + 2] == 'P' and pattern[i + 3] == '<') {
+                ns = i + 4;
+            } else continue;
+            var j = ns;
+            while (j < pattern.len and pattern[j] != '>') j += 1;
+            if (j >= pattern.len) continue;
+            if (n >= hir.MAX_GROUPS) continue;
+            n += 1;
+            gnames[n] = pattern[ns..j];
+        } else {
+            if (n >= hir.MAX_GROUPS) continue;
+            n += 1;
+        }
+    }
+    return n;
 }
 
 /// Parse `src` into `h` (prescan + grammar). On success sets `h.root`,
@@ -365,10 +421,15 @@ fn Parser(comptime cap: ?usize) type {
         }
 
         fn lookLeaf(p: *Self, kind: hir.LookKind) Error!NodeRef {
-            // Look-assertions run on the runtime bounded backtracker; the
-            // comptime `Pattern` DFA path cannot fold them → typed reject
-            // (rendered as @compileError by pattern.zig), like `\p`.
-            if (cap != null) return Error.Unsupported;
+            // Look-assertions (`\b \B`, `\A \z \Z`, `(?m)^ $`) are evaluated by
+            // the tree backtracker — at runtime via `.bt_look`, and at comptime
+            // via the SAME `cc.lookHolds` in the comptime-baked backtracker
+            // (`pattern.zig`'s `.backtrack` arm, routed by `props.has_look`). So
+            // the `.look` node is built for both stores; what must NOT happen is
+            // a look reaching the DFA arm (which cannot fold conditional
+            // epsilons) — `properties.has_look` ⇒ `requires_backtracking`
+            // guarantees it doesn't. (Pre-comptime-backtracker this was a hard
+            // `cap != null` reject; the backtracker made that unnecessary.)
             return p.node(.{ .tag = .look, .set_idx = @intFromEnum(kind) });
         }
 

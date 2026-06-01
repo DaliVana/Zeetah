@@ -282,10 +282,14 @@ export fn phoneMatches(ptr: [*]const u8, len: usize) i32 {
 }
 ```
 
-`Pattern` is **capture-free** and only handles the regular, DFA-representable
-subset. Lookaround, backreferences, captures-with-submatches, and look-assertions
-are a hard `@compileError` on this path (there is no runtime fallback baked into
-a `Pattern`); for those, use the runtime `Regex` shim above.
+`Pattern` covers the **same feature surface as the runtime `Regex`** — regular
+patterns bake a minimized DFA, non-regular ones (lookaround, backreferences,
+atomic/possessive, `\b`, `(?m)`, captures-with-submatches) bake the same bounded
+backtracker into `.rodata`. The only `@compileError`s are constructs genuinely
+unsupported anywhere in the engine (the `.unicode` flag, `\p` scripts / `\p` under
+`(?i)`, an unknown POSIX class, or a pattern past an internal construction ceiling),
+since a `Pattern` has no runtime fallback; for those, use the runtime `Regex` shim
+above.
 
 ---
 
@@ -297,9 +301,14 @@ a `Pattern`); for those, use the runtime `Regex` shim above.
   instead use a `DebugAllocator` or wrap the host's memory growth, but a
   reset-per-call arena is the simplest correct choice for a stateless ABI.
 - **No hidden allocation.** Every Zeetah heap allocation goes through the
-  allocator you pass. `find` / `isMatch` / `count` (and all `Pattern` methods
-  except `findAll`) compute whole-match results without allocating; `captures`,
-  `findAll`, `split`, and `replace` are the allocating calls.
+  allocator you pass. On the comptime `Pattern` (ideal for Wasm), **every
+  one-match verb is allocation-free** — `isMatch` / `find` / `count` / `startsWith`
+  / **`captures`** (groups inline, no allocator) and the lazy `iterator` /
+  `capturesIterator` / `splitIterator`; only the eager slice builders `findAll` →
+  `[]Match` and `capturesAll` → `[]Captures` allocate (one slice). So a Wasm build
+  can extract submatches with **zero** heap traffic. (On the runtime `Regex`,
+  `captures`/`split`/`replace`/`findAll` allocate, since it has no comptime shape
+  to bake.)
 - **Borrowed match views.** A `Match.slice` aliases the input bytes — in the
   shim those bytes live in the shared linear-memory buffer. Read any result out
   (e.g. copy it back into the buffer for JS) *before* the buffer is overwritten

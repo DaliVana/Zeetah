@@ -197,8 +197,12 @@ pub fn Hir(comptime cap: ?usize) type {
     };
 }
 
-/// Deep-copy subtree `ref` from `src` into `dst` (runtime HIR), re-interning
-/// set bitmaps so `dst` is self-contained. `relax_irregular` (comptime):
+/// Deep-copy subtree `ref` from `src` into `dst`, re-interning set bitmaps so
+/// `dst` is self-contained. Generic over BOTH stores' caps (`dcap`/`scap`): the
+/// runtime callers use `null→null`; the comptime seek (`pattern.zig`) uses
+/// `HIR_CAP→HIR_CAP` to derive a regular over-approximation entirely at compile
+/// time. The comptime store ignores `a`, so passing `undefined` is fine there.
+/// `relax_irregular` (comptime):
 ///   * `false` — faithful clone of every tag (the old `split_alt.cloneExact`
 ///     / `delegate.copyReg`).
 ///   * `true`  — `look`/`look_around`/`backref` collapse to `empty` and
@@ -207,9 +211,11 @@ pub fn Hir(comptime cap: ?usize) type {
 ///     derive a regular over-approximation.
 /// One definition replaces three near-identical recursive copies.
 pub fn cloneSubtree(
-    dst: *Hir(null),
+    comptime dcap: ?usize,
+    comptime scap: ?usize,
+    dst: *Hir(dcap),
     a: std.mem.Allocator,
-    src: *const Hir(null),
+    src: *const Hir(scap),
     ref: NodeRef,
     comptime relax_irregular: bool,
 ) Error!NodeRef {
@@ -223,7 +229,7 @@ pub fn cloneSubtree(
                 // look_around carries a sub-expression.
                 else => dst.addNode(a, .{
                     .tag = .look_around,
-                    .a = try cloneSubtree(dst, a, src, nd.a, relax_irregular),
+                    .a = try cloneSubtree(dcap, scap, dst, a, src, nd.a, relax_irregular),
                     .set_idx = nd.set_idx,
                 }),
             };
@@ -234,23 +240,23 @@ pub fn cloneSubtree(
             return dst.addNode(a, .{ .tag = .set, .set_idx = idx });
         },
         .concat, .alt => {
-            const la = try cloneSubtree(dst, a, src, nd.a, relax_irregular);
-            const lb = try cloneSubtree(dst, a, src, nd.b, relax_irregular);
+            const la = try cloneSubtree(dcap, scap, dst, a, src, nd.a, relax_irregular);
+            const lb = try cloneSubtree(dcap, scap, dst, a, src, nd.b, relax_irregular);
             return dst.addNode(a, .{ .tag = nd.tag, .a = la, .b = lb });
         },
         .star, .plus, .opt => {
-            const la = try cloneSubtree(dst, a, src, nd.a, relax_irregular);
+            const la = try cloneSubtree(dcap, scap, dst, a, src, nd.a, relax_irregular);
             return dst.addNode(a, .{ .tag = nd.tag, .a = la, .greedy = nd.greedy });
         },
         .cap => {
-            const la = try cloneSubtree(dst, a, src, nd.a, relax_irregular);
+            const la = try cloneSubtree(dcap, scap, dst, a, src, nd.a, relax_irregular);
             return dst.addNode(a, .{ .tag = .cap, .a = la, .set_idx = nd.set_idx });
         },
         .atomic => {
             // Relaxed over-approximation: drop the cut (`(?>R)` matches a
             // subset of `R`, so plain `R` is a sound language-enlarging
             // superset). Faithful clone: keep the atomic wrapper.
-            const la = try cloneSubtree(dst, a, src, nd.a, relax_irregular);
+            const la = try cloneSubtree(dcap, scap, dst, a, src, nd.a, relax_irregular);
             if (relax_irregular) return la;
             return dst.addNode(a, .{ .tag = .atomic, .a = la });
         },

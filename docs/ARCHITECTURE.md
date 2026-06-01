@@ -301,7 +301,8 @@ instance, no allocator, no `deinit`. This is possible precisely because
 pub const Options = struct {
     max_dfa_states: usize = 256, // soft budget; bounded by the internal MAX_DFA ceiling
     on_oversize: enum { compile_error, allow_oversized } = .compile_error,
-    case_insensitive: bool = false,
+    case_insensitive: bool = false, // peer of (?i)
+    multiline: bool = false,        // peer of (?m): ^/$ as line anchors
 };
 ```
 
@@ -309,22 +310,32 @@ pub const Options = struct {
 still within the internal ceiling; it does **not** rescue a pattern that blows
 the ceiling or uses an unsupported feature (no comptime → runtime fallback).
 
-The comptime path is **capture-free** and covers only the regular,
-DFA-representable subset (including Latin-1 `\p`, whose resolver is
-allocator-free). The following are a **hard `@compileError`** — there is no
-runtime fallback baked into a `Pattern`:
+The comptime path covers the **same feature surface as the runtime `Regex`** — the
+two share the `parser → HIR` front end, and `Pattern` bakes whichever matcher the
+runtime would build: a minimized DFA (or comptime Teddy literal) for regular
+patterns, or the **same bounded tree-backtracker** for non-regular ones, with its
+seek / over-approximation / delegate prefilters and full capture extraction
+(numbered + `(?<name>)` named), all into `.rodata`. So lookaround, backreferences,
+atomic/possessive quantifiers, look-assertions (`\b`, `\B`, mid-pattern `^`/`$`,
+`(?m)` line anchors), lazy-with-end-anchor, and captures **all work at comptime**.
+See *The comptime backtracker* below for how the non-regular tier is baked.
 
-- captures with submatch extraction,
-- lookaround,
-- backreferences,
-- atomic groups / possessive quantifiers,
-- look-assertions (`\b`, `\B`, mid-pattern `^`/`$`, `(?m)` anchors),
-- `\p` under `(?i)`,
-- lazy combined with an end-anchor (`a*?$` — it now routes to the backtracker,
-  which is unavailable at comptime),
-- patterns exceeding the DFA ceiling.
+A `Pattern` bakes one matcher with **no runtime fallback**, so the constructs
+genuinely unsupported *anywhere* in the engine are a hard `@compileError` rather
+than a recoverable runtime `error.NotImplemented`:
 
-For any of those, use the runtime `Regex`.
+- the `.unicode` (codepoint-mode) flag, `\p` scripts / binary props / `\p` under
+  `(?i)`,
+- an unknown POSIX class name,
+- patterns that overflow an internal construction ceiling (`>1000`-count
+  repetition; a DFA over the 256-state ceiling). *Exception:* a large keyword
+  alternation `\b(?:kw|…)\b` that would blow `MAX_NFA` on the DFA path instead
+  routes (via its `\b`) to the tree-backtracker and **compiles** — correct, though
+  slower than the runtime's dedicated Aho-Corasick `boundary_lits` engine, which
+  has no comptime analogue.
+
+For any of those — or whenever the rejection needs to be a recoverable error — use
+the runtime `Regex`.
 
 ## Design decisions & roads not taken
 
@@ -361,8 +372,9 @@ contains **only** the chosen strategy:
 - prefilter literals become `comptime` byte arrays → fully unrolled SIMD /
   constant Teddy masks; a pure-literal `Pattern` bakes a comptime Teddy scan with
   **no DFA table at all**;
-- scratch sizes are exact and baked into `.rodata` → **no allocator** (only
-  `findAll` allocates, for the result slice);
+- scratch sizes are exact and baked into `.rodata` → **no allocator** on the
+  `isMatch`/`find`/`count` path (only `findAll` / `captures` / `capturesAll`
+  allocate, for the result slices / `Match.groups`);
 - concurrency is automatically safe because nothing is shared.
 
 The comptime path bakes the planner's regular-tier strategies (`.literal`,
@@ -372,6 +384,50 @@ prefilters are baked into the comptime DFA too — via the table-type-agnostic
 `exec/search.zig` shared with the runtime — which is what keeps the comptime path
 **O(n), not O(n²)**, on `a.*X`-style adversarial input (previously a
 comptime-only gap).
+
+### The comptime backtracker — baking the non-regular tier
+
+The non-regular tier (backreferences, lookaround, atomic/possessive quantifiers,
+look-assertions, lazy-with-end-anchor) is baked the same way the DFA tier is. The
+strategy is "bake the value, reuse the executor":
+
+- **HIR → `.rodata`.** `exec/backtrack.zig`'s tree matcher was made generic over
+  the HIR store — `BacktrackerG(comptime cap)` (the runtime `Backtracker =
+  BacktrackerG(null)` alias is unchanged). `Pattern` parses to a fixed-size comptime
+  HIR, **trims it to its exact node count**, and bakes that `Hir(node_count)` into
+  `.rodata` — so a small non-regular pattern emits a small table, not the
+  build-ceiling-sized store. The matcher's `m`/`cont`/`loopStep` body is identical
+  across cap modes; `cc.lookHolds` (word boundaries, line/text anchors) is pure and
+  comptime-evaluable, which is what lets look-assertions run at comptime.
+- **Captures** are materialized into an inline `Captures(ng, gnames)` value — a
+  fixed `[ng+1]?Group` array, **no allocator** (the comptime peer of the runtime's
+  heap `Match.groups`; `Pattern.captures(input) ?Captures` vs runtime
+  `Regex.captures(a,input) !?Match`). Group **count + `(?<name>)` names** come from
+  the shared `parser.scanGroups` (lifted into `parser.zig` so both front-ends agree
+  by construction — it is a *source* scan, so a group inside a lookaround still
+  reserves its numbered/named slot). `get`/`getName` are compile-time-indexed.
+- **The prefilters are baked too**, reusing the *zero-allocator* `full_dfa.compute`
+  (the same one the DFA tier uses — the lazy/dense builders are allocator-heavy and
+  were deliberately *not* ported):
+  - a **seek** over-approximation `Dfa256` (relax `look`/`backref`→ε, drop the
+    `atomic` cut) plus the `lb_byte` leading-look-behind `memchr`, threaded into the
+    backtracker's own scan loop so it skips dead regions at every step;
+  - a **delegate** plan that runs regular islands of a concat at DFA speed.
+  Both are baked as values and pointed at with `@constCast` (read-only on the hot
+  path, never freed). Soundness mirrors the runtime `seek.build`/`delegate.build`
+  guards exactly.
+- **Routing** is comptime-only: `pattern.zig buildAll` dispatches on
+  `requires_backtracking or has_look` *before* `thompson.build`. The shared
+  `properties.requires_backtracking` deliberately omits `has_look` so the *runtime*
+  keeps its separate, faster `.bt_look` engine; the comptime path, which has no
+  `.bt_look`, folds looks into the one backtracker arm.
+
+Iteration runs over the **full input in absolute coordinates** (`runFrom(input,
+from, …)`), never an `input[from..]` slice — a slice would make a resumed start look
+like start-of-text and mis-fire `start_line`/`\b`. Correctness is pinned by the
+`Pattern`⇄`Regex` differential tests in `tests/feat_api.zig` (find-family, captures,
+seek-over-gaps, and look-assertions), plus the cross-engine count gate in the
+benchmark, which now exercises the comptime path on every pattern it can build.
 
 ### A DFA core, not a PikeVM
 

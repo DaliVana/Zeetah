@@ -31,6 +31,7 @@ const bounded_bt = @import("exec/bounded_bt.zig");
 const backtrack = @import("exec/backtrack.zig");
 const seek_mod = @import("exec/seek.zig");
 const split_alt = @import("exec/split_alt.zig");
+const edge_look = @import("exec/edge_look.zig");
 const delegate = @import("exec/delegate.zig");
 const dupword = @import("exec/dupword.zig");
 const lazy_dfa = @import("exec/lazy_dfa.zig");
@@ -43,7 +44,7 @@ pub const Group = @import("match.zig").Group;
 const wholeMatch = @import("match.zig").wholeMatch;
 const advanceEmpty = @import("match.zig").advanceEmpty;
 
-const MetaKind = enum { literal, dfa, lit_prefix, reverse_suffix, bt_look, backtrack, split_alt, lazy_dfa, dense_search, class_span, boundary_lits, dup_word };
+const MetaKind = enum { literal, dfa, lit_prefix, reverse_suffix, bt_look, backtrack, split_alt, lazy_dfa, dense_search, class_span, boundary_lits, dup_word, dfa_edge_look };
 
 /// `.boundary_lits` engine: `\b(?:lit|lit|…)\b` (a word-boundary-bracketed
 /// pure literal alternation). The naive NFA of a big keyword list blows
@@ -106,52 +107,11 @@ const BLits = struct {
     }
 };
 
-/// Count capturing groups in source order (mirrors `parser` numbering:
-/// group 0 = whole match; plain `(` and `(?<name>)`/`(?P<name>)` count,
-/// `(?:`/flags/lookaround do not) and record `(?<name>)` names (aliasing
-/// `pattern`) into `gnames[group]`.
-fn scanGroups(pattern: []const u8, gnames: *[hir.MAX_GROUPS + 1]?[]const u8) usize {
-    var n: usize = 0;
-    var i: usize = 0;
-    var in_class = false;
-    while (i < pattern.len) : (i += 1) {
-        const c = pattern[i];
-        if (c == '\\') {
-            i += 1; // skip escaped byte
-            continue;
-        }
-        if (in_class) {
-            if (c == ']') in_class = false;
-            continue;
-        }
-        if (c == '[') {
-            in_class = true;
-            continue;
-        }
-        if (c != '(') continue;
-        if (i + 1 < pattern.len and pattern[i + 1] == '?') {
-            // (?<name>…) / (?P<name>…) capture; everything else non-capturing.
-            var ns: usize = 0;
-            if (i + 2 < pattern.len and pattern[i + 2] == '<' and
-                i + 3 < pattern.len and pattern[i + 3] != '=' and pattern[i + 3] != '!')
-            {
-                ns = i + 3;
-            } else if (i + 3 < pattern.len and pattern[i + 2] == 'P' and pattern[i + 3] == '<') {
-                ns = i + 4;
-            } else continue;
-            var j = ns;
-            while (j < pattern.len and pattern[j] != '>') j += 1;
-            if (j >= pattern.len) continue;
-            if (n >= hir.MAX_GROUPS) continue;
-            n += 1;
-            gnames[n] = pattern[ns..j];
-        } else {
-            if (n >= hir.MAX_GROUPS) continue;
-            n += 1;
-        }
-    }
-    return n;
-}
+/// Capture-group numbering + `(?<name>)` names, in source order. Lifted to
+/// `parser.zig` as the single source of truth so the runtime and comptime
+/// (`pattern.zig`) `.backtrack` paths agree by construction; aliased here so the
+/// existing call site reads unchanged.
+const scanGroups = parser.scanGroups;
 
 /// Shift every set capture slot (`>= 0`) and leave unset slots (`-1`) alone,
 /// converting offsets that were computed over `input[pos..]` back to absolute
@@ -324,12 +284,34 @@ pub const Regex = struct {
     /// `.dup_word`: owned linear recogniser for the `(\b CLASS+ \b) SEP \1`
     /// adjacent-duplicate-token shape (see `exec/dupword.zig`).
     dw: ?*dupword.DupWord = null,
+    /// `.dfa_edge_look`: verify spec for the peeled trailing width-1 look.
+    /// The regular `core` runs on `self.dfa` (a normal `Dfa256`); this is the
+    /// O(1) edge check applied to each candidate end (see `exec/edge_look.zig`).
+    el_spec: edge_look.Spec = .{ .set = [_]u8{0} ** 32, .behind = false, .neg = false },
     /// Captures fast path: when the pattern is one-pass (decided at compile by
     /// the pure `onepass.isOnePass` over the DFA), `captures()` resolves slots
     /// via a single allocation-free deterministic forward pass instead of the
     /// `bounded_bt` memoized double-search. Pure speed — `bounded_bt` is the
     /// always-correct fallback if the deterministic walk bails.
     op_onepass: bool = false,
+
+    /// Build the regular-`core` DFA for the `.dfa_edge_look` strategy: point
+    /// the HIR root at `core_ref`, build NFA → `Dfa256` (unanchored at the end —
+    /// the trailing look is handled by the O(1) edge verify, not the DFA),
+    /// then restore the root. Returns `null` (caller falls back) on any build
+    /// failure. The `required`-byte prefilter is computed over the core.
+    fn buildEdgeLookDfa(allocator: std.mem.Allocator, h: *hir.Hir(null), core_ref: hir.NodeRef) ?*full_dfa.Dfa256 {
+        const saved = h.root;
+        h.root = core_ref;
+        defer h.root = saved;
+        var nfa = thompson.build(null, h) catch return null;
+        var d = full_dfa.compute(null, &nfa, h.anchored_start, false);
+        if (d.outcome != .ok) return null;
+        d.required = seq_extract.requiredByte(null, h);
+        const heap = allocator.create(full_dfa.Dfa256) catch return null;
+        heap.* = d;
+        return heap;
+    }
 
     /// Build a `.lazy_dfa` engine over `nfa_local` (single-pass unanchored
     /// + reverse-start; also the eager-DFA-blowup fallback). Reuses an
@@ -516,6 +498,27 @@ pub const Regex = struct {
         // deferred deinit is a no-op). .NET model: compiles and runs,
         // step-budget → MatchBudgetExceeded (never a hang).
         if (props.requires_backtracking) {
+            // Edge-look peel: `concat(regular_greedy_core, trailing_width1_look)`
+            // runs `core` on the linear DFA + an O(1) edge verify, instead of
+            // demoting the whole pattern to the tree backtracker (the lookaround
+            // analogue of `bt_look`). Capture-free only. See `exec/edge_look.zig`.
+            if (ng0 == 0) {
+                if (edge_look.recognize(null, &h)) |rec| {
+                    if (buildEdgeLookDfa(allocator, &h, rec.core)) |coredfa| {
+                        return Regex{
+                            .allocator = allocator,
+                            .pattern = owned,
+                            .flags = flags,
+                            .kind = .dfa_edge_look,
+                            .dfa = coredfa,
+                            .el_spec = rec.spec,
+                            .n_groups = 0,
+                            .gnames = gnames0,
+                        };
+                    }
+                }
+            }
+
             // Per-segment delegation: a top-level alternation with no capture
             // groups and a mix of regular / non-regular branches runs each
             // regular run on an anchored DFA and only the non-regular
@@ -764,7 +767,7 @@ pub const Regex = struct {
         // single allocation-free forward pass. No look/backref here (those
         // returned to bt_look/backtrack above). `nfa` is retained because
         // `need_nfa = needs_captures or has_look`.
-        const op_ok = props.needs_captures and onepass.isOnePassNfa(&nfa);
+        const op_ok = props.needs_captures and onepass.isOnePassNfa(null, &nfa);
 
         var self = Regex{
             .allocator = allocator,
@@ -981,6 +984,7 @@ pub const Regex = struct {
             .class_span => self.csIsMatch(input),
             .boundary_lits => self.blits.?.find(input, 0) != null,
             .dup_word => self.dw.?.find(input, 0) != null,
+            .dfa_edge_look => edge_look.nextFrom(self.dfa.?, &self.el_spec, input, 0) != null,
         };
     }
 
@@ -1055,7 +1059,7 @@ pub const Regex = struct {
                     @memset(slots[0..nslots], -1);
                     slots[0] = @intCast(sp.start);
                     slots[1] = @intCast(sp.end);
-                    if (onepass.fill(self.nfa.?, input, .{ .start = sp.start, .end = sp.end }, slots[0..nslots])) {
+                    if (onepass.fill(null, self.nfa.?, input, .{ .start = sp.start, .end = sp.end }, slots[0..nslots])) {
                         span = sp;
                         break :done;
                     }
@@ -1144,6 +1148,7 @@ pub const Regex = struct {
                 const r = self.dw.?.find(input, pos) orelse break :blk null;
                 break :blk core.Span{ .start = r.start, .end = r.end }; // absolute
             },
+            .dfa_edge_look => edge_look.nextFrom(self.dfa.?, &self.el_spec, input, pos), // absolute
         };
     }
 

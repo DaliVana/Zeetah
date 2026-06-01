@@ -218,6 +218,12 @@ pub fn analyze(comptime cap: ?usize, h: *const hir.Hir(cap)) Properties {
 
     // `saw_lazy && anchored_end` (`a*?$`) is regular but the DFA accept-cut
     // can't model lazy-against-`$`, so route it to the tree backtracker too.
+    // NOTE: `has_look` is deliberately NOT folded in here — the runtime keeps it
+    // a separate flag so a look pattern routes to its `.bt_look` engine (NFA +
+    // visited-bitset, with the line-anchor `\n`-memchr fast path), not the HIR
+    // `.backtrack` tree-walker. The comptime `Pattern` (which has no `.bt_look`)
+    // treats `has_look` as backtracking in `pattern.zig buildAll` instead, so
+    // the change stays comptime-only and the runtime routing is untouched.
     p.requires_backtracking = containsBacktrack(cap, h, h.root) or
         (p.saw_lazy and p.anchored_end);
     p.needs_captures = containsCap(cap, h, h.root);

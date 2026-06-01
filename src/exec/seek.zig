@@ -44,7 +44,7 @@ const NodeRef = hir.NodeRef;
 /// (a sound, language-enlarging relaxation), everything else faithful, sets
 /// re-interned. Thin alias over `hir.cloneSubtree(…, true)`.
 inline fn lowerApprox(dst: *H, a: std.mem.Allocator, src: *const H, ref: NodeRef) hir.Error!NodeRef {
-    return hir.cloneSubtree(dst, a, src, ref, true);
+    return hir.cloneSubtree(null, null, dst, a, src, ref, true);
 }
 
 /// Over-approximation prefilter for the backtracker tier. Locates the next

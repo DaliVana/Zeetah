@@ -28,9 +28,11 @@ backreferences). You call one API; the engine picks the machine.
 - **Bounded by design** — patterns that *require* backtracking
   (backreferences, lookaround) run under an explicit step budget and return a
   typed `error.MatchBudgetExceeded` instead of hanging.
-- **Compile-time patterns** — for a comptime-known pattern, the whole
-  parse → NFA → DFA pipeline runs at compile time and bakes the matcher into
-  `.rodata`: no allocator, no runtime compilation. See [`Pattern`](#compile-time-patterns).
+- **Compile-time patterns** — for a comptime-known pattern, the whole pipeline
+  runs at compile time and bakes the matcher into `.rodata`: no allocator, no
+  runtime compilation. Covers the **full feature surface** — a minimized DFA for
+  regular patterns, the same bounded backtracker (with captures) for non-regular
+  ones. See [`Pattern`](#compile-time-patterns).
 - **Capture-free fast path, opt-in captures** — `find` / `isMatch` / `findAll`
   return whole-match spans with no allocation; submatches are available on
   demand via [`captures`](#capture-groups).
@@ -274,14 +276,14 @@ compile-time path — live in **[Architecture](docs/ARCHITECTURE.md)**.
 | Custom classes | `[abc]`, `[a-z]`, `[^0-9]`, `[[:alpha:]]` | ✅ unknown POSIX name → `NotImplemented` |
 | Unicode properties | `\p{L}`, `\P{Nd}`, `\pL`, `[^\p{L}]` | ⚠️ **General_Category, Latin-1 bytes only**²; scripts/binary props/`\p` under `(?i)`/multibyte codepoints → `NotImplemented`⁵ |
 | Inline flags | `(?i)`, `(?s)`, `(?x)`, `(?m)` and scoped `(?i:…)` | ✅ |
-| Anchors | `^`, `$`, `\A`, `\z`, `\Z`, `\b`, `\B` | ✅ look-assertions are **runtime-only**³ |
+| Anchors | `^`, `$`, `\A`, `\z`, `\Z`, `\b`, `\B` | ✅ work at runtime **and** comptime³ |
 | Wildcard | `.` | ✅ excludes `\n` unless `(?s)` |
 | Capturing groups | `(...)` | ✅ slices via opt-in `captures()`⁴ |
 | Named groups | `(?<name>...)`, `(?P<name>...)` | ✅ duplicate name → `InvalidPattern` |
 | Non-capturing | `(?:...)` | ✅ |
-| Lookahead | `(?=...)`, `(?!...)` | ✅ runtime-only, step-budgeted³ |
+| Lookahead | `(?=...)`, `(?!...)` | ✅ step-budgeted; runtime **and** comptime³ |
 | Lookbehind | `(?<=...)`, `(?<!...)` | ⚠️ **fixed-width only**; variable-width → `MatchBudgetExceeded` at match |
-| Backreferences | `\1`, `\k<name>` | ⚠️ runtime-only, step-budgeted; unset group matches empty string |
+| Backreferences | `\1`, `\k<name>` | ✅ step-budgeted; runtime **and** comptime; unset group matches empty string |
 | Compile flags | `.case_insensitive`, `.dot_all`, `.extended`, `.multiline` | ✅ peers of `(?i)`/`(?s)`/`(?x)`/`(?m)` |
 | Compile flags | `.unicode` (codepoint mode) | ❌ `NotImplemented`⁵ |
 | Escaping | `\\`, `\.`, `\n`, `\t`, `\r` | ✅ |
@@ -290,8 +292,8 @@ compile-time path — live in **[Architecture](docs/ARCHITECTURE.md)**.
 > groups** (`a*+` ≡ `(?>a*)`) with true atomic semantics — they commit and never
 > give back, so `a*+a` does **not** match `"aaa"`. Like the other non-regular
 > constructs they run on the bounded backtracker (match-budget bounded), not a
-> DFA, so they are runtime-only — a `@compileError` under the comptime
-> [`Pattern`](#compile-time-patterns).
+> DFA — at runtime **and** at comptime, where [`Pattern`](#compile-time-patterns)
+> bakes that backtracker into `.rodata` (see that section).
 >
 > **² Unicode `\p`** currently covers **General_Category** for codepoints in the
 > Latin-1 range (bytes `0x00`–`0xFF`): one/two-letter categories (`L`, `Lu`,
@@ -314,8 +316,10 @@ compile-time path — live in **[Architecture](docs/ARCHITECTURE.md)**.
 > non-breaking change, not a silent semantics shift. Tracked, not scheduled.
 >
 > **³ Look-assertions** (`\b`, `\B`, mid-pattern `^`/`$`, lookahead, lookbehind)
-> run on the bounded backtracker and are **runtime-only** — the compile-time
-> [`Pattern`](#compile-time-patterns) path rejects them with a `@compileError`.
+> run on the bounded backtracker — at runtime **and** under the compile-time
+> [`Pattern`](#compile-time-patterns), which bakes the same backtracker (and its
+> seek prefilters) into `.rodata`. (Leading `^`/`\A` and trailing `$`/`\z` are not
+> look-assertions at all — the prescan folds them into the anchored DFA fast path.)
 >
 > **⁴ Captures.** `find` / `isMatch` / `findAll` return the correct whole-match
 > span but leave `groups` empty. Use [`captures`](#capture-groups) to extract
@@ -351,7 +355,8 @@ no allocator, no `deinit`:
 const zeetah = @import("zeetah");
 
 // Pure-literal patterns bake a comptime Teddy scan (no DFA table);
-// everything else bakes a minimized DFA into .rodata.
+// regular patterns bake a minimized DFA into .rodata; non-regular patterns
+// (below) bake the tree-backtracker + its seek prefilters into .rodata.
 const Phone = zeetah.Pattern("[0-9]{3}-[0-9]{4}", .{});
 
 test "allocation-free comptime match" {
@@ -361,23 +366,67 @@ test "allocation-free comptime match" {
     }
     try std.testing.expectEqual(@as(usize, 1), Phone.count("call 555-1234"));
 }
+
+// `find` returns the WHOLE match (`Match`); `captures` returns the SUBMATCHES
+// (`Captures`). On the comptime path `captures` is **zero-allocation** — the
+// group count + names are known at compile time, so groups live inline. `get(i)`
+// is compile-time-indexed (a bad index is a compile error, not a runtime null);
+// `getName` resolves the (?<name>) at compile time. Regular patterns (DFA arm) too.
+const Date = zeetah.Pattern("(?<y>[0-9]{4})-([0-9]{2})-([0-9]{2})", .{});
+
+test "zero-alloc comptime captures" {
+    if (Date.captures("ts 2026-06-01!")) |c| {        // ?Captures — NO allocator
+        try std.testing.expectEqualStrings("2026-06-01", c.slice());  // whole match
+        try std.testing.expectEqualStrings("2026", c.get(1).?.slice);  // by index
+        try std.testing.expectEqualStrings("2026", c.getName("y").?.slice); // by name
+    }
+}
+
+// Non-regular features work at comptime too — backreferences, lookaround,
+// atomic/possessive, word boundaries, (?m) line anchors. These bake the
+// bounded backtracker into .rodata (no DFA); `captures` is still zero-alloc.
+const Dup = zeetah.Pattern("(\\w+) \\1", .{});            // backreference
+
+test "lazy, allocation-free verbs" {
+    // iterator / splitIterator are lazy values — O(1) memory, free early-break:
+    var it = zeetah.Pattern("[0-9]+", .{}).iterator("a12 b345 c6");
+    while (it.next()) |m| { _ = m; }                  // no allocator, no slice
+
+    try std.testing.expect(zeetah.Pattern("v[0-9]+", .{}).startsWith("v2.0"));
+    _ = Dup; // (Dup used above)
+}
 ```
 
-`isMatch` / `find` / `count` are fully allocation-free; only `findAll(allocator, …)`
-allocates (just the result slice). Options (`zeetah.PatternOptions`):
+**The mental model:** `find` → `Match` (the whole match); `captures` → `Captures`
+(the submatches). On the comptime `Pattern`, **everything that returns one match is
+allocation-free** — `isMatch` / `find` / `count` / `captures` (inline `Captures`) /
+`iterator` / `capturesIterator` / `splitIterator` / `startsWith`. Only the **eager,
+return-a-slice** verbs take an allocator: `findAll` → `[]Match`, `capturesAll` →
+`[]Captures` (one slice; the per-match groups are still inline — no per-match heap,
+unlike the runtime `Regex`). Options (`zeetah.PatternOptions`):
 
 ```zig
 pub const Options = struct {
     max_dfa_states: usize = 256,                                  // soft budget; bounded by an internal ceiling
     on_oversize: enum { compile_error, allow_oversized } = .compile_error, // over-budget (but representable) DFA
-    case_insensitive: bool = false,
+    case_insensitive: bool = false,                              // peer of (?i)
+    multiline: bool = false,                                     // peer of (?m): ^/$ match at line boundaries
 };
 ```
 
-The comptime path is **capture-free** and supports only the regular,
-DFA-representable subset. Captures-with-submatches, lookaround, backreferences,
-and look-assertions are a **hard `@compileError`** — there is **no runtime
-fallback** baked into a `Pattern`. For those, use the runtime `Regex`.
+**The comptime path now matches the runtime engine's full feature surface** — the
+same `parser → HIR` front end feeds both. A regular pattern bakes a minimized DFA;
+a non-regular one (backreference, lookaround, atomic group, possessive quantifier,
+word boundary, `(?m)` line anchor, lazy-with-end-anchor) bakes the same bounded
+tree-backtracker the runtime uses, with capture extraction (`captures` /
+`capturesAll`, numbered **and** `(?<name>)` named) and the seek/over-approximation
+prefilters, all into `.rodata`. There is **no runtime fallback** inside a `Pattern`,
+so the few constructs that are genuinely unsupported anywhere in the engine (the
+`.unicode` flag, `\p` scripts, an unknown POSIX class) are a **`@compileError`**
+rather than a runtime `error.NotImplemented` — use the runtime `Regex` if you need
+the error to be recoverable. The match-budget (ReDoS) bound applies identically;
+since the comptime API is non-erroring, a budget exceedance surfaces as "no match"
+rather than `error.MatchBudgetExceeded`.
 
 ## Builder & ready-made patterns
 

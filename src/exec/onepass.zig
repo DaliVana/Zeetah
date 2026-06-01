@@ -65,24 +65,25 @@ inline fn hasBit(set: *const [32]u8, c: u8) bool {
 /// continue two ways ⇒ more than one live thread ⇒ `fill`'s single
 /// deterministic choice could diverge from leftmost-greedy). Conservative:
 /// false ⇒ just use `bounded_bt`; true ⇒ `fill` is exact.
-pub fn isOnePassNfa(nfa: *const thompson.Nfa(null)) bool {
+pub fn isOnePassNfa(comptime cap: ?usize, nfa: *const thompson.Nfa(cap)) bool {
+    @setEvalBranchQuota(8_000_000); // comptime callers (pattern.zig) recurse deeply
     var s: usize = 0;
     while (s < nfa.n_states) : (s += 1) {
         var seen = [_]bool{false} ** MAX_NFA;
         var acc = [_]u8{0} ** 32; // union of consuming sets seen in this closure
-        if (!closureOk(nfa, @intCast(s), &seen, &acc)) return false;
+        if (!closureOk(cap, nfa, @intCast(s), &seen, &acc)) return false;
     }
     return true;
 }
 
-fn closureOk(nfa: *const thompson.Nfa(null), st: u16, seen: *[MAX_NFA]bool, acc: *[32]u8) bool {
+fn closureOk(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), st: u16, seen: *[MAX_NFA]bool, acc: *[32]u8) bool {
     if (seen[st]) return false; // ε-cycle / ε-revisit ⇒ not a one-pass tree
     seen[st] = true;
     var ei: usize = 0;
     while (ei < nfa.n_edges) : (ei += 1) {
         if (nfa.e_from[ei] != st) continue;
         switch (nfa.e_kind[ei]) {
-            0 => if (!closureOk(nfa, nfa.e_to[ei], seen, acc)) return false,
+            0 => if (!closureOk(cap, nfa, nfa.e_to[ei], seen, acc)) return false,
             2 => return false, // look edge: not a capture-one-pass pattern
             else => {
                 const set = &nfa.sets[nfa.e_set[ei]];
@@ -118,12 +119,12 @@ const Step = union(enum) { matched, fail, consume: u16 };
 /// `span.end` (a mis-gated non-one-pass pattern, an ε-cycle, or a look edge):
 /// the caller then falls back to `bounded_bt`, which is always correct. So
 /// this is a pure speed path — never a correctness risk.
-pub fn fill(nfa: *const thompson.Nfa(null), input: []const u8, span: Span, slots: []i32) bool {
+pub fn fill(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), input: []const u8, span: Span, slots: []i32) bool {
     var st: u16 = @intCast(nfa.start);
     var pos: usize = span.start;
     while (true) {
         var seen = [_]bool{false} ** MAX_NFA;
-        switch (epsWalk(nfa, input, pos, span.end, slots, &seen, st)) {
+        switch (epsWalk(cap, nfa, input, pos, span.end, slots, &seen, st)) {
             .matched => return true,
             .fail => return false,
             .consume => |nx| {
@@ -135,7 +136,8 @@ pub fn fill(nfa: *const thompson.Nfa(null), input: []const u8, span: Span, slots
 }
 
 fn epsWalk(
-    nfa: *const thompson.Nfa(null),
+    comptime cap: ?usize,
+    nfa: *const thompson.Nfa(cap),
     input: []const u8,
     pos: usize,
     end: usize,
@@ -158,7 +160,7 @@ fn epsWalk(
                     old = slots[@intCast(slot)];
                     slots[@intCast(slot)] = @intCast(pos);
                 }
-                const r = epsWalk(nfa, input, pos, end, slots, seen, nfa.e_to[ei]);
+                const r = epsWalk(cap, nfa, input, pos, end, slots, seen, nfa.e_to[ei]);
                 if (r != .fail) return r; // chosen path: keep the saves
                 if (slot >= 0) slots[@intCast(slot)] = old; // dead branch: undo
             },
@@ -221,7 +223,7 @@ test "onepass: isOnePassNfa accepts deterministic, rejects overlap/ambiguous" {
         defer h.deinit(a);
         parser.parse(null, &h, a, c.p, .{}) catch continue;
         var nfa = try thompson.build(null, &h);
-        try std.testing.expectEqual(c.want, isOnePassNfa(&nfa));
+        try std.testing.expectEqual(c.want, isOnePassNfa(null, &nfa));
     }
 }
 
@@ -236,14 +238,14 @@ test "onepass: fill captures are byte-identical to bounded_bt (soundness gate)" 
     // proven bounded-backtracker reconstruction exactly. If `fill` ever
     // diverges (or wrongly claims one-pass), this fails loudly.
     const pats = [_][]const u8{
-        "(a)(b)(c)",      "(ab)+c",        "(\\d{3})-(\\d{4})",
-        "x(\\w+)y",       "(a)(b)?c",      "((a)(b))c",
-        "a(bc)*d",        "(foo)(bar)?",   "(\\d+)\\.(\\d+)",
+        "(a)(b)(c)", "(ab)+c",      "(\\d{3})-(\\d{4})",
+        "x(\\w+)y",  "(a)(b)?c",    "((a)(b))c",
+        "a(bc)*d",   "(foo)(bar)?", "(\\d+)\\.(\\d+)",
     };
     const ins = [_][]const u8{
-        "",          "abc",          "xababcy",      "555-1234",
-        "x hello y", "x  y",         "ac",           "abbcd",
-        "foobar",    "foo",          "3.14 end",     "no match here",
+        "",          "abc",  "xababcy",  "555-1234",
+        "x hello y", "x  y", "ac",       "abbcd",
+        "foobar",    "foo",  "3.14 end", "no match here",
         "ababc",
     };
     for (pats) |p| {
@@ -252,7 +254,7 @@ test "onepass: fill captures are byte-identical to bounded_bt (soundness gate)" 
         parser.parse(null, &h, a, p, .{}) catch continue;
         var nfa = try thompson.build(null, &h);
         const d = full_dfa.compute(null, &nfa, h.anchored_start, h.anchored_end);
-        if (d.outcome != .ok or !isOnePassNfa(&nfa)) continue;
+        if (d.outcome != .ok or !isOnePassNfa(null, &nfa)) continue;
 
         for (ins) |in| {
             // Reference: bounded_bt (its own findLeftmost + trace recon).
@@ -272,7 +274,7 @@ test "onepass: fill captures are byte-identical to bounded_bt (soundness gate)" 
                 got[0] = @intCast(sp.start);
                 got[1] = @intCast(sp.end);
                 // isOnePassNfa(true) ⇒ fill MUST resolve deterministically.
-                try std.testing.expect(fill(&nfa, in, .{ .start = sp.start, .end = sp.end }, got[0..]));
+                try std.testing.expect(fill(null, &nfa, in, .{ .start = sp.start, .end = sp.end }, got[0..]));
                 try std.testing.expectEqualSlices(i32, ref[0..bounded_bt.MAX_SLOTS], got[0..bounded_bt.MAX_SLOTS]);
             }
         }

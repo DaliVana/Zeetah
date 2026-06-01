@@ -415,15 +415,33 @@ test "allocation-free comptime match" {
 }
 ```
 
-Static methods:
+Static methods. **Mental model:** `find` → `Match` (whole match); `captures` →
+`Captures` (submatches). Every one-match verb is allocation-free:
 
 - `isMatch(input) bool` — allocation-free, no error union.
-- `find(input) ?Match` — allocation-free, **no error union** (unlike runtime `find`).
-- `count(input) usize` — allocation-free, no error union.
-- `findAll(allocator, input) ![]Match` — the **only** method that allocates (the result slice).
+- `find(input) ?Match` — whole match; allocation-free, **no error union** (unlike runtime `find`).
+- `count(input) usize` — allocation-free.
+- `startsWith(input) bool` — anchored-prefix test, allocation-free.
+- `captures(input) ?Captures` — **submatches with NO allocator** (groups inline; the
+  big win vs runtime `Regex.captures`, which allocates `Match.groups`). Read with
+  `c.get(comptime i)` / `c.getName(comptime name)` (both compile-time-checked),
+  `c.slice()`, or runtime `c.group(i)` / `c.groupByName(name)`. Numbered + named.
+- `iterator(input)` / `capturesIterator(input)` / `splitIterator(input)` — lazy
+  value iterators (`while (it.next()) |m|`), O(1) memory, no allocator.
+- `findAll(allocator, input) ![]Match` / `capturesAll(allocator, input) ![]Captures`
+  — eager; allocate **one** result slice (the `Captures` elements stay inline — no
+  per-match heap, unlike the runtime `Regex`).
 
-The comptime path is capture-free — there is no `captures` on `Pattern`; reach
-for the runtime `Regex.captures` if you need submatches.
+Captures work at comptime too, and unlike the runtime they cost no allocation —
+`Pattern` is no longer capture-free.
+
+```zig
+const Date = zeetah.Pattern("(?<y>[0-9]{4})-([0-9]{2})-([0-9]{2})", .{});
+if (Date.captures("ts 2026-06-01!")) |c| {   // ?Captures — no allocator
+    // c.slice() == "2026-06-01"; c.get(1) == "2026"; c.getName("y") == "2026"
+    std.debug.print("{s}\n", .{c.getName("y").?.slice});
+}
+```
 
 ### Options
 
@@ -431,21 +449,33 @@ for the runtime `Regex.captures` if you need submatches.
 // zeetah.PatternOptions:
 //   max_dfa_states: usize = 256          (soft budget; bounded by an internal 256 ceiling, cannot raise it)
 //   on_oversize: enum { compile_error, allow_oversized } = .compile_error
-//   case_insensitive: bool = false
+//   case_insensitive: bool = false       (peer of (?i))
+//   multiline: bool = false              (peer of (?m): ^/$ as line anchors)
 
 const Word = zeetah.Pattern("[a-z]+", .{ .case_insensitive = true });
 
 test "case-insensitive comptime pattern" {
     try std.testing.expect(Word.isMatch("ZEETAH"));
 }
+
+// Non-regular features compile at comptime — they bake the bounded backtracker:
+const Dup = zeetah.Pattern("(\\w+) \\1", .{});         // backreference + captures
+const Logs = zeetah.Pattern("^ERROR", .{ .multiline = true }); // (?m) line anchor
+
+test "non-regular comptime patterns" {
+    try std.testing.expect(Dup.isMatch("the the"));
+    try std.testing.expectEqual(@as(usize, 2), Logs.count("ERROR a\nok\nERROR b"));
+}
 ```
 
-The comptime path supports only the regular, DFA-representable subset (this
-*does* include Latin-1 `\p{…}`). Captures-with-submatches, lookaround,
-backreferences, look-assertions (`\b`, `\B`, mid-pattern `^`/`$`, `(?m)`
-anchors), `\p` under `(?i)`, lazy-plus-end-anchor (`a*?$`), and patterns
-exceeding the DFA ceiling are a **hard `@compileError`** — there is no runtime
-fallback baked into a `Pattern`. For those, use the runtime `Regex`.
+The comptime path now covers the **same feature surface as the runtime `Regex`**:
+regular patterns bake a minimized DFA, non-regular ones (captures, lookaround,
+backreferences, atomic/possessive, `\b`, `(?m)`, lazy-plus-end-anchor) bake the
+same bounded backtracker. The only `@compileError`s are the constructs genuinely
+unsupported *anywhere* in the engine — the `.unicode` flag, `\p` scripts / `\p`
+under `(?i)`, an unknown POSIX class, or a pattern past an internal construction
+ceiling — since a `Pattern` has no runtime fallback. For those, use the runtime
+`Regex`.
 
 > `on_oversize = .allow_oversized` only bakes an over-budget but
 > representable DFA for a large *regular* pattern; it does **not** make a

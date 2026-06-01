@@ -71,6 +71,13 @@ pub const Pattern = @import("pattern.zig").Pattern;
 /// Options for `Pattern`.
 pub const PatternOptions = @import("pattern.zig").Options;
 
+/// Comptime predicate: does `Pattern(pattern, …)` compile, or would it hit one
+/// of its `@compileError`s (unsupported feature / malformed / too complex)?
+/// Lets callers (and tooling like the cross-engine benchmark) branch at compile
+/// time over a pattern set instead of failing the build on the first pattern
+/// the comptime path can't represent. `ci` matches `Options.case_insensitive`.
+pub const compilesAtComptime = @import("pattern.zig").compilesAtComptime;
+
 /// Type-safe fluent builder for constructing patterns programmatically.
 pub const Builder = @import("builder.zig").Builder;
 

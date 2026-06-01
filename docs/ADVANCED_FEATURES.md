@@ -301,18 +301,31 @@ test "allocation-free comptime match" {
 
 ### Static method surface
 
+Mental model: `find` → `Match` (whole match); `captures` → `Captures` (submatches,
+inline & allocation-free).
+
 | Method | Signature | Allocates? |
 |--------|-----------|------------|
 | `isMatch` | `isMatch(input) bool` | no |
-| `find` | `find(input) ?Match` (no error union) | no |
+| `find` | `find(input) ?Match` (whole match, no error union) | no |
 | `count` | `count(input) usize` | no |
+| `startsWith` | `startsWith(input) bool` | no |
+| `captures` | `captures(input) ?Captures` | **no** (groups inline) |
+| `iterator` / `capturesIterator` / `splitIterator` | `(input) → lazy iterator` | no |
 | `findAll` | `findAll(allocator, input) ![]Match` | the result slice only |
+| `capturesAll` | `capturesAll(allocator, input) ![]Captures` | the slice only (elements inline) |
 
-The comptime `Pattern` path is **capture-free** — it has no `captures` method
-(submatch extraction is a hard `@compileError`). Use the runtime `Regex.captures`
-for groups.
+`captures` extracts submatches at comptime — numbered **and** `(?<name>)` named —
+into an inline `Captures` value with **no allocator**, the big ergonomic win over
+the runtime `Regex.captures` (which heap-allocates `Match.groups`). Read it with
+`c.get(comptime i)` / `c.getName(comptime name)` (compile-time bounds-/name-checked),
+`c.slice()`, or runtime `c.group(i)` / `c.groupByName(name)`. There is **no
+allocating `captures` on `Pattern`** — `captures` → `Captures` is the one,
+zero-alloc way. (The comptime path knows the group count at compile time, so it
+never needs the heap; earlier it was capture-free, now it captures for free.)
 
-`Pattern` also exposes `pub const has_dfa = true`.
+`Pattern` also exposes `pub const has_dfa` — `true` for a baked DFA / literal,
+`false` for the baked tree-backtracker (the non-regular tier).
 
 ### `PatternOptions`
 
@@ -321,20 +334,24 @@ pub const Options = struct {
     max_dfa_states: usize = 256,
     on_oversize: enum { compile_error, allow_oversized } = .compile_error,
     case_insensitive: bool = false,
+    multiline: bool = false,
 };
 ```
 
-- **`max_dfa_states`** — the soft DFA-state budget for this pattern. It is
-  bounded by an internal `MAX_DFA = 256` ceiling and **does not raise it**; you
-  can only request a smaller budget.
+- **`max_dfa_states`** — the soft DFA-state budget for this pattern (regular tier
+  only). It is bounded by an internal `MAX_DFA = 256` ceiling and **does not raise
+  it**; you can only request a smaller budget.
 - **`on_oversize`** — what happens when the minimized DFA builds successfully
   but exceeds `max_dfa_states`. `.compile_error` (the default) fails the build
   with a `@compileError`; `.allow_oversized` **bakes the larger table anyway**
   (still bounded by the internal ceiling). Neither value rescues a pattern that
-  blows the internal ceiling or uses an unsupported feature — those always
-  `@compileError` (there is no comptime → runtime fallback; use the runtime
+  blows the internal ceiling or uses a genuinely unsupported feature — those
+  always `@compileError` (there is no comptime → runtime fallback; use the runtime
   `Regex.compile`).
 - **`case_insensitive`** — ASCII case folding, equivalent to a leading `(?i)`.
+- **`multiline`** — `^`/`$` match at line boundaries, equivalent to a leading
+  `(?m)`. Routes the pattern to the comptime backtracker (looks aren't
+  DFA-foldable).
 
 ```zig
 const Strict = zeetah.Pattern("a|b|c", .{ .case_insensitive = true });
@@ -342,22 +359,29 @@ const Strict = zeetah.Pattern("a|b|c", .{ .case_insensitive = true });
 const Big = zeetah.Pattern("…", .{ .max_dfa_states = 64, .on_oversize = .allow_oversized });
 ```
 
-### What `Pattern` rejects at compile time
+### What `Pattern` supports (and the few things it rejects)
 
-`Pattern` supports the **regular, DFA-representable subset** — including `\p`
-(its resolver is allocator-free). Anything outside that subset is a **hard
-`@compileError` with no runtime fallback baked in**. The rejected set:
+`Pattern` now covers the **same feature surface as the runtime `Regex`** — the two
+share the `parser → HIR` front end. Regular patterns bake a minimized DFA (or a
+comptime Teddy literal); non-regular ones bake the **same bounded tree-backtracker**
+the runtime uses — so **captures** (numbered + named), **lookaround**,
+**backreferences**, **atomic/possessive** quantifiers, **word boundaries**
+(`\b`/`\B`), **`(?m)` line anchors**, and **lazy-with-end-anchor** (`a*?$`) all work
+at compile time. `\p` (Latin-1) is supported (allocator-free resolver).
 
-- captures with submatch extraction;
-- lookaround (`(?=…)`, `(?!…)`, `(?<=…)`, `(?<!…)`);
-- backreferences (`\1`, `\k<name>`);
-- look-assertions — `\b`, `\B`, mid-pattern `^`/`$`, and `(?m)` anchors;
-- `\p` under `(?i)`;
-- lazy combined with an end-anchor (`a*?$`), which the runtime engine routes
-  to the backtracker — a path that cannot be baked at comptime;
-- any pattern that exceeds the DFA-state ceiling.
+A `Pattern` bakes one matcher with **no runtime fallback**, so the constructs that
+are genuinely unsupported *anywhere* in the engine are a hard `@compileError`
+(rather than a recoverable runtime `error.NotImplemented`):
 
-For any of those, use the runtime `Regex`, which handles all of them.
+- the `.unicode` flag, `\p` scripts / binary properties / `\p` under `(?i)`;
+- an unknown POSIX class name;
+- a pattern that overflows an internal construction ceiling (`>1000`-count
+  repetition; a DFA over the 256-state ceiling — though a big `\b(?:kw|…)\b`
+  keyword list that would blow `MAX_NFA` instead routes to the backtracker and
+  *compiles*, just slower than the runtime's Aho-Corasick engine).
+
+For any of those — or whenever you need the rejection to be a recoverable error —
+use the runtime `Regex`.
 
 ## The meta engine, briefly
 
