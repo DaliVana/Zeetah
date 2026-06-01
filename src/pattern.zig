@@ -20,6 +20,7 @@ const planner = @import("planner.zig");
 const core = @import("exec/core.zig");
 const search = @import("exec/search.zig");
 const seq_extract = @import("exec/seq_extract.zig");
+const edge_look = @import("exec/edge_look.zig");
 const backtrack = @import("exec/backtrack.zig");
 const seek_mod = @import("exec/seek.zig");
 const delegate = @import("exec/delegate.zig");
@@ -67,7 +68,7 @@ const Outcome = enum { ok, unsupported, exploded, invalid };
 /// §6/(c) monomorphization: which planner strategy the baked matcher emits.
 /// `.literal` skips the DFA table entirely (Teddy only); the other three bake
 /// the DFA and differ only in the per-position prefilter wrapped around it.
-const Strat = enum { literal, reverse_suffix, lit_prefix, dfa, backtrack };
+const Strat = enum { literal, reverse_suffix, lit_prefix, dfa, backtrack, edge_look };
 
 /// Search mode for the baked-DFA matcher (everything except `.literal`). A
 /// comptime constant, so the `switch (mode)` in each method folds to the one
@@ -95,6 +96,9 @@ const Built = struct {
     /// which are HIR-non-capturing but still reserve a numbered, named slot).
     n_groups: usize = 0,
     gnames: [hir.MAX_GROUPS + 1]?[]const u8 = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1),
+    /// `.edge_look` arm: verify spec for the peeled trailing width-1 look.
+    /// `dfa` holds the regular core's DFA; this is the O(1) edge check.
+    el_spec: edge_look.Spec = .{ .set = [_]u8{0} ** 32, .behind = false, .neg = false },
     /// `.backtrack` arm: a regular over-approximation DFA used as the seek
     /// prefilter (skip proven-dead prefixes). Built at comptime by the SAME
     /// zero-allocator `full_dfa.compute` the regular arm uses, over a relaxed
@@ -242,6 +246,29 @@ fn buildAll(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) 
     // source of truth shared with the runtime, so the two agree by construction.
     var gnames = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1);
     const ng = parser.scanGroups(pattern, &gnames);
+
+    // Edge-look peel: `concat(regular_greedy_core, trailing_width1_look)` bakes
+    // the core's DFA + an O(1) edge verify instead of the comptime tree
+    // backtracker (the comptime peer of the runtime `.dfa_edge_look`). Shares
+    // `edge_look.recognize`/`nextFrom` with the runtime path ⇒ identical
+    // matches. Capture-free only (`ng == 0`); restore `h.root` before returning
+    // so the baked `.hir` is the whole pattern.
+    if (ng == 0) {
+        if (edge_look.recognize(HIR_CAP, &h)) |rec| {
+            const saved_root = h.root;
+            h.root = rec.core;
+            if (thompson.build(HIR_CAP, &h)) |nfa_core| {
+                var nfa_c = nfa_core;
+                var cd = full_dfa.compute(HIR_CAP, &nfa_c, h.anchored_start, false);
+                if (cd.outcome == .ok) {
+                    cd.required = seq_extract.requiredByte(HIR_CAP, &h);
+                    h.root = saved_root;
+                    return .{ .dfa = cd, .outcome = .ok, .strat = .edge_look, .el_spec = rec.spec, .hir = h, .n_groups = ng, .gnames = gnames };
+                }
+            } else |_| {}
+            h.root = saved_root;
+        }
+    }
 
     if (props.requires_backtracking or props.has_look) {
         // Comptime seek prefilter: a regular OVER-APPROXIMATION DFA (built by
@@ -801,6 +828,63 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
                 }
                 return list.toOwnedSlice(allocator);
             }
+        };
+    }
+
+    // Edge-look peel (comptime peer of runtime `.dfa_edge_look`): bake the core
+    // `Dfa256` + the verify spec and drive the shared `edge_look.nextFrom`.
+    // Placed before the DFA-state-budget gate so the core table is baked as-is.
+    if (built.strat == .edge_look) {
+        const core_dfa = built.dfa;
+        const spec = built.el_spec;
+        return struct {
+            pub const has_dfa = true;
+            pub fn nextSpanFrom(input: []const u8, from: usize) ?search.Span {
+                return edge_look.nextFrom(&core_dfa, &spec, input, from);
+            }
+            const nextSpan = nextSpanFrom;
+
+            pub fn isMatch(input: []const u8) bool {
+                return edge_look.nextFrom(&core_dfa, &spec, input, 0) != null;
+            }
+            pub fn find(input: []const u8) ?Match {
+                const sp = nextSpan(input, 0) orelse return null;
+                return wholeMatch(input, sp.start, sp.end);
+            }
+            pub fn count(input: []const u8) usize {
+                var n: usize = 0;
+                var pos: usize = 0;
+                while (pos <= input.len) {
+                    const sp = nextSpan(input, pos) orelse break;
+                    n += 1;
+                    pos = advanceEmpty(sp.start, sp.end);
+                }
+                return n;
+            }
+            pub fn findAll(allocator: std.mem.Allocator, input: []const u8) ![]Match {
+                var list: std.ArrayList(Match) = .empty;
+                errdefer list.deinit(allocator);
+                var pos: usize = 0;
+                while (pos <= input.len) {
+                    const sp = nextSpan(input, pos) orelse break;
+                    try list.append(allocator, wholeMatch(input, sp.start, sp.end));
+                    pos = advanceEmpty(sp.start, sp.end);
+                }
+                return list.toOwnedSlice(allocator);
+            }
+            const V = WholeMatchVerbs(nextSpanFrom);
+            pub const Iterator = V.Iterator;
+            pub const iterator = V.iterator;
+            pub const startsWith = V.startsWith;
+            pub const SplitIterator = V.SplitIterator;
+            pub const splitIterator = V.splitIterator;
+            const C = CaptureSupport(built);
+            pub const Captures = C.Caps;
+            pub const captures = C.captures;
+            pub const capturesFrom = C.capturesFrom;
+            pub const capturesAll = C.capturesAll;
+            pub const CapturesIterator = C.CapturesIterator;
+            pub const capturesIterator = C.capturesIterator;
         };
     }
 

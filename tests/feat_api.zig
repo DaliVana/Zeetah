@@ -320,7 +320,8 @@ test "comptime Pattern <-> runtime Regex agree: non-regular (tree backtracker) t
     try btAgree("foo(?=bar)", "foobar"); // positive, match
     try btAgree("foo(?=bar)", "foobaz"); // positive, no match
     try btAgree("foo(?!bar)", "foobaz"); // negative, match
-    try btAgree("a(?=b)", "ab"); // zero-width consumes only `a`
+    // (`a(?=b)` — a width-1 trailing lookahead — now routes to the edge-look
+    // DFA peel, not the backtracker; covered in tests/feat_lookaround.zig.)
     // fixed-width lookbehind
     try btAgree("(?<=x)y", "xy"); // positive
     try btAgree("(?<=x)y", "zy"); // positive, no match
@@ -444,8 +445,10 @@ test "comptime backtracker delegate: regular-island DFA == tree-walk (parity vs 
     // inputs with both hits and near-misses (the continuation fails ⇒ fall back
     // to full `m(nd.a,…)` recursion) exercise both branches of the delegation.
     try seekParity("[a-z]+[0-9]+(?=END)", "ab12END zz9END q aaaa1111ENDED a1END x000");
-    try seekParity("[A-Za-z]+ (?=\\d)", "foo 42 bar baz 9 qux  10 zzz");
-    try seekParity("x[0-9]*y+(?!Z)", "x12yyy x0yZ xy xyyyZ x99y end");
+    // NOTE: `[A-Za-z]+ (?=\d)` and `x[0-9]*y+(?!Z)` used to live here (backtracker
+    // + seek). They are now `concat(regular_core, trailing_width1_look)`, so they
+    // route to the edge-look DFA peel (has_dfa = true) and are covered — comptime
+    // == runtime, incl. multi-match findAll/count — in tests/feat_lookaround.zig.
 }
 
 test "comptime backtracker look-assertions: \\b / \\A\\z\\Z / (?m) anchors vs runtime" {

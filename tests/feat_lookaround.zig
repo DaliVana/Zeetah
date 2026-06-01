@@ -75,6 +75,47 @@ test "edge-look: trailing width-1 look peeled onto the DFA (scheme-branch shape)
     try std.testing.expectEqualStrings("foo", (try slice(a, "foo(?!bar)", "foobaz")).?);
 }
 
+test "edge-look: comptime Pattern engages the DFA path and matches runtime" {
+    // A lookaround pattern with `has_dfa == true` can ONLY be the edge-look
+    // peel (the regular DFA path can't model lookaround, and the comptime
+    // backtracker sets has_dfa = false) — so this asserts engagement.
+    const P = regex.Pattern("(?:https?:\\/\\/|ftp:\\/\\/)[\\w\\-.~:\\/?#@!$&*+,;=%]+(?<![,.])", .{});
+    try std.testing.expect(P.has_dfa);
+    try std.testing.expectEqualStrings("https://example.com", P.find("see https://example.com. more").?.slice);
+    try std.testing.expectEqualStrings("https://a.com", P.find("x https://a.com, y").?.slice);
+    try std.testing.expectEqualStrings("http://example.com", P.find("dot.http://example.com").?.slice);
+    try std.testing.expect(P.find("no url here just text") == null);
+
+    // Trailing single-char lookahead too: last digit of a run.
+    const D = regex.Pattern("\\d(?!\\d)", .{});
+    try std.testing.expect(D.has_dfa);
+    try std.testing.expectEqualStrings("5", D.find("in 345 end").?.slice);
+}
+
+test "edge-look: comptime == runtime over multi-match inputs (findAll/count)" {
+    const a = std.testing.allocator;
+    // Patterns that moved off the backtracker+seek onto the edge-look peel;
+    // pin comptime span-for-span equal to runtime over multi-match inputs.
+    const cases = .{
+        .{ "[A-Za-z]+ (?=\\d)", "foo 42 bar baz 9 qux  10 zzz" },
+        .{ "x[0-9]*y+(?!Z)", "x12yyy x0yZ xy xyyyZ x99y end" },
+        .{ "(?:https?:\\/\\/)[\\w\\-.~:\\/?#@!$&*+,;=%]+(?<![,.])", "a https://x.com, b http://y.io. c https://z.dev/p done" },
+    };
+    inline for (cases) |c| {
+        const P = regex.Pattern(c[0], .{});
+        try std.testing.expect(P.has_dfa); // edge-look engaged
+        var rx = try Regex.compile(a, c[0]);
+        defer rx.deinit();
+        try std.testing.expectEqual(try rx.count(c[1]), P.count(c[1]));
+        const rms = try rx.findAll(a, c[1]);
+        defer a.free(rms);
+        const cms = try P.findAll(a, c[1]);
+        defer a.free(cms);
+        try std.testing.expectEqual(rms.len, cms.len);
+        for (rms, cms) |rm, cm| try std.testing.expectEqualStrings(rm.slice, cm.slice);
+    }
+}
+
 test "lookbehind: variable-width positive (?<=a+) / (?<=\\d+)" {
     const a = std.testing.allocator;
     // `a+` is variable width: reverse scan finds a span of `a`s ending at pos.
