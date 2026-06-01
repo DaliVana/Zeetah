@@ -723,7 +723,7 @@ pub const Regex = struct {
         // single allocation-free forward pass. No look/backref here (those
         // returned to bt_look/backtrack above). `nfa` is retained because
         // `need_nfa = needs_captures or has_look`.
-        const op_ok = props.needs_captures and onepass.isOnePassNfa(&nfa);
+        const op_ok = props.needs_captures and onepass.isOnePassNfa(null, &nfa);
 
         var self = Regex{
             .allocator = allocator,
@@ -1014,7 +1014,7 @@ pub const Regex = struct {
                     @memset(slots[0..nslots], -1);
                     slots[0] = @intCast(sp.start);
                     slots[1] = @intCast(sp.end);
-                    if (onepass.fill(self.nfa.?, input, .{ .start = sp.start, .end = sp.end }, slots[0..nslots])) {
+                    if (onepass.fill(null, self.nfa.?, input, .{ .start = sp.start, .end = sp.end }, slots[0..nslots])) {
                         span = sp;
                         break :done;
                     }

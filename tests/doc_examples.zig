@@ -154,10 +154,8 @@ test "comptime Pattern: non-regular features (README/EXAMPLES/API/WASM mirror)" 
     const Dup = zeetah.Pattern("(\\w+) \\1", .{});
     comptime std.debug.assert(!Dup.has_dfa); // non-regular ⇒ baked backtracker
     try std.testing.expect(Dup.isMatch("the the quick"));
-    if (try Dup.captures(a, "the the quick")) |m| {
-        var mm = m;
-        defer mm.deinit(a);
-        try eqs("the", mm.groups[1].?.slice);
+    if (Dup.captures("the the quick")) |c| { // zero-alloc Captures, no allocator
+        try eqs("the", c.get(1).?.slice);
     } else return error.TestUnexpectedNull;
 
     const Amount = zeetah.Pattern("(?<=\\$)[0-9]+", .{});
@@ -165,6 +163,23 @@ test "comptime Pattern: non-regular features (README/EXAMPLES/API/WASM mirror)" 
 
     const Logs = zeetah.Pattern("^ERROR", .{ .multiline = true });
     try eq(@as(usize, 2), Logs.count("ERROR a\nok\nERROR b"));
+}
+
+test "comptime Pattern: zero-alloc captures + lazy verbs (README mirror)" {
+    // Mirrors the README "zero-alloc comptime captures" + "lazy verbs" snippets.
+    const Date = zeetah.Pattern("(?<y>[0-9]{4})-([0-9]{2})-([0-9]{2})", .{});
+    if (Date.captures("ts 2026-06-01!")) |c| { // no allocator
+        try eqs("2026-06-01", c.slice());
+        try eqs("2026", c.get(1).?.slice); // compile-time-indexed
+        try eqs("2026", c.getName("y").?.slice); // compile-time-named
+    } else return error.TestUnexpectedNull;
+
+    var it = zeetah.Pattern("[0-9]+", .{}).iterator("a12 b345 c6");
+    var n: usize = 0;
+    while (it.next()) |_| n += 1;
+    try eq(@as(usize, 3), n);
+
+    try std.testing.expect(zeetah.Pattern("v[0-9]+", .{}).startsWith("v2.0"));
 }
 
 test "Builder fluent build/compile + Patterns string factories" {

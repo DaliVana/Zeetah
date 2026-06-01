@@ -697,33 +697,62 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: PatternOptions) type
 // `has_dfa == false` for the baked tree-backtracker (the non-regular tier).
 pub const has_dfa: bool;
 
+// Mental model: `find` → `Match` (whole match); `captures` → `Captures`
+// (submatches). On the comptime path, every ONE-MATCH verb is allocation-free —
+// `Captures` holds groups INLINE (count + names comptime-known).
+// ── Allocation-free (return one match) ──
 pub fn isMatch(input: []const u8) bool;
-pub fn find(input: []const u8) ?Match;             // NO error union, NO allocator
+pub fn find(input: []const u8) ?Match;                  // whole match; NO error union, NO allocator
 pub fn count(input: []const u8) usize;
+pub fn startsWith(input: []const u8) bool;              // anchored-prefix test
+pub fn captures(input: []const u8) ?Captures(ng, gnames);            // submatches, inline — NO allocator
+pub fn capturesFrom(input: []const u8, from: usize) ?Captures(ng, gnames);
+// Lazy iterators — values you drive with `while (it.next()) |m|`; O(1) memory,
+// free early-break, no allocator:
+pub fn iterator(input: []const u8) Iterator;            // whole-match
+pub fn capturesIterator(input: []const u8) CapturesIterator; // submatches
+pub fn splitIterator(input: []const u8) SplitIterator;  // fields between matches
+// ── Eager (allocate ONE result slice; elements are still inline) ──
 pub fn findAll(allocator: std.mem.Allocator, input: []const u8) ![]Match;
-// Capture extraction — present on EVERY `Pattern` (DFA and backtracker tiers):
-pub fn captures(allocator: std.mem.Allocator, input: []const u8) !?Match;
-pub fn capturesAll(allocator: std.mem.Allocator, input: []const u8) ![]Match;
+pub fn capturesAll(allocator: std.mem.Allocator, input: []const u8) ![]Captures(ng, gnames);
 ```
 
-- `isMatch` / `find` / `count` are fully allocation-free. `findAll` / `captures` /
-  `capturesAll` take an allocator only to materialize the result slices /
-  `Match.groups`; free with `allocator.free` (and `Match.deinit` for the
-  capture-bearing ones).
-- Capture extraction works at comptime — numbered **and** `(?<name>)` named groups,
-  via `Match.groups` / `Match.groupByName`, identical to the runtime `Regex`.
+> Note the comptime `captures` takes **no allocator** and returns `?Captures` —
+> distinct from the runtime `Regex.captures(allocator, …) !?Match`, which
+> heap-allocates `Match.groups`. The comptime path knows the group count at compile
+> time, so it never needs the heap; there is **no allocating `captures` on
+> `Pattern`** (one obvious, zero-alloc way). `capturesAll` allocates only the outer
+> `[]Captures` slice (free with a single `allocator.free` — no per-element
+> `deinit`, since each `Captures`'s groups are inline).
+
+The inline `Captures` value (zero-allocation) exposes:
+
+```zig
+pub fn slice(self) []const u8;                 // whole match
+pub fn get(self, comptime i: usize) ?Group;    // compile-time-INDEXED (bad index = compile error)
+pub fn getName(self, comptime name: []const u8) ?Group; // compile-time name → group (unknown = compile error)
+pub fn group(self, i: usize) ?Group;           // runtime index (out-of-range ⇒ null)
+pub fn groupByName(self, name: []const u8) ?Group;      // runtime name lookup
+```
+
+- It runs **with no allocator at all** — even fully at `comptime`. This is the win
+  over the runtime `Regex.captures` (which heap-allocates `Match.groups`): in a hot
+  loop or a no-allocator (WASM / freestanding) build, `captures` + `get(i)` extract
+  submatches with zero heap traffic. `get`/`getName` are bounds-/name-checked **at
+  compile time**.
 
 ```zig
 const Pattern = @import("zeetah").Pattern;
 
-const Re = Pattern("\\d{4}-\\d{2}-\\d{2}", .{});
-comptime std.debug.assert(Re.has_dfa);          // regular ⇒ baked DFA
+// Regular pattern with named groups — DFA arm, captures still zero-alloc:
+const Date = Pattern("(?<y>\\d{4})-(\\d{2})-(\\d{2})", .{});
+comptime std.debug.assert(Date.has_dfa);        // regular ⇒ baked DFA
 
-if (Re.find("Date: 2024-03-15")) |m| {
-    std.debug.print("{s}\n", .{m.slice}); // "2024-03-15" — no allocator
+if (Date.captures("Date: 2024-03-15")) |c| {         // no allocator
+    std.debug.print("{s} {s}\n", .{ c.getName("y").?.slice, c.get(2).?.slice }); // "2024" "03"
 }
 
-// Non-regular ⇒ baked tree-backtracker (has_dfa == false):
+// Non-regular ⇒ baked tree-backtracker (has_dfa == false), captures the same way:
 const Dup = Pattern("(\\w+) \\1", .{});
 comptime std.debug.assert(!Dup.has_dfa);
 ```

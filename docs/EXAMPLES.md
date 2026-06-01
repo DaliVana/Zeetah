@@ -415,17 +415,33 @@ test "allocation-free comptime match" {
 }
 ```
 
-Static methods:
+Static methods. **Mental model:** `find` → `Match` (whole match); `captures` →
+`Captures` (submatches). Every one-match verb is allocation-free:
 
 - `isMatch(input) bool` — allocation-free, no error union.
-- `find(input) ?Match` — allocation-free, **no error union** (unlike runtime `find`).
-- `count(input) usize` — allocation-free, no error union.
-- `findAll(allocator, input) ![]Match` — allocates the result slice.
-- `captures(allocator, input) !?Match` / `capturesAll(allocator, input) ![]Match`
-  — submatch extraction (numbered + `(?<name>)` named), same as the runtime
-  `Regex`; allocate the `Match.groups`.
+- `find(input) ?Match` — whole match; allocation-free, **no error union** (unlike runtime `find`).
+- `count(input) usize` — allocation-free.
+- `startsWith(input) bool` — anchored-prefix test, allocation-free.
+- `captures(input) ?Captures` — **submatches with NO allocator** (groups inline; the
+  big win vs runtime `Regex.captures`, which allocates `Match.groups`). Read with
+  `c.get(comptime i)` / `c.getName(comptime name)` (both compile-time-checked),
+  `c.slice()`, or runtime `c.group(i)` / `c.groupByName(name)`. Numbered + named.
+- `iterator(input)` / `capturesIterator(input)` / `splitIterator(input)` — lazy
+  value iterators (`while (it.next()) |m|`), O(1) memory, no allocator.
+- `findAll(allocator, input) ![]Match` / `capturesAll(allocator, input) ![]Captures`
+  — eager; allocate **one** result slice (the `Captures` elements stay inline — no
+  per-match heap, unlike the runtime `Regex`).
 
-Captures work at comptime too — `Pattern` is no longer capture-free.
+Captures work at comptime too, and unlike the runtime they cost no allocation —
+`Pattern` is no longer capture-free.
+
+```zig
+const Date = zeetah.Pattern("(?<y>[0-9]{4})-([0-9]{2})-([0-9]{2})", .{});
+if (Date.captures("ts 2026-06-01!")) |c| {   // ?Captures — no allocator
+    // c.slice() == "2026-06-01"; c.get(1) == "2026"; c.getName("y") == "2026"
+    std.debug.print("{s}\n", .{c.getName("y").?.slice});
+}
+```
 
 ### Options
 

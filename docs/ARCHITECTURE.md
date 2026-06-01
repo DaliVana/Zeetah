@@ -399,11 +399,13 @@ strategy is "bake the value, reuse the executor":
   build-ceiling-sized store. The matcher's `m`/`cont`/`loopStep` body is identical
   across cap modes; `cc.lookHolds` (word boundaries, line/text anchors) is pure and
   comptime-evaluable, which is what lets look-assertions run at comptime.
-- **Captures** are materialized into `Match.groups` exactly as the runtime
-  `regex.capturesFrom` does; group **count + `(?<name>)` names** come from the
-  shared `parser.scanGroups` (lifted into `parser.zig` so both front-ends agree by
-  construction — it is a *source* scan, so a group inside a lookaround still
-  reserves its numbered/named slot).
+- **Captures** are materialized into an inline `Captures(ng, gnames)` value — a
+  fixed `[ng+1]?Group` array, **no allocator** (the comptime peer of the runtime's
+  heap `Match.groups`; `Pattern.captures(input) ?Captures` vs runtime
+  `Regex.captures(a,input) !?Match`). Group **count + `(?<name>)` names** come from
+  the shared `parser.scanGroups` (lifted into `parser.zig` so both front-ends agree
+  by construction — it is a *source* scan, so a group inside a lookaround still
+  reserves its numbered/named slot). `get`/`getName` are compile-time-indexed.
 - **The prefilters are baked too**, reusing the *zero-allocator* `full_dfa.compute`
   (the same one the DFA tier uses — the lazy/dense builders are allocator-heavy and
   were deliberately *not* ported):

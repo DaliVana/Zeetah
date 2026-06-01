@@ -301,9 +301,14 @@ above.
   instead use a `DebugAllocator` or wrap the host's memory growth, but a
   reset-per-call arena is the simplest correct choice for a stateless ABI.
 - **No hidden allocation.** Every Zeetah heap allocation goes through the
-  allocator you pass. `find` / `isMatch` / `count` (and all `Pattern` methods
-  except `findAll`) compute whole-match results without allocating; `captures`,
-  `findAll`, `split`, and `replace` are the allocating calls.
+  allocator you pass. On the comptime `Pattern` (ideal for Wasm), **every
+  one-match verb is allocation-free** — `isMatch` / `find` / `count` / `startsWith`
+  / **`captures`** (groups inline, no allocator) and the lazy `iterator` /
+  `capturesIterator` / `splitIterator`; only the eager slice builders `findAll` →
+  `[]Match` and `capturesAll` → `[]Captures` allocate (one slice). So a Wasm build
+  can extract submatches with **zero** heap traffic. (On the runtime `Regex`,
+  `captures`/`split`/`replace`/`findAll` allocate, since it has no comptime shape
+  to bake.)
 - **Borrowed match views.** A `Match.slice` aliases the input bytes — in the
   shim those bytes live in the shared linear-memory buffer. Read any result out
   (e.g. copy it back into the buffer for JS) *before* the buffer is overwritten

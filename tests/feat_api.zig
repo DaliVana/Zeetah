@@ -472,76 +472,74 @@ test "comptime backtracker look-assertions: \\b / \\A\\z\\Z / (?m) anchors vs ru
     try seekParity("(?m)^#", "a\n#one\nb\n#two\n##three");
 }
 
-// Capture-submatch parity on the `.backtrack` arm: the comptime `captures()`
-// must agree with the runtime `Regex.captures` on the whole-match span AND every
-// numbered/named group (slice, start, end, participation), since both derive
-// numbering + names from the same `parser.scanGroups`. Compares group-by-group
-// and, for named groups, via `groupByName` on both sides.
-fn btCapAgree(comptime p: []const u8, in: []const u8) !void {
+// Capture-submatch parity on the `.backtrack` arm: the comptime **zero-alloc**
+// `captures()` (→ `Captures`) must agree with the runtime `Regex.captures` (→
+// allocator-owned `Match`) on the whole-match span AND every numbered/named
+// group (slice, start, end, participation), since both derive numbering + names
+// from the same `parser.scanGroups`. Compares group-by-group, comptime `Captures`
+// vs runtime `Match`.
+fn btCapAgree(comptime p: []const u8, in: []const u8, comptime ng: usize) !void {
     const a = std.testing.allocator;
     const P = regex.Pattern(p, .{});
     comptime std.debug.assert(!P.has_dfa);
     var rx = try Regex.compile(a, p);
     defer rx.deinit();
 
-    var pm = try P.captures(a, in);
-    defer if (pm) |*x| x.deinit(a);
-    var rm = try rx.captures(a, in);
+    const pc = P.captures(in); // ?Captures — no allocator
+    var rm = try rx.captures(a, in); // !?Match — allocates groups
     defer if (rm) |*x| x.deinit(a);
 
-    try std.testing.expectEqual(rm == null, pm == null);
+    try std.testing.expectEqual(rm == null, pc == null);
     if (rm == null) return;
-    const pmm = pm.?;
+    const caps = pc.?;
     const rmm = rm.?;
-    try std.testing.expectEqual(rmm.start, pmm.start);
-    try std.testing.expectEqual(rmm.end, pmm.end);
-    try std.testing.expectEqualStrings(rmm.slice, pmm.slice);
-    // Same group count, and each group agrees (null-ness + span + slice).
-    try std.testing.expectEqual(rmm.groups.len, pmm.groups.len);
-    for (rmm.groups, pmm.groups) |rg, pg| {
-        try std.testing.expectEqual(rg == null, pg == null);
+    try std.testing.expectEqualStrings(rmm.slice, caps.slice());
+    try std.testing.expectEqual(rmm.start, caps.get(0).?.start);
+    inline for (1..ng + 1) |g| {
+        const rg = rmm.groups[g];
+        const cg = caps.get(g);
+        try std.testing.expectEqual(rg == null, cg == null);
         if (rg) |rgg| {
-            try std.testing.expectEqual(rgg.start, pg.?.start);
-            try std.testing.expectEqual(rgg.end, pg.?.end);
-            try std.testing.expectEqualStrings(rgg.slice, pg.?.slice);
+            try std.testing.expectEqual(rgg.start, cg.?.start);
+            try std.testing.expectEqual(rgg.end, cg.?.end);
+            try std.testing.expectEqualStrings(rgg.slice, cg.?.slice);
         }
     }
 }
 
 test "comptime backtracker captures(): numbered group parity with runtime Regex" {
-    try btCapAgree("(\\w+)-\\1", "ab-ab tail"); // group 1 = "ab"
-    try btCapAgree("(a)(b)\\2\\1", "abba"); // two groups, both participate
-    try btCapAgree("(\\w+) \\1", "the the quick"); // group 1 = "the"
-    try btCapAgree("(\\w+) \\1", "no repeat here"); // whole pattern no-match
-    try btCapAgree("(ab)\\1", "abab"); // group 1 across a backref
+    try btCapAgree("(\\w+)-\\1", "ab-ab tail", 1); // group 1 = "ab"
+    try btCapAgree("(a)(b)\\2\\1", "abba", 2); // two groups, both participate
+    try btCapAgree("(\\w+) \\1", "the the quick", 1); // group 1 = "the"
+    try btCapAgree("(\\w+) \\1", "no repeat here", 1); // whole pattern no-match
+    try btCapAgree("(ab)\\1", "abab", 1); // group 1 across a backref
     // A group that does not participate must be reported absent on both sides.
-    try btCapAgree("(x)|(y)\\2", "y"); // 2nd-branch backref; group 1 absent
+    try btCapAgree("(x)|(y)\\2", "y", 2); // 2nd-branch backref; group 1 absent
 }
 
-test "comptime backtracker captures(): named-group parity (groupByName)" {
-    const a = std.testing.allocator;
-    // Differential on slices/spans first.
-    try btCapAgree("(?<w>\\w+)=\\k<w>", "foo=foo rest");
-    try btCapAgree("(?<q>['\"]).*?\\k<q>", "say \"hi\" ok");
+test "comptime backtracker captures(): named-group parity (getName/groupByName)" {
+    // Differential on slices/spans first (zero-alloc Captures vs runtime Match).
+    try btCapAgree("(?<w>\\w+)=\\k<w>", "foo=foo rest", 1);
+    try btCapAgree("(?<q>['\"]).*?\\k<q>", "say \"hi\" ok", 1);
 
-    // Then assert the name actually resolves on the comptime path, matching the
-    // runtime — full named-capture parity, not just numbered.
+    // Then assert the name resolves on the comptime path, matching the runtime —
+    // full named-capture parity. `getName` is compile-time-resolved; `groupByName`
+    // is its runtime peer.
+    const a = std.testing.allocator;
     const P = regex.Pattern("(?<w>\\w+)=\\k<w>", .{});
     comptime std.debug.assert(!P.has_dfa);
     var rx = try Regex.compile(a, "(?<w>\\w+)=\\k<w>");
     defer rx.deinit();
 
-    var pm = (try P.captures(a, "foo=foo rest")).?;
-    defer pm.deinit(a);
+    const caps = P.captures("foo=foo rest").?; // no allocator
     var rm = (try rx.captures(a, "foo=foo rest")).?;
     defer rm.deinit(a);
 
-    const pg = pm.groupByName("w").?;
     const rg = rm.groupByName("w").?;
-    try std.testing.expectEqualStrings("foo", pg.slice);
-    try std.testing.expectEqualStrings(rg.slice, pg.slice);
-    try std.testing.expectEqual(rg.start, pg.start);
-    try std.testing.expectEqual(rg.end, pg.end);
+    try std.testing.expectEqualStrings("foo", caps.getName("w").?.slice);
+    try std.testing.expectEqualStrings(rg.slice, caps.getName("w").?.slice);
+    try std.testing.expectEqualStrings("foo", caps.groupByName("w").?.slice); // runtime-named peer
+    try std.testing.expectEqual(rg.start, caps.getName("w").?.start);
 }
 
 test "comptime backtracker capturesAll(): non-overlapping captures parity" {
@@ -552,23 +550,19 @@ test "comptime backtracker capturesAll(): non-overlapping captures parity" {
     defer rx.deinit();
     const in = "aabbXccd eez";
 
-    const rms = try rx.capturesAll(a, in);
+    const rms = try rx.capturesAll(a, in); // []Match, each owns groups
     defer {
         for (rms) |*mt| mt.deinit(a);
         a.free(rms);
     }
-    const pms = try P.capturesAll(a, in);
-    defer {
-        for (pms) |*mt| mt.deinit(a);
-        a.free(pms);
-    }
-    try std.testing.expectEqual(rms.len, pms.len);
-    for (rms, pms) |r, q| {
-        try std.testing.expectEqual(r.start, q.start);
-        try std.testing.expectEqual(r.end, q.end);
-        try std.testing.expectEqualStrings(r.slice, q.slice);
-        try std.testing.expectEqual(r.groups.len, q.groups.len);
-        try std.testing.expectEqualStrings(r.groups[1].?.slice, q.groups[1].?.slice);
+    const pcs = try P.capturesAll(a, in); // []Captures — ONE slice alloc, inline groups
+    defer a.free(pcs); // no per-element deinit (groups are inline)
+    try std.testing.expectEqual(rms.len, pcs.len);
+    for (rms, pcs) |r, c| {
+        try std.testing.expectEqual(r.start, c.get(0).?.start);
+        try std.testing.expectEqual(r.end, c.get(0).?.end);
+        try std.testing.expectEqualStrings(r.slice, c.slice());
+        try std.testing.expectEqualStrings(r.groups[1].?.slice, c.get(1).?.slice);
     }
 }
 
@@ -627,4 +621,153 @@ test "comptime Pattern strategy arms (lit_prefix / reverse_suffix / req_lit) par
     try crAgreeMulti("[a-z]+@[a-z]+", "aaaaaaaaaaaaaaaaaaaa user@host more@x");
     // required byte: 'X' mandatory and absent on the long run, present later.
     try crAgreeMulti("a.*X", "aaaaaaaaaaaaaaaaaaaa then aXb and abcXd");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Zero-alloc comptime captures + lazy verbs (Pattern.captures / get /
+// getName / iterator / splitIterator / startsWith). These are the comptime,
+// allocation-free peers of the runtime Regex.captures / iterator / split. Each
+// test asserts comptime == runtime so the new surface can't drift.
+// ───────────────────────────────────────────────────────────────────────────
+
+// captures() parity: the inline `Captures` must agree with the runtime
+// `Regex.captures` on the whole match AND every group (slice/start/end/
+// participation), for both the DFA arm (regular-with-captures, e.g. date
+// fields) and the backtrack arm (backreference). Also exercises the
+// compile-time-indexed `get(i)`.
+fn capAgree(comptime p: []const u8, in: []const u8, comptime ng: usize) !void {
+    const a = std.testing.allocator;
+    const P = regex.Pattern(p, .{});
+    const pc = P.captures(in);
+    var rx = try Regex.compile(a, p);
+    defer rx.deinit();
+    var rm = try rx.captures(a, in);
+    defer if (rm) |*m| m.deinit(a);
+
+    try std.testing.expectEqual(rm == null, pc == null);
+    if (rm == null) return;
+    const caps = pc.?;
+    const rmm = rm.?;
+    try std.testing.expectEqualStrings(rmm.slice, caps.slice());
+    // group 0 == whole match
+    try std.testing.expectEqual(rmm.start, caps.get(0).?.start);
+    // every group 1..ng agrees (compile-time-indexed get)
+    inline for (1..ng + 1) |g| {
+        const rg = rmm.groups[g];
+        const cg = caps.get(g);
+        try std.testing.expectEqual(rg == null, cg == null);
+        if (rg) |rgg| {
+            try std.testing.expectEqualStrings(rgg.slice, cg.?.slice);
+            try std.testing.expectEqual(rgg.start, cg.?.start);
+            try std.testing.expectEqual(rgg.end, cg.?.end);
+        }
+    }
+}
+
+test "comptime Pattern.captures: zero-alloc captures parity (DFA + backtrack arms)" {
+    // DFA arm — regular pattern with groups (the flagship date-fields case):
+    try capAgree("([0-9]{4})-([0-9]{2})-([0-9]{2})", "log 2026-06-01 end", 3);
+    try capAgree("([0-9]{4})-([0-9]{2})-([0-9]{2})", "no date here", 3); // no match
+    try capAgree("(\\w+)@(\\w+)\\.(\\w+)", "x user@host.io y", 3); // email-ish
+    // Backtrack arm — backreference with a captured group:
+    try capAgree("(\\w+) \\1", "the the quick", 1);
+    try capAgree("(\\w+)-\\1", "ab-ab tail", 1);
+    // A group that doesn't participate (alternation) must read null on both:
+    try capAgree("(a)|(b)", "b", 2);
+}
+
+test "comptime Pattern.get / getName: compile-time-indexed, zero allocation" {
+    // Named groups resolve at compile time; get/getName fold to array reads.
+    const Date = regex.Pattern("(?<y>[0-9]{4})-(?<m>[0-9]{2})-(?<d>[0-9]{2})", .{});
+    const c = Date.captures("ts=2026-06-01!").?;
+    try std.testing.expectEqualStrings("2026", c.get(1).?.slice);
+    try std.testing.expectEqualStrings("2026", c.getName("y").?.slice);
+    try std.testing.expectEqualStrings("06", c.getName("m").?.slice);
+    try std.testing.expectEqualStrings("01", c.getName("d").?.slice);
+    try std.testing.expectEqualStrings("2026-06-01", c.slice());
+    // runtime-indexed / runtime-named peers agree:
+    try std.testing.expectEqualStrings("06", c.group(2).?.slice);
+    try std.testing.expectEqualStrings("01", c.groupByName("d").?.slice);
+    try std.testing.expect(c.group(9) == null); // out-of-range runtime index ⇒ null
+    // captures() works with NO allocator at all — prove it under the
+    // `failing` allocator (any allocation would error):
+    const F = regex.Pattern("([0-9]+)", .{});
+    const fc = F.captures("abc123def").?; // must not touch the allocator
+    try std.testing.expectEqualStrings("123", fc.get(1).?.slice);
+}
+
+test "comptime Pattern.iterator: lazy whole-match, parity with runtime iterator" {
+    const a = std.testing.allocator;
+    const P = regex.Pattern("[0-9]+", .{});
+    var rx = try Regex.compile(a, "[0-9]+");
+    defer rx.deinit();
+    const in = "a12 b345 c6 d";
+
+    // comptime lazy iterator vs runtime findAll spans
+    const rms = try rx.findAll(a, in);
+    defer a.free(rms);
+    var it = P.iterator(in);
+    var i: usize = 0;
+    while (it.next()) |m| : (i += 1) {
+        try std.testing.expectEqual(rms[i].start, m.start);
+        try std.testing.expectEqual(rms[i].end, m.end);
+    }
+    try std.testing.expectEqual(rms.len, i);
+
+    // early-break costs nothing and is well-defined:
+    var it2 = P.iterator(in);
+    try std.testing.expectEqualStrings("12", it2.next().?.slice);
+    // empty input ⇒ no matches
+    var it3 = P.iterator("");
+    try std.testing.expect(it3.next() == null);
+}
+
+test "comptime Pattern.capturesIterator: lazy zero-alloc captures stream" {
+    const a = std.testing.allocator;
+    const P = regex.Pattern("(\\w)(\\w)", .{}); // pairs of word chars
+    var rx = try Regex.compile(a, "(\\w)(\\w)");
+    defer rx.deinit();
+    const in = "ab cd ef";
+    const rms = try rx.capturesAll(a, in);
+    defer {
+        for (rms) |*m| m.deinit(a);
+        a.free(rms);
+    }
+    var it = P.capturesIterator(in);
+    var i: usize = 0;
+    while (it.next()) |c| : (i += 1) {
+        try std.testing.expectEqualStrings(rms[i].groups[1].?.slice, c.get(1).?.slice);
+        try std.testing.expectEqualStrings(rms[i].groups[2].?.slice, c.get(2).?.slice);
+    }
+    try std.testing.expectEqual(rms.len, i);
+}
+
+test "comptime Pattern.splitIterator: parity with runtime split" {
+    const a = std.testing.allocator;
+    inline for (.{ ",", "\\s+", "::" }) |p| {
+        const P = regex.Pattern(p, .{});
+        var rx = try Regex.compile(a, p);
+        defer rx.deinit();
+        inline for (.{ "a,bb,,c", "one  two   three", "x::y::z", "nodelim", "" }) |in| {
+            const parts = try rx.split(a, in);
+            defer a.free(parts);
+            var it = P.splitIterator(in);
+            var i: usize = 0;
+            while (it.next()) |field| : (i += 1) {
+                if (i < parts.len) try std.testing.expectEqualStrings(parts[i], field);
+            }
+            try std.testing.expectEqual(parts.len, i);
+        }
+    }
+}
+
+test "comptime Pattern.startsWith: anchored-prefix test" {
+    const Ver = regex.Pattern("v[0-9]+", .{});
+    try std.testing.expect(Ver.startsWith("v12.x"));
+    try std.testing.expect(!Ver.startsWith(" v12")); // match exists but not at 0
+    try std.testing.expect(!Ver.startsWith("abc"));
+    // routing/prefix engine (lit_prefix) still answers startsWith correctly:
+    const Hello = regex.Pattern("hello.*world", .{});
+    try std.testing.expect(Hello.startsWith("hello big world"));
+    try std.testing.expect(!Hello.startsWith("say hello world"));
 }

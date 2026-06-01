@@ -301,18 +301,28 @@ test "allocation-free comptime match" {
 
 ### Static method surface
 
+Mental model: `find` → `Match` (whole match); `captures` → `Captures` (submatches,
+inline & allocation-free).
+
 | Method | Signature | Allocates? |
 |--------|-----------|------------|
 | `isMatch` | `isMatch(input) bool` | no |
-| `find` | `find(input) ?Match` (no error union) | no |
+| `find` | `find(input) ?Match` (whole match, no error union) | no |
 | `count` | `count(input) usize` | no |
+| `startsWith` | `startsWith(input) bool` | no |
+| `captures` | `captures(input) ?Captures` | **no** (groups inline) |
+| `iterator` / `capturesIterator` / `splitIterator` | `(input) → lazy iterator` | no |
 | `findAll` | `findAll(allocator, input) ![]Match` | the result slice only |
-| `captures` | `captures(allocator, input) !?Match` | `Match.groups` |
-| `capturesAll` | `capturesAll(allocator, input) ![]Match` | slice + each `Match.groups` |
+| `capturesAll` | `capturesAll(allocator, input) ![]Captures` | the slice only (elements inline) |
 
-`captures` / `capturesAll` extract submatches at comptime — numbered **and**
-`(?<name>)` named groups, via `Match.groups` / `Match.groupByName`, identical to
-the runtime `Regex`. (Earlier the comptime path was capture-free; it no longer is.)
+`captures` extracts submatches at comptime — numbered **and** `(?<name>)` named —
+into an inline `Captures` value with **no allocator**, the big ergonomic win over
+the runtime `Regex.captures` (which heap-allocates `Match.groups`). Read it with
+`c.get(comptime i)` / `c.getName(comptime name)` (compile-time bounds-/name-checked),
+`c.slice()`, or runtime `c.group(i)` / `c.groupByName(name)`. There is **no
+allocating `captures` on `Pattern`** — `captures` → `Captures` is the one,
+zero-alloc way. (The comptime path knows the group count at compile time, so it
+never needs the heap; earlier it was capture-free, now it captures for free.)
 
 `Pattern` also exposes `pub const has_dfa` — `true` for a baked DFA / literal,
 `false` for the baked tree-backtracker (the non-regular tier).

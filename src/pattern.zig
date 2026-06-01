@@ -14,6 +14,7 @@ const hir = @import("hir.zig");
 const parser = @import("parser.zig");
 const thompson = @import("thompson.zig");
 const full_dfa = @import("exec/full_dfa.zig");
+const onepass = @import("exec/onepass.zig");
 const properties = @import("properties.zig");
 const planner = @import("planner.zig");
 const core = @import("exec/core.zig");
@@ -25,6 +26,7 @@ const delegate = @import("exec/delegate.zig");
 
 const Match = @import("match.zig").Match;
 const Group = @import("match.zig").Group;
+const Captures = @import("match.zig").Captures;
 const wholeMatch = @import("match.zig").wholeMatch;
 const advanceEmpty = @import("match.zig").advanceEmpty;
 
@@ -230,10 +232,18 @@ fn buildAll(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) 
     // `analyze` is pure and only reads the HIR, so computing it here (rather than
     // after the DFA build) is free and lets the regular path fall through.
     const props = properties.analyze(HIR_CAP, &h);
-    if (props.requires_backtracking or props.has_look) {
-        var gnames = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1);
-        const ng = parser.scanGroups(pattern, &gnames);
 
+    // Capture metadata, computed once for EVERY `.ok` strat (not just
+    // `.backtrack`): a regular-with-captures pattern (e.g. `(\d{4})-(\d{2})`)
+    // routes to the DFA arm but still needs `n_groups`/`gnames` + the baked HIR
+    // so the DFA arm can offer zero-alloc `findCaptures` (it bakes a capture-only
+    // `BacktrackerG` over this HIR; the DFA still serves `find`/`count`). Group
+    // count + names come from `parser.scanGroups` over the source — the single
+    // source of truth shared with the runtime, so the two agree by construction.
+    var gnames = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1);
+    const ng = parser.scanGroups(pattern, &gnames);
+
+    if (props.requires_backtracking or props.has_look) {
         // Comptime seek prefilter: a regular OVER-APPROXIMATION DFA (built by
         // `overApproxDfa` below — see its doc for the soundness/guards). When
         // present it bakes into `.rodata` and the backtracker `memchr`s/DFA-skips
@@ -275,13 +285,30 @@ fn buildAll(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) 
     // strategy *by construction* (the `tests/feat_api.zig` differential is now a
     // backstop on materialization, not the primary guard on routing).
     const strat = planner.plan(props, .{ .case_insensitive = ci });
+    // Carry the HIR + capture metadata into every DFA-tier `Built` too, so the
+    // returned `Pattern` can bake a zero-alloc capture path (`captures`) over the
+    // SAME HIR when `ng > 0`. The DFA still serves `find`/`isMatch`/`count`;
+    // captures route through a baked `BacktrackerG`. That capture backtracker
+    // needs its OWN seek prefilter — without it, the unanchored capture scan over
+    // a `(.*)`-style pattern blows the per-call anti-ReDoS step budget hunting for
+    // the next match and bails early (e.g. `log_parse` stalled at 55 of ~600
+    // matches). So build the over-approximation seek here whenever the pattern
+    // has groups (cheap; gated on `ng > 0` so group-less patterns pay nothing).
+    var seek_dfa: full_dfa.Dfa256 = undefined;
+    var seek_ok = false;
+    if (ng > 0) {
+        if (overApproxDfa(&h)) |od| {
+            seek_dfa = od;
+            seek_ok = true;
+        }
+    }
     return switch (planner.resolve(strat, h.anchored_start)) {
-        .literal => |seq| .{ .dfa = d, .outcome = .ok, .strat = .literal, .seq = seq },
-        .reverse_suffix => |sfx| .{ .dfa = d, .outcome = .ok, .strat = .reverse_suffix, .seq = sfx },
-        .lit_prefix => |pp| .{ .dfa = d, .outcome = .ok, .strat = .lit_prefix, .seq = pp },
+        .literal => |seq| .{ .dfa = d, .outcome = .ok, .strat = .literal, .seq = seq, .hir = h, .n_groups = ng, .gnames = gnames, .seek_dfa = seek_dfa, .seek_ok = seek_ok },
+        .reverse_suffix => |sfx| .{ .dfa = d, .outcome = .ok, .strat = .reverse_suffix, .seq = sfx, .hir = h, .n_groups = ng, .gnames = gnames, .seek_dfa = seek_dfa, .seek_ok = seek_ok },
+        .lit_prefix => |pp| .{ .dfa = d, .outcome = .ok, .strat = .lit_prefix, .seq = pp, .hir = h, .n_groups = ng, .gnames = gnames, .seek_dfa = seek_dfa, .seek_ok = seek_ok },
         // `.core`, plus the `.backtrack` sentinel (never reached — non-regular
         // patterns `@compileError` upstream): plain baked DFA.
-        .dfa, .backtrack => .{ .dfa = d, .outcome = .ok, .strat = .dfa },
+        .dfa, .backtrack => .{ .dfa = d, .outcome = .ok, .strat = .dfa, .hir = h, .n_groups = ng, .gnames = gnames, .seek_dfa = seek_dfa, .seek_ok = seek_ok },
     };
 }
 
@@ -297,6 +324,265 @@ fn buildAll(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) 
 pub fn compilesAtComptime(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) bool {
     const built = comptime buildAll(pattern, ci, ml);
     return built.outcome == .ok;
+}
+
+/// Whole-match verbs shared by all three `Pattern` arms (literal / DFA /
+/// backtrack). Parameterized by the arm's strategy-specific leftmost scan
+/// `nextSpanFrom(input, from) ?search.Span`; this layer builds the
+/// **allocation-free, lazy** verbs on top — a comptime peer of the runtime
+/// `MatchIterator` / `starts_with` / `split`. Each arm re-exports the members it
+/// wants (`pub const iterator = V.iterator;` …) since Zig 0.16 has no
+/// `usingnamespace`. Nothing here allocates; iterators are values driven with
+/// `while (it.next()) |m|`.
+fn WholeMatchVerbs(comptime nextSpanFrom: fn ([]const u8, usize) ?search.Span) type {
+    return struct {
+        /// Lazy non-overlapping match iterator — the zero-alloc comptime peer of
+        /// `Regex.iterator`. Computes one match at a time (so `break`-ing early
+        /// costs nothing and memory is O(1) regardless of match count), using the
+        /// same `advanceEmpty` non-overlapping rule as `findAll`/`count`.
+        pub const Iterator = struct {
+            input: []const u8,
+            pos: usize = 0,
+            pub fn next(it: *Iterator) ?Match {
+                if (it.pos > it.input.len) return null;
+                const sp = nextSpanFrom(it.input, it.pos) orelse {
+                    it.pos = it.input.len + 1; // exhausted
+                    return null;
+                };
+                it.pos = advanceEmpty(sp.start, sp.end);
+                return wholeMatch(it.input, sp.start, sp.end);
+            }
+        };
+        pub fn iterator(input: []const u8) Iterator {
+            return .{ .input = input };
+        }
+
+        /// True iff a match begins at offset 0 (anchored-prefix test), without
+        /// writing `^…` into the pattern — the comptime peer of a runtime
+        /// `starts_with`. Allocation-free.
+        pub fn startsWith(input: []const u8) bool {
+            const sp = nextSpanFrom(input, 0) orelse return false;
+            return sp.start == 0;
+        }
+
+        /// Lazy split iterator: yields the substrings of `input` BETWEEN
+        /// successive (non-overlapping) matches — the zero-alloc comptime peer of
+        /// `Regex.split`. Each `next()` returns the next field (a slice aliasing
+        /// `input`); after the last match it yields the trailing remainder, then
+        /// `null`. A zero-width match advances one byte (shared `advanceEmpty`
+        /// rule) so the walk always terminates. Empty fields are yielded (e.g.
+        /// `,,` over `","` gives an empty middle field), matching the runtime
+        /// `split`'s semantics.
+        pub const SplitIterator = struct {
+            input: []const u8,
+            pos: usize = 0, // start of the current (pending) field
+            scan: usize = 0, // where the next match search resumes
+            done: bool = false,
+            pub fn next(it: *SplitIterator) ?[]const u8 {
+                if (it.done) return null;
+                while (it.scan <= it.input.len) {
+                    const sp = nextSpanFrom(it.input, it.scan) orelse break;
+                    const adv = advanceEmpty(sp.start, sp.end);
+                    // A zero-width match that doesn't advance the field start
+                    // produces no separator here; keep scanning. Otherwise the
+                    // field is `[pos, sp.start)` and the next field starts at the
+                    // match end.
+                    if (sp.end == sp.start) {
+                        // zero-width separator: skip it, do not split (matches the
+                        // common `split` convention of not emitting empties for
+                        // empty matches at the cursor); advance the scan only.
+                        if (adv > it.input.len) break;
+                        it.scan = adv;
+                        continue;
+                    }
+                    const field = it.input[it.pos..sp.start];
+                    it.pos = sp.end;
+                    it.scan = adv;
+                    return field;
+                }
+                it.done = true;
+                return it.input[it.pos..]; // trailing remainder
+            }
+        };
+        pub fn splitIterator(input: []const u8) SplitIterator {
+            return .{ .input = input };
+        }
+    };
+}
+
+/// Zero-allocation capture support, re-exported by every arm (`pub const
+/// captures = C.captures;` …). It bakes a capture-only
+/// tree-backtracker over the SAME baked HIR (`built.hir`, trimmed to exact node
+/// count) — independent of how the arm scans for `find` (a regular pattern's
+/// DFA arm still serves `find`/`count` from its DFA; captures route here because
+/// the DFA is capture-transparent). The result is a `Captures(ng, gnames)`
+/// value: groups live inline, **no allocator**. Slots come back absolute from
+/// `runFrom` over the full input (so look-assertions see true context).
+fn CaptureSupport(comptime built: Built) type {
+    const src_h = built.hir;
+    const NN = src_h.node_count;
+    const NG = built.n_groups;
+    const gnames_full = built.gnames;
+    // Exact-size `gnames` for the `Captures` type parameter (`[NG+1]`).
+    const gnames: [NG + 1]?[]const u8 = blk: {
+        var g: [NG + 1]?[]const u8 = undefined;
+        for (0..NG + 1) |i| g[i] = gnames_full[i];
+        break :blk g;
+    };
+    const BH = hir.Hir(NN);
+    const baked: BH = comptime blk: {
+        var t = BH.initComptime();
+        t.node_count = NN;
+        t.set_count = src_h.set_count;
+        t.root = src_h.root;
+        t.anchored_start = src_h.anchored_start;
+        t.anchored_end = src_h.anchored_end;
+        t.saw_lazy = src_h.saw_lazy;
+        for (0..NN) |i| t.nodes[i] = src_h.nodes[i];
+        for (0..src_h.set_count) |s| t.sets[s] = src_h.sets[s];
+        for (src_h.set_count..NN) |s| t.sets[s] = [_]u8{0} ** 32;
+        break :blk t;
+    };
+    const BT = backtrack.BacktrackerG(NN);
+
+    // ── One-pass capture fast path (mirrors the runtime `op_onepass`) ──
+    // For a REGULAR capture pattern that is "one-pass" (deterministic ε-closure,
+    // no overlapping consumes — `onepass.isOnePassNfa`), captures can be filled
+    // by a single O(n·m) deterministic NFA walk with NO backtracking and NO step
+    // budget — exactly how the runtime avoids the tree-backtracker for these. The
+    // tree backtracker is budget-bounded and, on a `(.*)`-over-long-line pattern
+    // like `log_parse`, would hit that budget and bail; onepass does not. We bake
+    // the NFA (built at comptime from the same HIR) + a `Dfa256` (for the O(n)
+    // span the fill needs) when one-pass; otherwise the path is comptime-dead and
+    // `capturesFrom` uses the tree backtracker (the only option for non-regular
+    // patterns — look/backref aren't one-pass anyway, by construction).
+    // Build the NFA at comptime; `built` flag records whether the build
+    // succeeded (a `.backtrack`-strat HIR with backref/look/atomic would error in
+    // `thompson.build` — those are never one-pass, so `op_ok` stays false).
+    const op_built: struct { nfa: thompson.Nfa(NN), ok: bool } = comptime blk: {
+        const n = thompson.build(NN, &baked) catch break :blk .{ .nfa = undefined, .ok = false };
+        break :blk .{ .nfa = n, .ok = true };
+    };
+    const op_nfa = op_built.nfa;
+    const op_ok: bool = comptime (NG > 0 and op_built.ok and onepass.isOnePassNfa(NN, &op_nfa));
+    const op_dfa: full_dfa.Dfa256 = if (op_ok) comptime blk: {
+        var n = op_nfa;
+        break :blk full_dfa.compute(NN, &n, baked.anchored_start, baked.anchored_end);
+    } else undefined;
+    const op_dfa_usable = op_ok and op_dfa.outcome == .ok;
+
+    return struct {
+        pub const Caps = Captures(NG, gnames);
+        const cap_h = baked;
+        const nfa = op_nfa;
+        const dfa = op_dfa;
+
+        /// Seek prefilter for the (fallback) capture backtracker — the SAME
+        /// `lb_byte` / over-approximation-`Dfa256` layering the whole-match
+        /// `.backtrack` arm uses. Only consulted when the one-pass path is
+        /// unavailable (non-regular patterns). `@constCast` is sound (read-only on
+        /// the `locate` path, never `deinit`'d — same as the whole-match seek).
+        const cap_seek_dfa = built.seek_dfa;
+        const cap_seek: ?seek_mod.Seek = if (seq_extract.requiredLeadingLookbehindByte(NN, &baked)) |b|
+            .{ .allocator = std.heap.c_allocator, .lb_byte = b }
+        else if (built.seek_ok)
+            .{ .allocator = std.heap.c_allocator, .dfa = @constCast(&cap_seek_dfa) }
+        else
+            null;
+        inline fn capSeekPtr() ?*const seek_mod.Seek {
+            return if (cap_seek) |*sv| sv else null;
+        }
+
+        /// Materialize a `Caps` from filled `slots` (`slots[0..2]` = whole span).
+        fn slotsToCaps(input: []const u8, slots: []const i32) Caps {
+            var caps: Caps = .{ .groups = undefined };
+            caps.groups[0] = .{ .slice = input[@intCast(slots[0])..@intCast(slots[1])], .start = @intCast(slots[0]), .end = @intCast(slots[1]), .name = null };
+            inline for (1..NG + 1) |g| {
+                const s = slots[2 * g];
+                const e = slots[2 * g + 1];
+                caps.groups[g] = if (s >= 0 and e >= 0 and s <= e)
+                    .{ .slice = input[@intCast(s)..@intCast(e)], .start = @intCast(s), .end = @intCast(e), .name = gnames[g] }
+                else
+                    null;
+            }
+            return caps;
+        }
+
+        /// Leftmost capture-bearing match at/after absolute `from`, into an
+        /// inline `Captures` — **no allocator**. One-pass patterns take the O(n)
+        /// DFA-span + `onepass.fill` path (no backtracking, no step budget);
+        /// everything else uses the tree backtracker. `null` if no match (or, on
+        /// the backtracker path only, the step budget is exceeded — the no-error
+        /// comptime API can't surface that; the runtime maps it to
+        /// `MatchBudgetExceeded`).
+        pub fn capturesFrom(input: []const u8, from: usize) ?Caps {
+            var slots: [2 * (hir.MAX_GROUPS + 1)]i32 = undefined;
+            const nslots = 2 * (NG + 1);
+            if (comptime op_dfa_usable) {
+                // O(n) span from the baked DFA, then a single deterministic fill.
+                const r = core.findLeftmost(&dfa, input[from..]) orelse return null;
+                const span: onepass.Span = .{ .start = from + r.start, .end = from + r.end };
+                @memset(slots[0..nslots], -1);
+                slots[0] = @intCast(span.start);
+                slots[1] = @intCast(span.end);
+                if (onepass.fill(NN, &nfa, input, span, slots[0..nslots]))
+                    return slotsToCaps(input, slots[0..nslots]);
+                // mis-gated (should not happen for op_ok); fall through to bt.
+            }
+            var bt = BT.init(&cap_h, cap_h.anchored_start, cap_h.anchored_end, NG, capSeekPtr(), null);
+            const sp = (bt.runFrom(input, from, slots[0..nslots]) catch return null) orelse return null;
+            slots[0] = @intCast(sp.start);
+            slots[1] = @intCast(sp.end);
+            return slotsToCaps(input, slots[0..nslots]);
+        }
+
+        /// Leftmost capture-bearing match — the **zero-allocation** comptime peer
+        /// of the runtime `Regex.captures`. `find` returns only the whole match
+        /// (a `Match`); this returns every submatch inline (a `Captures`). Use
+        /// `c.get(1)` / `c.getName("year")`. No allocator, no `deinit`.
+        pub fn captures(input: []const u8) ?Caps {
+            return capturesFrom(input, 0);
+        }
+
+        /// Lazy non-overlapping capture iterator — zero-alloc peer of
+        /// `Regex.capturesIterator`. Yields a `Captures` per match. Prefer this
+        /// (or `captures` in a loop) over `capturesAll` to stay fully alloc-free.
+        pub const CapturesIterator = struct {
+            input: []const u8,
+            pos: usize = 0,
+            pub fn next(it: *CapturesIterator) ?Caps {
+                if (it.pos > it.input.len) return null;
+                const c = capturesFrom(it.input, it.pos) orelse {
+                    it.pos = it.input.len + 1;
+                    return null;
+                };
+                const m0 = c.groups[0].?;
+                it.pos = advanceEmpty(m0.start, m0.end);
+                return c;
+            }
+        };
+        pub fn capturesIterator(input: []const u8) CapturesIterator {
+            return .{ .input = input };
+        }
+
+        /// Eager: every non-overlapping match's `Captures` in one owned slice.
+        /// The ONLY allocation is the `[]Captures` slice itself — each element's
+        /// groups are inline (no per-match heap allocation, unlike the runtime
+        /// `Regex.capturesAll` which owns a `[]?Group` per `Match`). Free with a
+        /// single `allocator.free(result)`; no per-element `deinit`.
+        pub fn capturesAll(allocator: std.mem.Allocator, input: []const u8) ![]Caps {
+            var list: std.ArrayList(Caps) = .empty;
+            errdefer list.deinit(allocator);
+            var pos: usize = 0;
+            while (pos <= input.len) {
+                const c = capturesFrom(input, pos) orelse break;
+                const m0 = c.groups[0].?;
+                try list.append(allocator, c);
+                pos = advanceEmpty(m0.start, m0.end);
+            }
+            return list.toOwnedSlice(allocator);
+        }
+    };
 }
 
 /// Build a regex from a comptime-known `pattern`. See the old `ComptimeRegex`
@@ -454,50 +740,35 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             /// API can't surface it); the runtime maps the same bound to
             /// `MatchBudgetExceeded`. Pick inputs well under the O(n) budget for
             /// differential parity.
-            fn nextSpan(input: []const u8, from: usize) ?search.Span {
+            pub fn nextSpanFrom(input: []const u8, from: usize) ?search.Span {
                 var bt = BT.init(&h, a_start, a_end, n_groups, seekPtr(), delPtr());
                 var slots: [2 * (hir.MAX_GROUPS + 1)]i32 = undefined;
                 const sp = (bt.runFrom(input, from, slots[0 .. 2 * (n_groups + 1)]) catch return null) orelse return null;
                 return .{ .start = sp.start, .end = sp.end };
             }
+            const nextSpan = nextSpanFrom; // back-compat alias for in-arm callers
 
-            /// Leftmost match WITH capture slots at/after absolute `from`,
-            /// materialized into an allocator-owned `Match.groups` (group 0 =
-            /// whole match; absent groups are `null`; `(?<name>)` names attached
-            /// from the baked `gnames`). Mirrors the runtime
-            /// `regex.capturesFrom` `.backtrack` branch + slot→`Group`
-            /// materialization exactly, so submatches agree across the two
-            /// front-ends. Budget-exceed degrades to `null` as in `nextSpan`.
-            fn nextCaptures(allocator: std.mem.Allocator, input: []const u8, from: usize) !?Match {
-                const nslots = 2 * (n_groups + 1);
-                var slots: [2 * (hir.MAX_GROUPS + 1)]i32 = undefined;
-                var bt = BT.init(&h, a_start, a_end, n_groups, seekPtr(), delPtr());
-                // `runFrom` over the FULL input (absolute coords) — slots and
-                // span come back absolute, so no shift is needed (and looks see
-                // true context; see `nextSpan`).
-                const sp = (bt.runFrom(input, from, slots[0..nslots]) catch return null) orelse return null;
-                const span_start = sp.start;
-                const span_end = sp.end;
-                const groups = try allocator.alloc(?Group, n_groups + 1);
-                errdefer allocator.free(groups);
-                groups[0] = .{ .slice = input[span_start..span_end], .start = span_start, .end = span_end, .name = null };
-                var g: usize = 1;
-                while (g <= n_groups) : (g += 1) {
-                    const s = slots[2 * g];
-                    const e = slots[2 * g + 1];
-                    if (s >= 0 and e >= 0 and s <= e) {
-                        const su: usize = @intCast(s);
-                        const eu: usize = @intCast(e);
-                        groups[g] = .{ .slice = input[su..eu], .start = su, .end = eu, .name = gnames[g] };
-                    } else groups[g] = null;
-                }
-                return Match{
-                    .slice = input[span_start..span_end],
-                    .start = span_start,
-                    .end = span_end,
-                    .groups = groups,
-                };
-            }
+            // Lazy whole-match verbs (zero-alloc), built on this arm's
+            // `nextSpanFrom`. Re-exported individually (no `usingnamespace` in
+            // Zig 0.16). See `WholeMatchVerbs`.
+            const V = WholeMatchVerbs(nextSpanFrom);
+            pub const Iterator = V.Iterator;
+            pub const iterator = V.iterator;
+            pub const startsWith = V.startsWith;
+            pub const SplitIterator = V.SplitIterator;
+            pub const splitIterator = V.splitIterator;
+            // Zero-alloc capture verbs over an inline `Captures` (works for any
+            // group count — `NG == 0` still exposes group 0 = whole match). The
+            // comptime path captures with NO allocator, so — unlike the runtime
+            // `Regex` — there is no `Match`-returning (allocating) `captures`
+            // here: `captures`→`Captures` is the one, zero-alloc way.
+            const C = CaptureSupport(built);
+            pub const Captures = C.Caps;
+            pub const captures = C.captures;
+            pub const capturesFrom = C.capturesFrom;
+            pub const capturesAll = C.capturesAll;
+            pub const CapturesIterator = C.CapturesIterator;
+            pub const capturesIterator = C.capturesIterator;
 
             pub fn isMatch(input: []const u8) bool {
                 return nextSpan(input, 0) != null;
@@ -506,14 +777,6 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             pub fn find(input: []const u8) ?Match {
                 const sp = nextSpan(input, 0) orelse return null;
                 return wholeMatch(input, sp.start, sp.end);
-            }
-
-            /// Leftmost match with capture-group submatches (the
-            /// capture-bearing peer of `find`). Caller owns the result —
-            /// `defer m.?.deinit(allocator)`. Full parity with the runtime
-            /// `Regex.captures` for the non-regular tier, names included.
-            pub fn captures(allocator: std.mem.Allocator, input: []const u8) !?Match {
-                return nextCaptures(allocator, input, 0);
             }
 
             pub fn count(input: []const u8) usize {
@@ -535,31 +798,6 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
                     const sp = nextSpan(input, pos) orelse break;
                     try list.append(allocator, wholeMatch(input, sp.start, sp.end));
                     pos = advanceEmpty(sp.start, sp.end);
-                }
-                return list.toOwnedSlice(allocator);
-            }
-
-            /// `findAll` with capture submatches: every non-overlapping leftmost
-            /// match, each owning its `groups` (same advance rule as
-            /// `findAll`/`count`). Ownership matches the runtime
-            /// `Regex.capturesAll`: free with
-            /// `for (ms) |*m| m.deinit(a); a.free(ms);`.
-            pub fn capturesAll(allocator: std.mem.Allocator, input: []const u8) ![]Match {
-                var list: std.ArrayList(Match) = .empty;
-                errdefer {
-                    for (list.items) |*mt| mt.deinit(allocator);
-                    list.deinit(allocator);
-                }
-                var pos: usize = 0;
-                while (pos <= input.len) {
-                    var mt = (try nextCaptures(allocator, input, pos)) orelse break;
-                    const s = mt.start;
-                    const e = mt.end;
-                    list.append(allocator, mt) catch |err| {
-                        mt.deinit(allocator);
-                        return err;
-                    };
-                    pos = advanceEmpty(s, e);
                 }
                 return list.toOwnedSlice(allocator);
             }
@@ -594,12 +832,18 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             pub const has_dfa = true;
             const t = teddy;
 
+            /// Leftmost literal span at/after `from` (Teddy scan). The single
+            /// scan the whole-match verbs share.
+            pub fn nextSpanFrom(input: []const u8, from: usize) ?search.Span {
+                return core.literalFindT(&t, input, from);
+            }
+
             pub fn isMatch(input: []const u8) bool {
                 return core.literalIsMatchT(&t, input);
             }
 
             pub fn find(input: []const u8) ?Match {
-                const sp = core.literalFindT(&t, input, 0) orelse return null;
+                const sp = nextSpanFrom(input, 0) orelse return null;
                 return wholeMatch(input, sp.start, sp.end);
             }
 
@@ -607,7 +851,7 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
                 var n: usize = 0;
                 var pos: usize = 0;
                 while (pos <= input.len) {
-                    const sp = core.literalFindT(&t, input, pos) orelse break;
+                    const sp = nextSpanFrom(input, pos) orelse break;
                     n += 1;
                     pos = advanceEmpty(sp.start, sp.end);
                 }
@@ -619,12 +863,30 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
                 errdefer list.deinit(allocator);
                 var pos: usize = 0;
                 while (pos <= input.len) {
-                    const sp = core.literalFindT(&t, input, pos) orelse break;
+                    const sp = nextSpanFrom(input, pos) orelse break;
                     try list.append(allocator, wholeMatch(input, sp.start, sp.end));
                     pos = advanceEmpty(sp.start, sp.end);
                 }
                 return list.toOwnedSlice(allocator);
             }
+
+            // Lazy whole-match verbs (zero-alloc): iterator / startsWith / split.
+            const V = WholeMatchVerbs(nextSpanFrom);
+            pub const Iterator = V.Iterator;
+            pub const iterator = V.iterator;
+            pub const startsWith = V.startsWith;
+            pub const SplitIterator = V.SplitIterator;
+            pub const splitIterator = V.splitIterator;
+            // Zero-alloc captures over the baked HIR (the `.literal` strat is an
+            // exact-literal pattern, so typically `NG == 0` ⇒ group 0 only; but a
+            // captured exact literal like `(abc)` still resolves correctly).
+            const C = CaptureSupport(built);
+            pub const Captures = C.Caps;
+            pub const captures = C.captures;
+            pub const capturesFrom = C.capturesFrom;
+            pub const capturesAll = C.capturesAll;
+            pub const CapturesIterator = C.CapturesIterator;
+            pub const capturesIterator = C.capturesIterator;
         };
     }
 
@@ -679,9 +941,9 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             const t: pf.Teddy = maybe_teddy orelse undefined;
 
             /// Next leftmost span at/after `from`, absolute coords. The single
-            /// source of truth `find`/`count`/`findAll` share; the `switch
-            /// (mode)` folds to the one strategy at comptime.
-            fn nextSpan(input: []const u8, from: usize) ?search.Span {
+            /// source of truth `find`/`count`/`findAll` + the lazy verbs share;
+            /// the `switch (mode)` folds to the one strategy at comptime.
+            pub fn nextSpanFrom(input: []const u8, from: usize) ?search.Span {
                 return switch (mode) {
                     .dfa => blk: {
                         const r = table.findLeftmost(input[from..]) orelse break :blk null;
@@ -701,6 +963,7 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
                     },
                 };
             }
+            const nextSpan = nextSpanFrom; // back-compat alias for in-arm callers
 
             pub fn isMatch(input: []const u8) bool {
                 return switch (mode) {
@@ -737,6 +1000,25 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
                 }
                 return list.toOwnedSlice(allocator);
             }
+
+            // Lazy whole-match verbs (zero-alloc): iterator / startsWith / split.
+            const V = WholeMatchVerbs(nextSpanFrom);
+            pub const Iterator = V.Iterator;
+            pub const iterator = V.iterator;
+            pub const startsWith = V.startsWith;
+            pub const SplitIterator = V.SplitIterator;
+            pub const splitIterator = V.splitIterator;
+            // Zero-alloc captures: this is the key win for regular-with-captures
+            // patterns (e.g. `(\d{4})-(\d{2})-(\d{2})`) — `find`/`count` stay on
+            // the fast DFA above; captures route through a baked backtracker over
+            // the same HIR (the DFA is capture-transparent), no allocator.
+            const C = CaptureSupport(built);
+            pub const Captures = C.Caps;
+            pub const captures = C.captures;
+            pub const capturesFrom = C.capturesFrom;
+            pub const capturesAll = C.capturesAll;
+            pub const CapturesIterator = C.CapturesIterator;
+            pub const capturesIterator = C.capturesIterator;
         };
     }
 

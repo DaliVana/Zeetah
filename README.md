@@ -367,25 +367,43 @@ test "allocation-free comptime match" {
     try std.testing.expectEqual(@as(usize, 1), Phone.count("call 555-1234"));
 }
 
+// `find` returns the WHOLE match (`Match`); `captures` returns the SUBMATCHES
+// (`Captures`). On the comptime path `captures` is **zero-allocation** — the
+// group count + names are known at compile time, so groups live inline. `get(i)`
+// is compile-time-indexed (a bad index is a compile error, not a runtime null);
+// `getName` resolves the (?<name>) at compile time. Regular patterns (DFA arm) too.
+const Date = zeetah.Pattern("(?<y>[0-9]{4})-([0-9]{2})-([0-9]{2})", .{});
+
+test "zero-alloc comptime captures" {
+    if (Date.captures("ts 2026-06-01!")) |c| {        // ?Captures — NO allocator
+        try std.testing.expectEqualStrings("2026-06-01", c.slice());  // whole match
+        try std.testing.expectEqualStrings("2026", c.get(1).?.slice);  // by index
+        try std.testing.expectEqualStrings("2026", c.getName("y").?.slice); // by name
+    }
+}
+
 // Non-regular features work at comptime too — backreferences, lookaround,
 // atomic/possessive, word boundaries, (?m) line anchors. These bake the
-// bounded backtracker into .rodata (no DFA); captures are fully supported.
+// bounded backtracker into .rodata (no DFA); `captures` is still zero-alloc.
 const Dup = zeetah.Pattern("(\\w+) \\1", .{});            // backreference
-const Amount = zeetah.Pattern("(?<=\\$)[0-9]+", .{});      // lookbehind
 
-test "non-regular comptime match + captures" {
-    try std.testing.expect(Dup.isMatch("the the quick"));
-    const a = std.testing.allocator;
-    if (try Dup.captures(a, "the the quick")) |m| {
-        defer { var mm = m; mm.deinit(a); }
-        try std.testing.expectEqualStrings("the", m.groups[1].?.slice);
-    }
+test "lazy, allocation-free verbs" {
+    // iterator / splitIterator are lazy values — O(1) memory, free early-break:
+    var it = zeetah.Pattern("[0-9]+", .{}).iterator("a12 b345 c6");
+    while (it.next()) |m| { _ = m; }                  // no allocator, no slice
+
+    try std.testing.expect(zeetah.Pattern("v[0-9]+", .{}).startsWith("v2.0"));
+    _ = Dup; // (Dup used above)
 }
 ```
 
-`isMatch` / `find` / `count` are fully allocation-free; `findAll` / `captures` /
-`capturesAll` take an allocator only to materialize the result slices. Options
-(`zeetah.PatternOptions`):
+**The mental model:** `find` → `Match` (the whole match); `captures` → `Captures`
+(the submatches). On the comptime `Pattern`, **everything that returns one match is
+allocation-free** — `isMatch` / `find` / `count` / `captures` (inline `Captures`) /
+`iterator` / `capturesIterator` / `splitIterator` / `startsWith`. Only the **eager,
+return-a-slice** verbs take an allocator: `findAll` → `[]Match`, `capturesAll` →
+`[]Captures` (one slice; the per-match groups are still inline — no per-match heap,
+unlike the runtime `Regex`). Options (`zeetah.PatternOptions`):
 
 ```zig
 pub const Options = struct {
