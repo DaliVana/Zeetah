@@ -63,6 +63,27 @@ test "escapes: metacharacters are literal when escaped" {
     try std.testing.expectEqualStrings("a\\b", (try find1(a, "a\\\\b", "p a\\b q")).?.slice);
 }
 
+test "escapes: any ASCII punctuation is literal (Rust/RE2 rule, incl. \\/)" {
+    const a = std.testing.allocator;
+
+    // `\/` is the headline case (ghostty's URL regex uses it heavily). Plus a
+    // spread of other punctuation escapes that have no special meaning.
+    try std.testing.expectEqualStrings("a/b", (try find1(a, "a\\/b", "a/b")).?.slice);
+    try std.testing.expectEqualStrings("a-b", (try find1(a, "a\\-b", "a-b")).?.slice);
+    try std.testing.expectEqualStrings("x@y", (try find1(a, "x\\@y", "x@y")).?.slice);
+    try std.testing.expectEqualStrings("c:d", (try find1(a, "c\\:d", "c:d")).?.slice);
+    try std.testing.expectEqualStrings("e#f", (try find1(a, "e\\#f", "e#f")).?.slice);
+    try std.testing.expectEqualStrings("g%h", (try find1(a, "g\\%h", "g%h")).?.slice);
+    try std.testing.expectEqualStrings("i&j", (try find1(a, "i\\&j", "i&j")).?.slice);
+
+    // Inside a character class too: `[\w\/]+` matches a slash-containing run.
+    try std.testing.expectEqualStrings("a/b/c", (try find1(a, "[\\w\\/]+", " a/b/c ")).?.slice);
+
+    // Alphabetic non-escapes are still rejected (not silently literal) — Rust
+    // parity: the carve-out is punctuation only.
+    try std.testing.expectError(error.NotImplemented, Regex.compile(a, "a\\yb"));
+}
+
 test "escapes: \\n \\t \\r control bytes" {
     const a = std.testing.allocator;
     try std.testing.expect((try find1(a, "a\\nb", "a\nb")) != null);
