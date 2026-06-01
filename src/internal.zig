@@ -38,6 +38,7 @@ pub const full_dfa = @import("exec/full_dfa.zig");
 pub const dfa_build = @import("exec/dfa_build.zig");
 pub const Pattern = @import("pattern.zig").Pattern;
 pub const PatternOptions = @import("pattern.zig").Options;
+pub const compilesAtComptime = @import("pattern.zig").compilesAtComptime;
 
 pub const properties = @import("properties.zig");
 pub const Properties = @import("properties.zig").Properties;

@@ -693,45 +693,65 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: PatternOptions) type
 **Static members of the returned type:**
 
 ```zig
-pub const has_dfa = true;
+// `has_dfa == true`  for a baked DFA / literal (the regular tier);
+// `has_dfa == false` for the baked tree-backtracker (the non-regular tier).
+pub const has_dfa: bool;
 
 pub fn isMatch(input: []const u8) bool;
 pub fn find(input: []const u8) ?Match;             // NO error union, NO allocator
 pub fn count(input: []const u8) usize;
-pub fn findAll(allocator: std.mem.Allocator, input: []const u8) ![]Match; // only this allocates
+pub fn findAll(allocator: std.mem.Allocator, input: []const u8) ![]Match;
+// Capture extraction — present on EVERY `Pattern` (DFA and backtracker tiers):
+pub fn captures(allocator: std.mem.Allocator, input: []const u8) !?Match;
+pub fn capturesAll(allocator: std.mem.Allocator, input: []const u8) ![]Match;
 ```
 
-- The comptime path is **capture-free**: there is no `captures`/`findWithCaptures`
-  on `Pattern` (submatch extraction is a hard `@compileError`). Use the runtime
-  `Regex.captures` if you need groups.
-- Only `findAll` allocates — for the result slice; free it with
-  `allocator.free`.
+- `isMatch` / `find` / `count` are fully allocation-free. `findAll` / `captures` /
+  `capturesAll` take an allocator only to materialize the result slices /
+  `Match.groups`; free with `allocator.free` (and `Match.deinit` for the
+  capture-bearing ones).
+- Capture extraction works at comptime — numbered **and** `(?<name>)` named groups,
+  via `Match.groups` / `Match.groupByName`, identical to the runtime `Regex`.
 
 ```zig
 const Pattern = @import("zeetah").Pattern;
 
 const Re = Pattern("\\d{4}-\\d{2}-\\d{2}", .{});
-comptime std.debug.assert(Re.has_dfa);
+comptime std.debug.assert(Re.has_dfa);          // regular ⇒ baked DFA
 
 if (Re.find("Date: 2024-03-15")) |m| {
     std.debug.print("{s}\n", .{m.slice}); // "2024-03-15" — no allocator
 }
+
+// Non-regular ⇒ baked tree-backtracker (has_dfa == false):
+const Dup = Pattern("(\\w+) \\1", .{});
+comptime std.debug.assert(!Dup.has_dfa);
 ```
 
-**Supported subset.** `Pattern` covers the regular, DFA-representable subset,
-including `\p{…}` (the resolver is allocator-free). It raises a hard
-`@compileError` (there is **no** runtime fallback for these) for:
+**Supported subset.** `Pattern` now covers the **same feature surface as the runtime
+`Regex`** — the two share the `parser → HIR` front end. Regular patterns bake a
+minimized DFA (or a comptime Teddy literal); non-regular patterns bake the same
+bounded tree-backtracker the runtime uses, including **captures** (numbered + named),
+**lookaround**, **backreferences**, **atomic/possessive** quantifiers, **word
+boundaries** (`\b`/`\B`), **`(?m)` line anchors**, and **lazy-with-end-anchor**
+(`a*?$`). `\p{…}` is supported (allocator-free resolver).
 
-- capture extraction with submatches,
-- lookaround and look-assertions (`\b`, `\B`, mid-string `^`/`$`, `(?m)`
-  anchors),
-- backreferences,
-- `\p` under `(?i)`,
-- lazy combined with an end-anchor (e.g. `a*?$`, which routes to the runtime
-  backtracker — unavailable at comptime),
-- patterns that exceed the internal DFA ceiling.
+Because a `Pattern` bakes a single matcher with **no runtime fallback**, the
+constructs that are genuinely unsupported *anywhere* in the engine are a hard
+`@compileError` (rather than a recoverable runtime `error.NotImplemented`):
 
-For any of those, use the runtime `Regex` instead.
+- the `.unicode` (codepoint-mode) flag,
+- `\p` scripts / binary properties / `\p` under `(?i)`,
+- an unknown POSIX class name,
+- a pattern that overflows an internal construction ceiling (e.g. `>1000`-count
+  repetition, or a DFA that blows the 256-state ceiling — note a *large keyword
+  alternation* like `\b(?:kw|…)\b` that would blow `MAX_NFA` instead routes to the
+  backtracker and compiles, just slower than the runtime's Aho-Corasick engine).
+
+For any of those, or if you need the rejection to be a recoverable error, use the
+runtime `Regex`. (The match-budget ReDoS bound applies identically at comptime; the
+non-erroring comptime API surfaces an exceedance as "no match" rather than
+`error.MatchBudgetExceeded`.)
 
 ### `PatternOptions`
 
@@ -749,8 +769,12 @@ pub const PatternOptions = struct {
     /// `@compileError` (the comptime path has no runtime fallback; use the
     /// runtime `Regex.compile` instead).
     on_oversize: enum { compile_error, allow_oversized } = .compile_error,
-    /// ASCII case-insensitive matching.
+    /// ASCII case-insensitive matching (peer of `(?i)`).
     case_insensitive: bool = false,
+    /// Multiline mode (peer of `(?m)`): `^`/`$` match at line boundaries.
+    /// Such a pattern routes to the comptime backtracker (looks aren't
+    /// DFA-foldable), exactly as a leading inline `(?m)` would.
+    multiline: bool = false,
 };
 ```
 

@@ -88,7 +88,7 @@ pub const SplitAlt = struct {
 
 /// Faithful subtree copy (sets re-interned) — `hir.cloneSubtree(…, false)`.
 inline fn cloneExact(dst: *H, a: std.mem.Allocator, src: *const H, ref: NodeRef) hir.Error!NodeRef {
-    return hir.cloneSubtree(dst, a, src, ref, false);
+    return hir.cloneSubtree(null, null, dst, a, src, ref, false);
 }
 
 /// A branch is DFA-eligible iff it contains no non-regular / unfoldable node

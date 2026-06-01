@@ -148,6 +148,25 @@ test "comptime Pattern: allocation-free static methods" {
     try std.testing.expect(Word.isMatch("ZEETAH"));
 }
 
+test "comptime Pattern: non-regular features (README/EXAMPLES/API/WASM mirror)" {
+    // Mirrors the README "Compile-time patterns" + EXAMPLES non-regular snippets:
+    // backreference (with captures), lookbehind, and (?m) via Options.multiline.
+    const Dup = zeetah.Pattern("(\\w+) \\1", .{});
+    comptime std.debug.assert(!Dup.has_dfa); // non-regular ⇒ baked backtracker
+    try std.testing.expect(Dup.isMatch("the the quick"));
+    if (try Dup.captures(a, "the the quick")) |m| {
+        var mm = m;
+        defer mm.deinit(a);
+        try eqs("the", mm.groups[1].?.slice);
+    } else return error.TestUnexpectedNull;
+
+    const Amount = zeetah.Pattern("(?<=\\$)[0-9]+", .{});
+    try eqs("42", Amount.find("price $42 today").?.slice);
+
+    const Logs = zeetah.Pattern("^ERROR", .{ .multiline = true });
+    try eq(@as(usize, 2), Logs.count("ERROR a\nok\nERROR b"));
+}
+
 test "Builder fluent build/compile + Patterns string factories" {
     var b = zeetah.Builder.init(a);
     defer b.deinit();

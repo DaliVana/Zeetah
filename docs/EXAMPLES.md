@@ -420,10 +420,12 @@ Static methods:
 - `isMatch(input) bool` — allocation-free, no error union.
 - `find(input) ?Match` — allocation-free, **no error union** (unlike runtime `find`).
 - `count(input) usize` — allocation-free, no error union.
-- `findAll(allocator, input) ![]Match` — the **only** method that allocates (the result slice).
+- `findAll(allocator, input) ![]Match` — allocates the result slice.
+- `captures(allocator, input) !?Match` / `capturesAll(allocator, input) ![]Match`
+  — submatch extraction (numbered + `(?<name>)` named), same as the runtime
+  `Regex`; allocate the `Match.groups`.
 
-The comptime path is capture-free — there is no `captures` on `Pattern`; reach
-for the runtime `Regex.captures` if you need submatches.
+Captures work at comptime too — `Pattern` is no longer capture-free.
 
 ### Options
 
@@ -431,21 +433,33 @@ for the runtime `Regex.captures` if you need submatches.
 // zeetah.PatternOptions:
 //   max_dfa_states: usize = 256          (soft budget; bounded by an internal 256 ceiling, cannot raise it)
 //   on_oversize: enum { compile_error, allow_oversized } = .compile_error
-//   case_insensitive: bool = false
+//   case_insensitive: bool = false       (peer of (?i))
+//   multiline: bool = false              (peer of (?m): ^/$ as line anchors)
 
 const Word = zeetah.Pattern("[a-z]+", .{ .case_insensitive = true });
 
 test "case-insensitive comptime pattern" {
     try std.testing.expect(Word.isMatch("ZEETAH"));
 }
+
+// Non-regular features compile at comptime — they bake the bounded backtracker:
+const Dup = zeetah.Pattern("(\\w+) \\1", .{});         // backreference + captures
+const Logs = zeetah.Pattern("^ERROR", .{ .multiline = true }); // (?m) line anchor
+
+test "non-regular comptime patterns" {
+    try std.testing.expect(Dup.isMatch("the the"));
+    try std.testing.expectEqual(@as(usize, 2), Logs.count("ERROR a\nok\nERROR b"));
+}
 ```
 
-The comptime path supports only the regular, DFA-representable subset (this
-*does* include Latin-1 `\p{…}`). Captures-with-submatches, lookaround,
-backreferences, look-assertions (`\b`, `\B`, mid-pattern `^`/`$`, `(?m)`
-anchors), `\p` under `(?i)`, lazy-plus-end-anchor (`a*?$`), and patterns
-exceeding the DFA ceiling are a **hard `@compileError`** — there is no runtime
-fallback baked into a `Pattern`. For those, use the runtime `Regex`.
+The comptime path now covers the **same feature surface as the runtime `Regex`**:
+regular patterns bake a minimized DFA, non-regular ones (captures, lookaround,
+backreferences, atomic/possessive, `\b`, `(?m)`, lazy-plus-end-anchor) bake the
+same bounded backtracker. The only `@compileError`s are the constructs genuinely
+unsupported *anywhere* in the engine — the `.unicode` flag, `\p` scripts / `\p`
+under `(?i)`, an unknown POSIX class, or a pattern past an internal construction
+ceiling — since a `Pattern` has no runtime fallback. For those, use the runtime
+`Regex`.
 
 > `on_oversize = .allow_oversized` only bakes an over-budget but
 > representable DFA for a large *regular* pattern; it does **not** make a

@@ -106,52 +106,11 @@ const BLits = struct {
     }
 };
 
-/// Count capturing groups in source order (mirrors `parser` numbering:
-/// group 0 = whole match; plain `(` and `(?<name>)`/`(?P<name>)` count,
-/// `(?:`/flags/lookaround do not) and record `(?<name>)` names (aliasing
-/// `pattern`) into `gnames[group]`.
-fn scanGroups(pattern: []const u8, gnames: *[hir.MAX_GROUPS + 1]?[]const u8) usize {
-    var n: usize = 0;
-    var i: usize = 0;
-    var in_class = false;
-    while (i < pattern.len) : (i += 1) {
-        const c = pattern[i];
-        if (c == '\\') {
-            i += 1; // skip escaped byte
-            continue;
-        }
-        if (in_class) {
-            if (c == ']') in_class = false;
-            continue;
-        }
-        if (c == '[') {
-            in_class = true;
-            continue;
-        }
-        if (c != '(') continue;
-        if (i + 1 < pattern.len and pattern[i + 1] == '?') {
-            // (?<name>…) / (?P<name>…) capture; everything else non-capturing.
-            var ns: usize = 0;
-            if (i + 2 < pattern.len and pattern[i + 2] == '<' and
-                i + 3 < pattern.len and pattern[i + 3] != '=' and pattern[i + 3] != '!')
-            {
-                ns = i + 3;
-            } else if (i + 3 < pattern.len and pattern[i + 2] == 'P' and pattern[i + 3] == '<') {
-                ns = i + 4;
-            } else continue;
-            var j = ns;
-            while (j < pattern.len and pattern[j] != '>') j += 1;
-            if (j >= pattern.len) continue;
-            if (n >= hir.MAX_GROUPS) continue;
-            n += 1;
-            gnames[n] = pattern[ns..j];
-        } else {
-            if (n >= hir.MAX_GROUPS) continue;
-            n += 1;
-        }
-    }
-    return n;
-}
+/// Capture-group numbering + `(?<name>)` names, in source order. Lifted to
+/// `parser.zig` as the single source of truth so the runtime and comptime
+/// (`pattern.zig`) `.backtrack` paths agree by construction; aliased here so the
+/// existing call site reads unchanged.
+const scanGroups = parser.scanGroups;
 
 /// Shift every set capture slot (`>= 0`) and leave unset slots (`-1`) alone,
 /// converting offsets that were computed over `input[pos..]` back to absolute

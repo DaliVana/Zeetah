@@ -282,10 +282,14 @@ export fn phoneMatches(ptr: [*]const u8, len: usize) i32 {
 }
 ```
 
-`Pattern` is **capture-free** and only handles the regular, DFA-representable
-subset. Lookaround, backreferences, captures-with-submatches, and look-assertions
-are a hard `@compileError` on this path (there is no runtime fallback baked into
-a `Pattern`); for those, use the runtime `Regex` shim above.
+`Pattern` covers the **same feature surface as the runtime `Regex`** — regular
+patterns bake a minimized DFA, non-regular ones (lookaround, backreferences,
+atomic/possessive, `\b`, `(?m)`, captures-with-submatches) bake the same bounded
+backtracker into `.rodata`. The only `@compileError`s are constructs genuinely
+unsupported anywhere in the engine (the `.unicode` flag, `\p` scripts / `\p` under
+`(?i)`, an unknown POSIX class, or a pattern past an internal construction ceiling),
+since a `Pattern` has no runtime fallback; for those, use the runtime `Regex` shim
+above.
 
 ---
 

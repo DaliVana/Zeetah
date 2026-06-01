@@ -44,13 +44,16 @@ const NodeRef = hir.NodeRef;
 const MAX_ISLANDS: usize = 32;
 
 /// Is `ref`'s subtree a delegatable regular island? (See module soundness.)
-fn delegatable(h: *const H, ref: NodeRef) bool {
+/// `pub` + generic over the store cap so the comptime path (`pattern.zig`'s
+/// baked-delegate builder) reuses the SAME classifier as the runtime — the
+/// soundness argument above holds identically for both.
+pub fn delegatable(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) bool {
     if (ref == hir.none) return false;
     const nd = h.node(ref);
     return switch (nd.tag) {
         .empty, .set => true,
-        .concat => delegatable(h, nd.a) and delegatable(h, nd.b),
-        .star, .plus, .opt => nd.greedy and delegatable(h, nd.a),
+        .concat => delegatable(cap, h, nd.a) and delegatable(cap, h, nd.b),
+        .star, .plus, .opt => nd.greedy and delegatable(cap, h, nd.a),
         // alt (priority/longest mismatch), lazy (handled above via !greedy),
         // cap/backref/look/look_around (irregular or slot-writing), atomic
         // (non-regular cut) → no.
@@ -63,25 +66,25 @@ fn delegatable(h: *const H, ref: NodeRef) bool {
 /// the tree-walker in tight O(len) already — compiling a minimized DFA for it
 /// is pure compile-time cost for no runtime gain. Delegation only earns its
 /// keep when a `*`/`+` makes the run length unbounded.
-fn hasUnboundedRep(h: *const H, ref: NodeRef) bool {
+pub fn hasUnboundedRep(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) bool {
     const nd = h.node(ref);
     return switch (nd.tag) {
         .star, .plus => true,
-        .opt => hasUnboundedRep(h, nd.a),
-        .concat => hasUnboundedRep(h, nd.a) or hasUnboundedRep(h, nd.b),
+        .opt => hasUnboundedRep(cap, h, nd.a),
+        .concat => hasUnboundedRep(cap, h, nd.a) or hasUnboundedRep(cap, h, nd.b),
         else => false,
     };
 }
 
 /// Minimum match width of a delegatable subtree (only called on subtrees
 /// `delegatable` already accepted, so the irregular tags never occur).
-fn minLen(h: *const H, ref: NodeRef) usize {
+pub fn minLen(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) usize {
     const nd = h.node(ref);
     return switch (nd.tag) {
         .empty => 0,
         .set => 1,
-        .concat => minLen(h, nd.a) + minLen(h, nd.b),
-        .plus => minLen(h, nd.a),
+        .concat => minLen(cap, h, nd.a) + minLen(cap, h, nd.b),
+        .plus => minLen(cap, h, nd.a),
         .star, .opt => 0,
         else => 0,
     };
@@ -91,7 +94,7 @@ fn minLen(h: *const H, ref: NodeRef) usize {
 /// star|plus|opt` occur — the classifier guarantees it). Thin alias over
 /// `hir.cloneSubtree(…, false)`.
 inline fn copyReg(dst: *H, a: std.mem.Allocator, src: *const H, ref: NodeRef) hir.Error!NodeRef {
-    return hir.cloneSubtree(dst, a, src, ref, false);
+    return hir.cloneSubtree(null, null, dst, a, src, ref, false);
 }
 
 pub const Plan = struct {
@@ -128,9 +131,9 @@ pub fn build(allocator: std.mem.Allocator, h: *const H) ?*Plan {
     while (ref < n_nodes and pl.n < MAX_ISLANDS) : (ref += 1) {
         const nd = h.node(ref);
         if (nd.tag != .concat) continue;
-        if (!delegatable(h, nd.a)) continue;
-        if (minLen(h, nd.a) < 1) continue; // nullable ⇒ no work saved
-        if (!hasUnboundedRep(h, nd.a)) continue; // fixed run ⇒ DFA not worth it
+        if (!delegatable(null, h, nd.a)) continue;
+        if (minLen(null, h, nd.a) < 1) continue; // nullable ⇒ no work saved
+        if (!hasUnboundedRep(null, h, nd.a)) continue; // fixed run ⇒ DFA not worth it
 
         // Extract the island into its own anchored DFA.
         var oh = H.initRuntime();
@@ -189,9 +192,9 @@ fn diffOnOff(a: std.mem.Allocator, p: []const u8, ins: []const []const u8, must_
 test "delegate: regular-prefix patterns actually fire, on ≡ off" {
     const a = std.testing.allocator;
     const ins = [_][]const u8{
-        "",          "ab12END",  "ab12ENDx",      "  AB12END  ",
-        "zz9END q",  "x000yyZ",  "x000yyy q",     "aaaa1111ENDED a1END",
-        "nope",      "X12END",
+        "",         "ab12END", "ab12ENDx",  "  AB12END  ",
+        "zz9END q", "x000yyZ", "x000yyy q", "aaaa1111ENDED a1END",
+        "nope",     "X12END",
     };
     // Regular *prefix* run (the `.a` spine) + irregular glue ⇒ delegatable
     // as a subtree. These MUST fire (else the path isn't exercised).

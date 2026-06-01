@@ -199,8 +199,9 @@ the meta engine; this is a guide to expectations, not a contract.
 
 ### Bounded — the backtracker (linear-time *not* guaranteed by construction)
 
-- **Lookahead / lookbehind** (`(?=…)`, `(?<=…)`): runtime-only, step-budgeted.
-- **Backreferences** (`\1`, `\k<name>`): runtime-only, step-budgeted; the
+- **Lookahead / lookbehind** (`(?=…)`, `(?<=…)`): step-budgeted; runs on the
+  backtracker (at runtime, and baked into `.rodata` under the comptime `Pattern`).
+- **Backreferences** (`\1`, `\k<name>`): step-budgeted (runtime + comptime); the
   `dup_word` recognizer handles the adjacent-duplicate-word special case in a
   single linear scan instead.
 - **Lazy with an end-anchor** (`a*?$`): routes to the backtracker.

@@ -224,11 +224,11 @@ test "reverse_suffix: find/isMatch consistent with an independent recompile" {
 // The comptime `Pattern` and the runtime `Regex` (both the unified pipeline)
 // must agree on isMatch/find boundaries across the supported subset.
 const cr_inputs = [_][]const u8{
-    "",            "a",            "ab",          "abc",
-    "abcabc",      "xabcy",        "AABBCC",      "123",
-    "a1b2c3",      "hello world",  "the fox",     "no match",
-    "aaaaaaaaaa",  "foobar",       "cat dog bird","x",
-    "user@host.io","2026-05-17",   "Zfoobar end", "  spaces  ",
+    "",             "a",           "ab",           "abc",
+    "abcabc",       "xabcy",       "AABBCC",       "123",
+    "a1b2c3",       "hello world", "the fox",      "no match",
+    "aaaaaaaaaa",   "foobar",      "cat dog bird", "x",
+    "user@host.io", "2026-05-17",  "Zfoobar end",  "  spaces  ",
 };
 
 fn crAgree(comptime p: []const u8) !void {
@@ -273,6 +273,303 @@ test "comptime Pattern <-> runtime Regex agree across the supported subset" {
     try crAgree("abc[0-9]+z");
     try crAgree("hello.*world");
     try crAgree("[A-Z].*foobar");
+}
+
+// Non-regular tier differential: backref / lookaround / atomic / possessive /
+// lazy-anchored patterns route to the comptime-baked tree backtracker
+// (`has_dfa == false`, no DFA table — Steps 1-3 of the comptime-backtracker
+// work). This is the ONLY coverage that *instantiates* that `Pattern` arm —
+// every other test pattern is regular, so the arm is comptime-eliminated and a
+// green build says nothing about it. Calling `isMatch`/`find` here forces full
+// analysis of the baked `Hir(node_count)` + the generic `BacktrackerG(node_count)`,
+// so this file compiling at all is the primary proof those pieces type-check;
+// the value checks then confirm the comptime matcher agrees with the runtime
+// `Regex` engine. Inputs are short (well under `backtrack.run`'s O(n) step
+// budget) so neither side hits the budget cut — comptime degrades it to `null`
+// (the no-error API), runtime maps it to `MatchBudgetExceeded` — keeping the two
+// directly comparable.
+fn btAgree(comptime p: []const u8, in: []const u8) !void {
+    const a = std.testing.allocator;
+    const P = regex.Pattern(p, .{});
+    comptime std.debug.assert(!P.has_dfa); // took the .backtrack arm, not the DFA/literal
+    var rx = try Regex.compile(a, p);
+    defer rx.deinit();
+
+    try std.testing.expectEqual(try rx.isMatch(in), P.isMatch(in));
+    const pm = P.find(in);
+    var rm = try rx.find(in);
+    defer if (rm) |*x| x.deinit(a);
+    try std.testing.expectEqual(rm == null, pm == null);
+    if (pm) |pmm| {
+        try std.testing.expectEqual(rm.?.start, pmm.start);
+        try std.testing.expectEqual(rm.?.end, pmm.end);
+    }
+}
+
+test "comptime Pattern <-> runtime Regex agree: non-regular (tree backtracker) tier" {
+    // backreferences (numeric + named)
+    try btAgree("(ab)\\1", "abab"); // match
+    try btAgree("(ab)\\1", "abac"); // no match
+    try btAgree("(\\w)\\1", "aXhhb"); // doubled char mid-string
+    try btAgree("(\\w+) \\1", "the the quick"); // adjacent dup word
+    try btAgree("(\\w+) \\1", "the cat sat"); // no dup
+    try btAgree("(a)(b)\\2\\1", "abba"); // multi-group \2\1
+    try btAgree("(?<w>\\w+)=\\k<w>", "x=x"); // named backref, match
+    try btAgree("(?<w>\\w+)=\\k<w>", "x=y"); // named backref, no match
+    // lookahead
+    try btAgree("foo(?=bar)", "foobar"); // positive, match
+    try btAgree("foo(?=bar)", "foobaz"); // positive, no match
+    try btAgree("foo(?!bar)", "foobaz"); // negative, match
+    try btAgree("a(?=b)", "ab"); // zero-width consumes only `a`
+    // fixed-width lookbehind
+    try btAgree("(?<=x)y", "xy"); // positive
+    try btAgree("(?<=x)y", "zy"); // positive, no match
+    try btAgree("(?<!x)y", "zy"); // negative, match
+    try btAgree("(?<!x)y", "xy"); // negative, no match
+    // atomic group / possessive quantifier (language-changing cut)
+    try btAgree("(?>a+)b", "xaaab"); // atomic, match
+    try btAgree("(?>a+)a", "aaa"); // cut starves trailing `a` -> no match
+    try btAgree("(?>[A-Za-z0-9_]+)@", "say foo@bar"); // atomic_token shape
+    try btAgree("a*+b", "aaab"); // possessive, match
+    try btAgree("a*+a", "aaa"); // possessive, no match
+    try btAgree("a{2,3}+a", "aaa"); // bounded possessive starves trailing `a`
+    // lazy + end-anchor: regular language, but `saw_lazy && anchored_end`
+    // routes to the tree backtracker (the DFA accept-cut can't model it).
+    try btAgree("a*?$", "aaa");
+    try btAgree(".*?b$", "aabxb");
+}
+
+test "comptime backtracker inherits the ReDoS step budget over a longer input" {
+    // The comptime tree backtracker reuses `backtrack.run`, so it inherits the
+    // O(n) step budget — a backref pattern over a longer input terminates (no
+    // hang) and agrees with the runtime. The test completing is the termination
+    // proof; the value check confirms agreement well under the budget.
+    const a = std.testing.allocator;
+    const P = regex.Pattern("(\\w+)\\1", .{});
+    comptime std.debug.assert(!P.has_dfa);
+    var rx = try Regex.compile(a, "(\\w+)\\1");
+    defer rx.deinit();
+    const in = "the the quick fox fox jumps over the lazy dog dog again";
+    const pm = P.find(in);
+    var rm = try rx.find(in);
+    defer if (rm) |*x| x.deinit(a);
+    try std.testing.expectEqual(rm == null, pm == null);
+    if (pm) |pmm| {
+        try std.testing.expectEqual(rm.?.start, pmm.start);
+        try std.testing.expectEqual(rm.?.end, pmm.end);
+    }
+}
+
+test "comptime backtracker findAll/count parity with runtime Regex" {
+    // Non-overlapping iteration on the `.backtrack` arm must use the same
+    // span-shift + empty-advance convention as the runtime engine.
+    const a = std.testing.allocator;
+    const P = regex.Pattern("(\\w+)\\1", .{});
+    comptime std.debug.assert(!P.has_dfa);
+    var rx = try Regex.compile(a, "(\\w+)\\1");
+    defer rx.deinit();
+    const in = "abcabc x yzyz tutu end";
+
+    try std.testing.expectEqual(try rx.count(in), P.count(in));
+
+    const rms = try rx.findAll(a, in);
+    defer a.free(rms);
+    const pms = try P.findAll(a, in);
+    defer a.free(pms);
+    try std.testing.expectEqual(rms.len, pms.len);
+    for (rms, pms) |r, q| {
+        try std.testing.expectEqual(r.start, q.start);
+        try std.testing.expectEqual(r.end, q.end);
+    }
+}
+
+test "comptime backtracker bakes a trimmed HIR (rodata size sanity)" {
+    // Step 2: the baked HIR is trimmed to the pattern's exact node count, not
+    // the `HIR_CAP` = 2048 build ceiling — so a tiny non-regular pattern emits a
+    // tiny `.rodata` table rather than ~98 KB. `(ab)\1` is ~6 HIR nodes.
+    const P = regex.Pattern("(ab)\\1", .{});
+    comptime std.debug.assert(!P.has_dfa);
+    comptime std.debug.assert(P.bt_node_count > 0 and P.bt_node_count < 32);
+}
+
+// Over-approximation seek prefilter: the baked `Dfa256` (atomic/possessive
+// shapes with no leading look-behind) and the `lb_byte` memchr (leading
+// `(?<=X)`) only change WHERE the backtracker starts scanning — never which
+// match it finds. The short-input `btAgree` cases above can't catch a seek that
+// wrongly skips a valid start; this drives `findAll`/`count` over a longer,
+// multi-match input with dead gaps between matches (where the seek actually
+// fires repeatedly) and pins comptime == runtime span-for-span. A seek that
+// skipped a real start would drop or shift a match here.
+fn seekParity(comptime p: []const u8, in: []const u8) !void {
+    const a = std.testing.allocator;
+    const P = regex.Pattern(p, .{});
+    comptime std.debug.assert(!P.has_dfa);
+    var rx = try Regex.compile(a, p);
+    defer rx.deinit();
+
+    try std.testing.expectEqual(try rx.count(in), P.count(in));
+    const rms = try rx.findAll(a, in);
+    defer a.free(rms);
+    const pms = try P.findAll(a, in);
+    defer a.free(pms);
+    try std.testing.expectEqual(rms.len, pms.len);
+    for (rms, pms) |r, q| {
+        try std.testing.expectEqual(r.start, q.start);
+        try std.testing.expectEqual(r.end, q.end);
+        try std.testing.expectEqualStrings(r.slice, q.slice);
+    }
+}
+
+test "comptime backtracker over-approx seek: findAll/count parity over dead gaps" {
+    // atomic_token: over-approx DFA seek (no leading look-behind). Long input
+    // with non-token filler between `…@` hits — the seek skips each gap.
+    try seekParity("(?>[A-Za-z0-9_]+)@",
+        \\  ... foo@bar ... ###### nothing here ###### baz@qux ... !!!!!!! end@now
+    );
+    // lookbehind_amount: lb_byte memchr seek skips to each `$`.
+    try seekParity("(?<=\\$)[0-9]+(?:\\.[0-9]{2})?",
+        \\price $12.50 then a long stretch of no dollars at all then $99 and $0.01 done
+    );
+    // possessive (lowers to atomic) with trailing literal — same seek shape.
+    try seekParity("[A-Za-z]++;", "aa; ....... bb; ....... ccc; xyz");
+}
+
+test "comptime backtracker delegate: regular-island DFA == tree-walk (parity vs runtime)" {
+    // Concat-internal regular-island delegation, baked at comptime: a greedy
+    // regular PREFIX of a concat (the `.a` spine) runs at DFA speed via
+    // `core.matchEndFrom`, the irregular glue (lookahead) stays in the
+    // tree-walker. These patterns FIRE the baked delegate (verified: islands>0);
+    // the delegate is sound only if delegate-on == delegate-off, so comptime
+    // findAll/count must match the runtime engine span-for-span. Multi-match
+    // inputs with both hits and near-misses (the continuation fails ⇒ fall back
+    // to full `m(nd.a,…)` recursion) exercise both branches of the delegation.
+    try seekParity("[a-z]+[0-9]+(?=END)", "ab12END zz9END q aaaa1111ENDED a1END x000");
+    try seekParity("[A-Za-z]+ (?=\\d)", "foo 42 bar baz 9 qux  10 zzz");
+    try seekParity("x[0-9]*y+(?!Z)", "x12yyy x0yZ xy xyyyZ x99y end");
+}
+
+test "comptime backtracker look-assertions: \\b / \\A\\z\\Z / (?m) anchors vs runtime" {
+    // Look-assertions (`cc.lookHolds`) now evaluate at comptime — the comptime
+    // `Pattern` has no `.bt_look` engine, so `has_look` routes them to the same
+    // baked tree-backtracker (`pattern.zig buildAll`'s `or props.has_look`). The
+    // parser no longer rejects `.look` at `cap != null`. These previously
+    // `@compileError`'d; assert comptime span/count == runtime.
+    //   \b word boundary (the `backref_word`/`deep_alternation` blocker):
+    try btAgree("\\bword\\b", "a word here, wording, sword, word.");
+    try btAgree("(\\w+)\\1", "hello hellohello x"); // bare backref still fine
+    try seekParity("\\b[a-z]+\\b", "  foo bar1 baz  qux  ");
+    //   deep-alternation `\b(?:kw|kw|…)\b` — routes to the tree-walker, bypassing
+    //   the MAX_NFA ceiling that rejects it on the DFA path:
+    try seekParity("\\b(?:break|case|catch|class|const|continue|return|if|else|for|while)\\b", "if x then break; for y return; classify const cases while continue");
+    //   `\Z` (end-before-optional-final-`\n`) is a real look ⇒ backtrack arm.
+    //   (`\A`/`\z` are NOT here: the prescan folds them into the anchored-DFA
+    //   fast path — `has_dfa == true` — so they never needed the backtracker and
+    //   are covered by the anchored-DFA tests instead.)
+    try btAgree("baz\\Z", "foobaz\n");
+    try btAgree("baz\\Z", "foobaz");
+    //   inline (?m) line anchors (the `multiline_log` shape):
+    try seekParity("(?m)^[0-9]{4}-[0-9]{2}-[0-9]{2}.*$", "2024-01-02 hi\njunk\n2025-12-31 yo\n2026-06-01 z\n");
+    try seekParity("(?m)^#", "a\n#one\nb\n#two\n##three");
+}
+
+// Capture-submatch parity on the `.backtrack` arm: the comptime `captures()`
+// must agree with the runtime `Regex.captures` on the whole-match span AND every
+// numbered/named group (slice, start, end, participation), since both derive
+// numbering + names from the same `parser.scanGroups`. Compares group-by-group
+// and, for named groups, via `groupByName` on both sides.
+fn btCapAgree(comptime p: []const u8, in: []const u8) !void {
+    const a = std.testing.allocator;
+    const P = regex.Pattern(p, .{});
+    comptime std.debug.assert(!P.has_dfa);
+    var rx = try Regex.compile(a, p);
+    defer rx.deinit();
+
+    var pm = try P.captures(a, in);
+    defer if (pm) |*x| x.deinit(a);
+    var rm = try rx.captures(a, in);
+    defer if (rm) |*x| x.deinit(a);
+
+    try std.testing.expectEqual(rm == null, pm == null);
+    if (rm == null) return;
+    const pmm = pm.?;
+    const rmm = rm.?;
+    try std.testing.expectEqual(rmm.start, pmm.start);
+    try std.testing.expectEqual(rmm.end, pmm.end);
+    try std.testing.expectEqualStrings(rmm.slice, pmm.slice);
+    // Same group count, and each group agrees (null-ness + span + slice).
+    try std.testing.expectEqual(rmm.groups.len, pmm.groups.len);
+    for (rmm.groups, pmm.groups) |rg, pg| {
+        try std.testing.expectEqual(rg == null, pg == null);
+        if (rg) |rgg| {
+            try std.testing.expectEqual(rgg.start, pg.?.start);
+            try std.testing.expectEqual(rgg.end, pg.?.end);
+            try std.testing.expectEqualStrings(rgg.slice, pg.?.slice);
+        }
+    }
+}
+
+test "comptime backtracker captures(): numbered group parity with runtime Regex" {
+    try btCapAgree("(\\w+)-\\1", "ab-ab tail"); // group 1 = "ab"
+    try btCapAgree("(a)(b)\\2\\1", "abba"); // two groups, both participate
+    try btCapAgree("(\\w+) \\1", "the the quick"); // group 1 = "the"
+    try btCapAgree("(\\w+) \\1", "no repeat here"); // whole pattern no-match
+    try btCapAgree("(ab)\\1", "abab"); // group 1 across a backref
+    // A group that does not participate must be reported absent on both sides.
+    try btCapAgree("(x)|(y)\\2", "y"); // 2nd-branch backref; group 1 absent
+}
+
+test "comptime backtracker captures(): named-group parity (groupByName)" {
+    const a = std.testing.allocator;
+    // Differential on slices/spans first.
+    try btCapAgree("(?<w>\\w+)=\\k<w>", "foo=foo rest");
+    try btCapAgree("(?<q>['\"]).*?\\k<q>", "say \"hi\" ok");
+
+    // Then assert the name actually resolves on the comptime path, matching the
+    // runtime — full named-capture parity, not just numbered.
+    const P = regex.Pattern("(?<w>\\w+)=\\k<w>", .{});
+    comptime std.debug.assert(!P.has_dfa);
+    var rx = try Regex.compile(a, "(?<w>\\w+)=\\k<w>");
+    defer rx.deinit();
+
+    var pm = (try P.captures(a, "foo=foo rest")).?;
+    defer pm.deinit(a);
+    var rm = (try rx.captures(a, "foo=foo rest")).?;
+    defer rm.deinit(a);
+
+    const pg = pm.groupByName("w").?;
+    const rg = rm.groupByName("w").?;
+    try std.testing.expectEqualStrings("foo", pg.slice);
+    try std.testing.expectEqualStrings(rg.slice, pg.slice);
+    try std.testing.expectEqual(rg.start, pg.start);
+    try std.testing.expectEqual(rg.end, pg.end);
+}
+
+test "comptime backtracker capturesAll(): non-overlapping captures parity" {
+    const a = std.testing.allocator;
+    const P = regex.Pattern("(\\w)\\1", .{}); // doubled char, group 1 = the char
+    comptime std.debug.assert(!P.has_dfa);
+    var rx = try Regex.compile(a, "(\\w)\\1");
+    defer rx.deinit();
+    const in = "aabbXccd eez";
+
+    const rms = try rx.capturesAll(a, in);
+    defer {
+        for (rms) |*mt| mt.deinit(a);
+        a.free(rms);
+    }
+    const pms = try P.capturesAll(a, in);
+    defer {
+        for (pms) |*mt| mt.deinit(a);
+        a.free(pms);
+    }
+    try std.testing.expectEqual(rms.len, pms.len);
+    for (rms, pms) |r, q| {
+        try std.testing.expectEqual(r.start, q.start);
+        try std.testing.expectEqual(r.end, q.end);
+        try std.testing.expectEqualStrings(r.slice, q.slice);
+        try std.testing.expectEqual(r.groups.len, q.groups.len);
+        try std.testing.expectEqualStrings(r.groups[1].?.slice, q.groups[1].?.slice);
+    }
 }
 
 test "comptime Pattern findAll/count parity with runtime Regex" {
