@@ -64,24 +64,36 @@ pub const Backtracker = struct {
 
     // `hasBit` / `isWord` / `lookHolds` now live in `charclass.zig` (`cc`).
 
-    /// Fixed width of `ref` (min==max), or null if variable/unbounded.
-    fn fixedWidth(self: *Backtracker, ref: NodeRef) ?usize {
+    /// Min/max byte width a node can match. `bounded == false` means the max is
+    /// unbounded (`*`/`+`/backref) — callers cap it (e.g. at `pos` for a
+    /// lookbehind). Used to drive the variable-width lookbehind reverse scan.
+    const WidthBounds = struct { min: usize, max: usize, bounded: bool };
+    fn widthBounds(self: *Backtracker, ref: NodeRef) WidthBounds {
         const nd = self.h.node(ref);
         return switch (nd.tag) {
-            .empty, .look, .look_around => 0,
-            .set => 1,
+            .empty, .look, .look_around => .{ .min = 0, .max = 0, .bounded = true },
+            .set => .{ .min = 1, .max = 1, .bounded = true },
             .concat => {
-                const l = self.fixedWidth(nd.a) orelse return null;
-                const r = self.fixedWidth(nd.b) orelse return null;
-                return l + r;
+                const l = self.widthBounds(nd.a);
+                const r = self.widthBounds(nd.b);
+                return .{ .min = l.min + r.min, .max = l.max + r.max, .bounded = l.bounded and r.bounded };
             },
             .alt => {
-                const l = self.fixedWidth(nd.a) orelse return null;
-                const r = self.fixedWidth(nd.b) orelse return null;
-                return if (l == r) l else null;
+                const l = self.widthBounds(nd.a);
+                const r = self.widthBounds(nd.b);
+                return .{ .min = @min(l.min, r.min), .max = @max(l.max, r.max), .bounded = l.bounded and r.bounded };
             },
-            .cap, .atomic => self.fixedWidth(nd.a),
-            .star, .plus, .opt, .backref => null,
+            .opt => {
+                const c = self.widthBounds(nd.a);
+                return .{ .min = 0, .max = c.max, .bounded = c.bounded };
+            },
+            .cap, .atomic => self.widthBounds(nd.a),
+            .star => .{ .min = 0, .max = 0, .bounded = false },
+            .plus => blk: {
+                const c = self.widthBounds(nd.a);
+                break :blk .{ .min = c.min, .max = 0, .bounded = false };
+            },
+            .backref => .{ .min = 0, .max = 0, .bounded = false },
         };
     }
 
@@ -194,10 +206,25 @@ pub const Backtracker = struct {
                     const acc: Cont = .accept;
                     ok = try self.m(nd.a, pos, &acc);
                 } else {
-                    const w = self.fixedWidth(nd.a) orelse return Error.Budget; // variable lookbehind → MatchBudgetExceeded
-                    if (w <= pos) {
+                    // Lookbehind: the sub-pattern must match a span ending
+                    // exactly at `pos` (enforced by `Cont.accept_at`). Scan
+                    // candidate start offsets `w` (shortest first, so a negative
+                    // lookbehind rejects on the first violating span). For a
+                    // fixed-width sub-pattern this collapses to a single offset —
+                    // byte-identical to the previous fixed-only path. Unbounded
+                    // `*`/`+`/backref cap at `pos` (nothing precedes index 0).
+                    // Every `m` step ticks the same anti-ReDoS budget, so this
+                    // stays O(pos·sub) and bounded — never a hang.
+                    const wb = self.widthBounds(nd.a);
+                    const hi = if (wb.bounded) @min(wb.max, pos) else pos;
+                    const lo = @min(wb.min, pos);
+                    var w: usize = lo;
+                    while (w <= hi) : (w += 1) {
                         const acc: Cont = .{ .accept_at = pos };
-                        ok = try self.m(nd.a, pos - w, &acc);
+                        if (try self.m(nd.a, pos - w, &acc)) {
+                            ok = true;
+                            break;
+                        }
                     }
                 }
                 if (ok == !neg) return self.cont(pos, k); // zero-width
