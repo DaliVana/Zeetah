@@ -1,6 +1,8 @@
 //! Per-feature: lookaround (Phase E, .NET-model tree backtracker).
-//! `(?=…)` `(?!…)` lookahead, `(?<=…)` `(?<!…)` fixed-width lookbehind.
-//! Variable-width lookbehind → typed MatchBudgetExceeded (documented limit).
+//! `(?=…)` `(?!…)` lookahead, `(?<=…)` `(?<!…)` lookbehind (fixed- AND
+//! variable-width; the latter scans candidate start offsets, charged to the
+//! same anti-ReDoS step budget — pathological cases surface as a typed
+//! `MatchBudgetExceeded`, never a hang).
 
 const std = @import("std");
 const regex = @import("zeetah");
@@ -52,9 +54,34 @@ test "lookaround: combined with quantifiers / anchors" {
     try std.testing.expect(!try isM(a, "^(?=.*a)(?=.*b).+$", "xxyy"));
 }
 
-test "lookaround: variable-width lookbehind is a typed error" {
+test "lookbehind: variable-width positive (?<=a+) / (?<=\\d+)" {
     const a = std.testing.allocator;
-    var r = try Regex.compile(a, "(?<=a+)b"); // a+ is not fixed width
-    defer r.deinit();
-    try std.testing.expectError(error.MatchBudgetExceeded, r.isMatch("aaab"));
+    // `a+` is variable width: reverse scan finds a span of `a`s ending at pos.
+    try std.testing.expectEqualStrings("b", (try slice(a, "(?<=a+)b", "aaab")).?);
+    try std.testing.expectEqualStrings("b", (try slice(a, "(?<=a+)b", "ab")).?);
+    try std.testing.expect(!try isM(a, "(?<=a+)b", "b")); // nothing precedes index 0
+    try std.testing.expectEqualStrings("x", (try slice(a, "(?<=\\d+)x", "12x")).?);
+    try std.testing.expect(!try isM(a, "(?<=\\d+)x", "x"));
+}
+
+test "lookbehind: variable-width negative (?<!\\$\\d*) (ghostty $VAR case)" {
+    const a = std.testing.allocator;
+    // The exact construct from ghostty's URL regex bare-path branch.
+    try std.testing.expectEqualStrings("5", (try slice(a, "(?<!\\$\\d*)\\d", "x5")).?);
+    try std.testing.expect(!try isM(a, "(?<!\\$\\d*)\\d", "$5")); // 5 is preceded by $ (zero digits)
+    // The standalone "5" (after the space) is NOT preceded by `$\d*`.
+    try std.testing.expectEqualStrings("5", (try slice(a, "(?<!\\$\\d*)\\d", "$12 5")).?);
+}
+
+test "lookbehind: variable-width terminates on long input (anti-ReDoS)" {
+    const a = std.testing.allocator;
+    // ~2000-byte run forces the reverse scan to span many offsets; it must
+    // terminate (match or typed MatchBudgetExceeded), never hang.
+    const big = "a" ** 2000 ++ "b";
+    const r = isM(a, "(?<=a+)b", big);
+    if (r) |hit| {
+        try std.testing.expect(hit);
+    } else |e| {
+        try std.testing.expectEqual(error.MatchBudgetExceeded, e);
+    }
 }

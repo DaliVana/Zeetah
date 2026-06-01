@@ -43,6 +43,16 @@ fn singleByteSet(c: u8) [32]u8 {
     return s;
 }
 
+/// An escaped ASCII punctuation byte is the literal byte, matching the Rust
+/// `regex` / RE2 / PCRE rule ("`\x` is literal `x` for any ASCII punctuation").
+/// Rust's exact carve-out is "all ASCII except `[0-9A-Za-z<>]`"; we follow it,
+/// so `\/ \- \@ \# \: …` are literals while `\<`/`\>` and alphanumeric escapes
+/// (`\y`) are NOT covered here — callers reject those as `Unsupported`.
+fn escapedPunct(e: u8) ?u8 {
+    if (e < 0x80 and !std.ascii.isAlphanumeric(e) and e != '<' and e != '>') return e;
+    return null;
+}
+
 /// `.` without dot_all: every byte except '\n' (matches `vm.zig`).
 fn anySet() [32]u8 {
     var s = [_]u8{0xFF} ** 32;
@@ -806,8 +816,9 @@ fn Parser(comptime cap: ?usize) type {
                         'Z' => p.lookLeaf(.end_text_before_nl),
                         '1', '2', '3', '4', '5', '6', '7', '8', '9' => p.parseBackref(e),
                         'k' => p.parseNamedBackref(),
-                        '\\', '.', '*', '+', '?', '|', '(', ')', '[', ']', '{', '}', '^', '$' => p.setLeaf(singleByteSet(e)),
-                        else => Error.Unsupported,
+                        // Escaped ASCII punctuation (incl. `\/`) is the literal
+                        // byte; alphanumerics not matched above stay unsupported.
+                        else => if (escapedPunct(e)) |lit| p.setLeaf(singleByteSet(lit)) else Error.Unsupported,
                     };
                 },
                 else => {
@@ -980,8 +991,8 @@ fn Parser(comptime cap: ?usize) type {
                     'n' => '\n',
                     't' => '\t',
                     'r' => '\r',
-                    '\\', '.', '*', '+', '?', '|', '(', ')', '[', ']', '{', '}', '^', '$', '-' => e,
-                    else => Error.Unsupported,
+                    // Escaped ASCII punctuation (incl. `\/` and `\-`) is literal.
+                    else => escapedPunct(e) orelse Error.Unsupported,
                 };
             }
             p.i += 1;

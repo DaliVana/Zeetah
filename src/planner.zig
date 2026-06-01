@@ -49,13 +49,18 @@ pub fn plan(p: Properties, flags: Flags) Strategy {
     if (p.requires_backtracking) return .backtrack;
 
     // §5.1 — Pure literal(s): substring search wins, skip the engine entirely.
-    // Case-insensitive literals still need the engine's folding, so only the
-    // case-sensitive form qualifies here.
-    if (!flags.case_insensitive and p.is_exact_literal and !p.prefix.isEmpty()) {
+    // Case-insensitive letter literals need the engine's folding; but a
+    // *case-invariant* literal (no ASCII letters — digits, punctuation, …)
+    // folds to itself, so the exact substring search is already a correct
+    // case-insensitive search and qualifies here too (`isCaseInvariant`).
+    if (p.is_exact_literal and !p.prefix.isEmpty() and
+        (!flags.case_insensitive or p.prefix.isCaseInvariant()))
+    {
         return .{ .literal = p.prefix };
     }
-    if (!flags.case_insensitive and p.prefix.exact and p.prefix.n > 1 and
-        !p.anchored_start and !p.anchored_end)
+    if (p.prefix.exact and p.prefix.n > 1 and
+        !p.anchored_start and !p.anchored_end and
+        (!flags.case_insensitive or p.prefix.isCaseInvariant()))
     {
         // Exact alternation of literals (`cat|dog|bird`) -> multi-substring.
         return .{ .literal = p.prefix };
@@ -64,17 +69,18 @@ pub fn plan(p: Properties, flags: Flags) Strategy {
     // §5.4 — A selective trailing literal but no literal prefix: the suffix
     // is a sound fast-negative and drives the reverse DFA. Prefer it over a
     // broad first-byte prefilter.
-    if (!flags.case_insensitive and p.prefix.isEmpty() and
+    if (p.prefix.isEmpty() and
         !p.suffix.isEmpty() and p.suffix.minLen() >= 2 and
-        !p.anchored_start and !p.anchored_end)
+        !p.anchored_start and !p.anchored_end and
+        (!flags.case_insensitive or p.suffix.isCaseInvariant()))
     {
         return .{ .reverse_suffix = p.suffix };
     }
 
     // §5.3 — A selective prefix (literal run or necessary first-byte set):
     // prefilter to candidates, then verify with the core engine.
-    const has_prefix_lit = !flags.case_insensitive and
-        !p.prefix.isEmpty() and p.prefix.minLen() >= 2;
+    const has_prefix_lit = !p.prefix.isEmpty() and p.prefix.minLen() >= 2 and
+        (!flags.case_insensitive or p.prefix.isCaseInvariant());
     if (has_prefix_lit or p.first_byte_set != null) {
         return .{ .prefix_prefilter = .{
             .seq = if (has_prefix_lit) p.prefix else Seq{},
@@ -144,6 +150,53 @@ fn planFor(comptime src: []const u8) Strategy {
     parser.parse(256, &h, undefined, src, .{}) catch unreachable;
     const p = properties.analyze(256, &h);
     return plan(p, .{});
+}
+
+fn planForCi(comptime src: []const u8) Strategy {
+    @setEvalBranchQuota(1_000_000);
+    const H = hir.Hir(256);
+    var h = H.initComptime();
+    parser.parse(256, &h, undefined, src, .{ .ci = true }) catch unreachable;
+    const p = properties.analyze(256, &h);
+    return plan(p, .{ .case_insensitive = true });
+}
+
+// 3.3 — case-insensitive literal fast paths. Under `ci` a *case-invariant*
+// literal (no ASCII letters) folds to itself, so the exact literal/prefix/
+// suffix strategies are still sound and must be picked; a letter-bearing
+// literal still falls to the folded first-byte-set DFA (`.core`/prefilter).
+
+test "planner(ci): letter-free exact literal -> .literal" {
+    const s = comptime planForCi("12345");
+    try std.testing.expect(s == .literal);
+    try std.testing.expectEqualStrings("12345", s.literal.alt(0));
+}
+
+test "planner(ci): letter-free alternation -> .literal multi" {
+    const s = comptime planForCi("12|34|56");
+    try std.testing.expect(s == .literal);
+    try std.testing.expectEqual(@as(u8, 3), s.literal.n);
+}
+
+test "planner(ci): letter-free prefix -> .prefix_prefilter (lit_prefix)" {
+    const s = comptime planForCi("1234.*5678");
+    try std.testing.expect(s == .prefix_prefilter);
+    try std.testing.expectEqualStrings("1234", s.prefix_prefilter.seq.alt(0));
+    try std.testing.expect(comptime resolve(s, false) == .lit_prefix);
+}
+
+test "planner(ci): letter-free selective suffix -> .reverse_suffix" {
+    const s = comptime planForCi("[A-Z].*9999");
+    try std.testing.expect(s == .reverse_suffix);
+    try std.testing.expectEqualStrings("9999", s.reverse_suffix.alt(0));
+}
+
+test "planner(ci): letter-bearing literal stays off the fast paths" {
+    // `hello` folds to 2-bit sets ⇒ no Seq ⇒ folded first-byte-set prefilter.
+    try std.testing.expect(comptime planForCi("hello") == .prefix_prefilter);
+    try std.testing.expect(comptime resolve(planForCi("hello"), false) == .dfa);
+    // selective letter suffix must NOT become a (case-sensitive) reverse_suffix
+    try std.testing.expect(comptime planForCi("[A-Z].*foobar") == .prefix_prefilter);
 }
 
 test "planner: exact literal -> .literal" {

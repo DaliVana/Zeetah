@@ -77,7 +77,21 @@ naturally with the existing `@Vector` usage in `src/prefilter.zig`. Big win on
 short-to-medium patterns where a full DFA table is overkill.
 
 ### 2.5 SIMD self-loop / "spin-state" skip in the DFA hot loop
-**Impact: high · Effort: medium · Risk: medium**
+**Impact: high · Effort: medium · Risk: medium · Status: DEFERRED — needs a gate (ReleaseFast re-eval; see `docs/VECTOR_SKIP_FINDINGS.md`)**
+
+> **Outcome (revised after ReleaseFast re-eval):** The adaptive
+> **trigger-on-self-loop + compact index + `SPIN_TRIGGER`** redesign works — in
+> ReleaseFast it is **+~5× on long self-loop runs** (`<[^>]+>` over a long body).
+> But it is **not free**: it costs **−5–12% on short-run `full_dfa` workloads**
+> (path_unix, k8s_fluentd, json_string), corpus geomean 0.968. The earlier
+> "neutral at 1 MB" was a Debug-build artifact. So it was **removed from this
+> branch and deferred** until it is *gated* — engage only when the DFA has a
+> wide self-loop class and long runs are expected — so the long-run win does not
+> tax typical short-run matching. `dense_search.findFrom` was left scalar for
+> the same reason (its Debug "−1.5×" was inflated, but the real machinery still
+> carries the short-run cost). Upside is long-run inputs (large base64 / quoted
+> bodies / minified data). The original proposal text
+> below is kept for context.
 
 IDEAS.md "stable local neighborhood … SIMD scan for a delimiter." The hot DFA
 walk (`src/exec/full_dfa.zig`, `lazy_dfa.zig`, `dense_search.zig`, `core.zig`,
@@ -113,7 +127,17 @@ is the remaining open piece from IDEAS.md's literal-extraction list:
   Perl semantics (IDEAS.md explicitly calls out non-commutative alternation).
 
 ### 3.3 Case-insensitive prefilter
-**Impact: medium · Effort: small · Risk: low**
+**Impact: medium · Effort: small · Risk: low · Status: SHIPPED (this branch)**
+
+> **Outcome:** Done. `Seq.isCaseInvariant()` (`src/exec/seq_extract.zig`) gates
+> the four `!case_insensitive` planner branches as `(!ci or isCaseInvariant())`,
+> recovering the `.literal` / `.lit_prefix` / `.reverse_suffix` fast paths for
+> letter-free literals under `ci` (digits, punctuation, URLs, version strings).
+> Sound because under `ci` the parser folds letters into 2-bit sets that `Seq`
+> extraction already drops, so every surviving `Seq` is letter-free; the
+> predicate makes that explicit. Covered by `planner.zig` routing tests +
+> `tests/feat_literals.zig` match-correctness tests (cross-checked vs the
+> case-sensitive engine). Letter-bearing `ci` patterns are unchanged.
 
 The literal / literal-prefix fast paths are still gated behind
 `!flags.case_insensitive` in the planner (`src/planner.zig`), so they are
@@ -142,7 +166,18 @@ cannot blow compile-time stack before those ceilings are reached, guaranteeing
 linear-time parsing.
 
 ### 4.4 Reuse the vectorized class-span scans in the dup-word backref fast-path
-**Impact: low-medium · Effort: tiny · Risk: low**
+**Impact: low-medium · Effort: tiny · Risk: low · Status: ATTEMPTED — REVERTED (net-negative)**
+
+> **Outcome:** Tried and reverted. Routing `findCap` through `Ranges.runEnd` /
+> `firstMember` regressed `backref_word` **~2.9×** (bisected: `runEnd` 1.44×,
+> `firstMember` adds ~2×). English words average 4 bytes (max 14 — all < the
+> 16-byte SIMD width), so `runEnd` always falls through to its scalar pin loop
+> after paying full vector setup, and `firstMember` (per position) never has a
+> long gap to skip. Both replace a single cheap scalar `cc.hasBit`. Unfixable
+> here — words are never ≥16 bytes, so vectorization cannot win. The scalar
+> path is optimal. (A standalone microbench of `findCap` mislead­ingly showed
+> "neutral" because it folded away the runtime `?Ranges` unwrap + heap deref
+> that the engine pays — see `docs/VECTOR_SKIP_FINDINGS.md`.)
 
 The adjacent-duplicate-word backref fast-path (`src/exec/dupword.zig`, the
 `(\bCLASS+\b)SEP\1` shape) still walks its maximal CLASS run one byte at a time
@@ -157,24 +192,27 @@ gate-tested primitive, no new SIMD code.
 
 ## Suggested ordering
 
+Resolved by the `@Vector` experiment + ReleaseFast re-eval
+(`docs/VECTOR_SKIP_FINDINGS.md`): **3.3 SHIPPED** (this branch — a clear ci win),
+**2.5 DEFERRED** (full_dfa spin-skip: +~5× long runs but −5–12% short runs;
+needs a gate), **4.4 REVERTED** (net-negative). The big takeaway: inside the
+automaton/scan hot loops the scalar baseline is already near-optimal for the
+short runs that survive the prefilter, so unconditional `@Vector` work there does
+not pay — SIMD only helps *before* the automaton (the shipped prefilter / Teddy /
+`class_span` scanners) or *behind a long-run gate* (2.5) where runs are long.
+
 Remaining, roughly in priority:
 
-1. **3.3** (case-insensitive prefilter) — small, high-value, reuses existing
-   SIMD; the literal/prefix fast paths are still gated off under
-   `case_insensitive`.
-2. **4.4** (dup-word reuse of vectorized class-span scans) — tiny, low-risk
-   drop-in of an already gate-tested `@Vector` primitive.
-3. **2.5** (SIMD self-loop / spin-state skip) — high impact on `.*` /
-   scan-to-delimiter patterns, reuses `class_span.runEnd`, semantics-preserving.
-4. **2.3** (backtracker memoization) — would let genuinely non-regular patterns
+1. **2.3** (backtracker memoization) — would let genuinely non-regular patterns
    finish fast instead of hitting the step budget; relates to
    `docs/SECURITY_PROBLEMS.md`.
-5. **1.2** (two-phase captures) — narrows the capture pass to the match region;
+2. **1.2** (two-phase captures) — narrows the capture pass to the match region;
    complements the already-shipped `onepass` fast-path.
-6. **2.4** (bit-parallel NFA) and the open part of **3.1** (small-class
-   cross-product literal expansion) — opportunistic, pattern-dependent
-   accelerators.
-7. **2.2** (bounded backtracker as first-choice capture engine on short inputs)
+3. **3.1** (small-class cross-product literal expansion) — opportunistic; feeds
+   more literals into the already-vectorized Teddy / Aho-Corasick path.
+4. **2.4** (bit-parallel NFA) — opportunistic, pattern-dependent; note the
+   short-run caveat from 2.5/4.4 likely applies to small patterns too.
+5. **2.2** (bounded backtracker as first-choice capture engine on short inputs)
    and **4.3** (packrat/memoized parse guard) — incremental hardening / small
    wins.
 

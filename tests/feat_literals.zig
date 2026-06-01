@@ -63,6 +63,27 @@ test "escapes: metacharacters are literal when escaped" {
     try std.testing.expectEqualStrings("a\\b", (try find1(a, "a\\\\b", "p a\\b q")).?.slice);
 }
 
+test "escapes: any ASCII punctuation is literal (Rust/RE2 rule, incl. \\/)" {
+    const a = std.testing.allocator;
+
+    // `\/` is the headline case (ghostty's URL regex uses it heavily). Plus a
+    // spread of other punctuation escapes that have no special meaning.
+    try std.testing.expectEqualStrings("a/b", (try find1(a, "a\\/b", "a/b")).?.slice);
+    try std.testing.expectEqualStrings("a-b", (try find1(a, "a\\-b", "a-b")).?.slice);
+    try std.testing.expectEqualStrings("x@y", (try find1(a, "x\\@y", "x@y")).?.slice);
+    try std.testing.expectEqualStrings("c:d", (try find1(a, "c\\:d", "c:d")).?.slice);
+    try std.testing.expectEqualStrings("e#f", (try find1(a, "e\\#f", "e#f")).?.slice);
+    try std.testing.expectEqualStrings("g%h", (try find1(a, "g\\%h", "g%h")).?.slice);
+    try std.testing.expectEqualStrings("i&j", (try find1(a, "i\\&j", "i&j")).?.slice);
+
+    // Inside a character class too: `[\w\/]+` matches a slash-containing run.
+    try std.testing.expectEqualStrings("a/b/c", (try find1(a, "[\\w\\/]+", " a/b/c ")).?.slice);
+
+    // Alphabetic non-escapes are still rejected (not silently literal) — Rust
+    // parity: the carve-out is punctuation only.
+    try std.testing.expectError(error.NotImplemented, Regex.compile(a, "a\\yb"));
+}
+
 test "escapes: \\n \\t \\r control bytes" {
     const a = std.testing.allocator;
     try std.testing.expect((try find1(a, "a\\nb", "a\nb")) != null);
@@ -93,6 +114,43 @@ test "case-insensitive: compile flag" {
     var cs = try Regex.compile(a, "abc");
     defer cs.deinit();
     try std.testing.expect(!try cs.isMatch("ABC"));
+}
+
+test "case-insensitive: letter-free literal fast paths (3.3) match correctly" {
+    const a = std.testing.allocator;
+    // Under ci, a letter-free literal folds to itself, so the
+    // literal / lit_prefix / reverse_suffix fast paths are now taken and must
+    // still produce the exact same matches as the case-sensitive engine.
+    const Case = struct { pat: []const u8, in: []const u8, s: ?usize, e: ?usize };
+    const cases = [_]Case{
+        .{ .pat = "12345", .in = "xx 12345 yy", .s = 3, .e = 8 }, // .literal
+        .{ .pat = "12|34|56", .in = "aa 34 bb", .s = 3, .e = 5 }, // .literal multi
+        .{ .pat = "1234.*5678", .in = "p 1234xx5678 q", .s = 2, .e = 12 }, // lit_prefix
+        .{ .pat = "[A-Z].*9999", .in = "Order 9999", .s = 0, .e = 10 }, // reverse_suffix
+        .{ .pat = "12345", .in = "no digits here", .s = null, .e = null },
+    };
+    for (cases) |c| {
+        var rx = try Regex.compileWithFlags(a, c.pat, .{ .case_insensitive = true });
+        defer rx.deinit();
+        var m = try rx.find(c.in);
+        defer if (m) |*mm| mm.deinit(a);
+        try std.testing.expectEqual(c.s == null, m == null);
+        if (c.s) |s| {
+            try std.testing.expectEqual(s, m.?.start);
+            try std.testing.expectEqual(c.e.?, m.?.end);
+        }
+        // Must agree byte-for-byte with the case-sensitive engine (the literal
+        // has no letters, so ci changes nothing).
+        var cs = try Regex.compile(a, c.pat);
+        defer cs.deinit();
+        var cm = try cs.find(c.in);
+        defer if (cm) |*mm| mm.deinit(a);
+        try std.testing.expectEqual(cm == null, m == null);
+        if (cm) |x| {
+            try std.testing.expectEqual(x.start, m.?.start);
+            try std.testing.expectEqual(x.end, m.?.end);
+        }
+    }
 }
 
 test "case-insensitive: inline (?i) and scoped (?i:...)/(?-i:...)" {

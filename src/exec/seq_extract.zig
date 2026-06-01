@@ -45,6 +45,23 @@ pub const Seq = struct {
     pub fn alt(s: *const Seq, i: usize) []const u8 {
         return s.lits[i][0..s.lens[i]];
     }
+
+    /// True iff no alternative contains an ASCII letter. For such a literal
+    /// case folding is the identity, so an exact (case-sensitive) literal
+    /// search *is* a correct case-insensitive search — letting the
+    /// literal/prefix/suffix fast paths run under `case_insensitive` instead
+    /// of falling to the broad first-byte-set DFA (digits, punctuation, URLs
+    /// like `://`, version strings, …). In practice every Seq extracted under
+    /// `ci` is already letter-free — the parser folds each letter into a
+    /// 2-bit set that the single-member extraction below drops — so this
+    /// predicate makes that soundness condition explicit and robust rather
+    /// than relying on that representational invariant.
+    pub fn isCaseInvariant(s: *const Seq) bool {
+        for (0..s.n) |i| {
+            for (s.alt(i)) |b| if (std.ascii.isAlphabetic(b)) return false;
+        }
+        return true;
+    }
 };
 
 inline fn hasBit(set: *const [32]u8, c: u8) bool {
