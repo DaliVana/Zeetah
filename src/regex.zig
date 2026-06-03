@@ -887,7 +887,7 @@ pub const Regex = struct {
         const n_pos1 = input.len + 1;
         try sc.ensure((self.nfa.?.n_states * n_pos1 + 63) / 64);
         var bt = bounded_bt.BoundedBt.initWith(self.nfa.?, self.bt_a_start, self.bt_a_end, sc, n_pos1);
-        const s = bt.findLeftmost(input) orelse return null;
+        const s = (try bt.findLeftmost(input)) orelse return null;
         return core.Span{ .start = s.start, .end = s.end };
     }
 
@@ -904,7 +904,7 @@ pub const Regex = struct {
         const n_pos1 = input.len + 1;
         try sc.ensure((self.nfa.?.n_states * n_pos1 + 63) / 64);
         var bt = bounded_bt.BoundedBt.initWith(self.nfa.?, self.bt_a_start, self.bt_a_end, sc, n_pos1);
-        const s = bt.findLineStart(input, from) orelse return null;
+        const s = (try bt.findLineStart(input, from)) orelse return null;
         return core.Span{ .start = s.start, .end = s.end };
     }
 
@@ -1066,7 +1066,7 @@ pub const Regex = struct {
                 }
                 var bt = try bounded_bt.BoundedBt.init(allocator, self.nfa.?, self.bt_a_start, self.bt_a_end, input.len);
                 defer bt.deinit();
-                const sp = bt.captures(input[pos..], slots[0..nslots]) orelse return null;
+                const sp = (try bt.captures(input[pos..], slots[0..nslots])) orelse return null;
                 span = .{ .start = sp.start + pos, .end = sp.end + pos };
                 shiftSlots(slots[0..nslots], pos);
             }

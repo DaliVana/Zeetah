@@ -261,7 +261,7 @@ test "onepass: fill captures are byte-identical to bounded_bt (soundness gate)" 
             var bt = try bounded_bt.BoundedBt.init(a, &nfa, h.anchored_start, h.anchored_end, in.len);
             defer bt.deinit();
             var ref: [bounded_bt.MAX_SLOTS]i32 = undefined;
-            const ref_span = bt.captures(in, ref[0..]);
+            const ref_span = try bt.captures(in, ref[0..]);
 
             // One-pass: span from the DFA, then deterministic fill.
             const dsp = core.findLeftmost(&d, in);

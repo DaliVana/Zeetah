@@ -194,18 +194,18 @@ pub fn SharedRegex(comptime Regex: type) type {
 pub fn RegexCache(comptime Regex: type) type {
     return struct {
         const Self = @This();
-        const Entry = struct {
-            pattern: []const u8,
-            regex: Regex,
-        };
 
-        cache: std.StringHashMap(Regex),
+        /// Values are **boxed** (`*Regex`) so a returned pointer stays valid
+        /// across a later insert: a `StringHashMap(Regex)` stores values inline,
+        /// so a rehash on `put` would move them and dangle every pointer handed
+        /// out by an earlier `get` (use-after-free). The box is heap-stable.
+        cache: std.StringHashMap(*Regex),
         allocator: std.mem.Allocator,
         initialized: bool = false,
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
-                .cache = std.StringHashMap(Regex).init(allocator),
+                .cache = std.StringHashMap(*Regex).init(allocator),
                 .allocator = allocator,
                 .initialized = true,
             };
@@ -214,44 +214,39 @@ pub fn RegexCache(comptime Regex: type) type {
         pub fn deinit(self: *Self) void {
             var it = self.cache.iterator();
             while (it.next()) |entry| {
-                var regex = entry.value_ptr.*;
-                regex.deinit();
+                entry.value_ptr.*.deinit();
+                self.allocator.destroy(entry.value_ptr.*);
                 self.allocator.free(entry.key_ptr.*);
             }
             self.cache.deinit();
             self.initialized = false;
         }
 
-        /// Get a compiled regex from cache, or compile and cache it
+        /// Get a compiled regex from cache, or compile and cache it. The
+        /// returned pointer is stable for the lifetime of the cache entry
+        /// (until `clear`/`deinit`), regardless of later `get` calls.
         pub fn get(self: *Self, pattern: []const u8) !*const Regex {
-            // Check if in cache
-            const entry = self.cache.getPtr(pattern);
-            if (entry) |regex_ptr| {
-                return regex_ptr;
-            }
+            if (self.cache.get(pattern)) |regex_ptr| return regex_ptr;
 
-            // Not in cache, compile and store
-            const regex = try Regex.compile(self.allocator, pattern);
-            errdefer {
-                var mut_regex = regex;
-                mut_regex.deinit();
-            }
+            // Not in cache: compile into a heap box, then store the box.
+            const box = try self.allocator.create(Regex);
+            errdefer self.allocator.destroy(box);
+            box.* = try Regex.compile(self.allocator, pattern);
+            errdefer box.deinit();
 
             const owned_pattern = try self.allocator.dupe(u8, pattern);
             errdefer self.allocator.free(owned_pattern);
 
-            try self.cache.put(owned_pattern, regex);
-
-            // Return pointer to cached entry
-            return self.cache.getPtr(owned_pattern).?;
+            try self.cache.put(owned_pattern, box);
+            return box;
         }
 
         /// Clear all cached patterns
         pub fn clear(self: *Self) void {
             var it = self.cache.iterator();
             while (it.next()) |entry| {
-                var regex = entry.value_ptr.*;
-                regex.deinit();
+                entry.value_ptr.*.deinit();
+                self.allocator.destroy(entry.value_ptr.*);
                 self.allocator.free(entry.key_ptr.*);
             }
             self.cache.clearRetainingCapacity();
