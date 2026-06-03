@@ -13,6 +13,21 @@ const cc = @import("charclass.zig");
 
 const MAX_NFA = thompson.MAX_NFA;
 
+/// The search and capture-trace walks use **explicit heap worklists**, not
+/// native recursion. The `(state,pos)` visited memo bounds *work* to O(n·m),
+/// but a single greedy lineage (e.g. `\b\w+\b` over a long run) reaches a
+/// recursion *depth* of one frame per consumed byte — which overflowed the
+/// native call stack on large inputs (a crash). Driving the walk from a
+/// heap-allocated, geometrically-grown worklist removes the call-stack ceiling
+/// entirely: only the (already allocated) `BtScratch` memory bounds it.
+const WorkItem = struct { state: u16, pos: usize };
+
+/// One frame of the explicit capture-trace stack — emulates a `recCap`
+/// activation: `(state,pos)` plus the edge cursor `ei`, and the slot this frame
+/// was entered through (`rslot`/`rold`) so it can be restored when the frame is
+/// popped as failed (the recursive code's "restore on backtrack").
+const CapFrame = struct { state: u16, pos: usize, ei: usize, rslot: i32, rold: i32 };
+
 /// Capture slots = 2 per group (start,end); group 0 = whole match.
 pub const MAX_SLOTS: usize = 2 * (hir.MAX_GROUPS + 1);
 
@@ -39,6 +54,15 @@ pub const BtScratch = struct {
     dirty: []usize = &.{},
     n_dirty: usize = 0,
     cap_words: usize = 0,
+    /// Explicit DFS worklist for the reachability search (`reach`), and the
+    /// capture-trace stack (`recCap`). Both replace native recursion; they grow
+    /// geometrically and are pooled/reused across a whole `findAll` loop. Live
+    /// size is the search frontier / trace depth — typically tiny, far below the
+    /// `visited` bitset.
+    reach: []WorkItem = &.{},
+    reach_cap: usize = 0,
+    cap_stack: []CapFrame = &.{},
+    cap_stack_cap: usize = 0,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) BtScratch {
@@ -50,6 +74,8 @@ pub const BtScratch = struct {
             self.allocator.free(self.visited);
             self.allocator.free(self.dirty);
         }
+        if (self.reach_cap != 0) self.allocator.free(self.reach);
+        if (self.cap_stack_cap != 0) self.allocator.free(self.cap_stack);
     }
 
     /// Ensure capacity for `nwords` bitset words, growing + zeroing only when
@@ -140,13 +166,54 @@ pub const BoundedBt = struct {
 
     // `hasBit` / `isWord` / `lookHolds` now live in `charclass.zig` (`cc`).
 
+    /// Push `(state,pos)` onto the reachability worklist iff not already visited
+    /// (push-time `seen` ⇒ each configuration is enqueued at most once, so the
+    /// worklist holds only the live frontier). Grows the pooled buffer
+    /// geometrically; returns the new count.
+    fn pushReach(self: *BoundedBt, n: usize, state: u16, pos: usize) std.mem.Allocator.Error!usize {
+        if (self.seen(state, pos)) return n;
+        const sc = self.sc;
+        if (n == sc.reach_cap) {
+            const new_cap = if (sc.reach_cap == 0) 256 else sc.reach_cap * 2;
+            sc.reach = try sc.allocator.realloc(sc.reach, new_cap);
+            sc.reach_cap = new_cap;
+        }
+        sc.reach[n] = .{ .state = state, .pos = pos };
+        return n + 1;
+    }
+
     /// Longest match starting exactly at `start` (greedy/lazy already encoded
     /// in NFA edge order; we take the deepest accept = leftmost-longest end
-    /// for the surviving lineage, matching the DFA's `runFrom`).
-    fn matchAt(self: *BoundedBt, input: []const u8, start: usize) ?usize {
+    /// for the surviving lineage, matching the DFA's `runFrom`). Reachability is
+    /// order-independent, so an explicit LIFO worklist computes the same max
+    /// accept as the former recursion without a call-stack depth limit.
+    fn matchAt(self: *BoundedBt, input: []const u8, start: usize) std.mem.Allocator.Error!?usize {
         self.clearVisited();
         var best: ?usize = null;
-        self.dfs(@intCast(self.nfa.start), input, start, &best);
+        var n = try self.pushReach(0, @intCast(self.nfa.start), start);
+        const nfa = self.nfa;
+        while (n > 0) {
+            n -= 1;
+            const state = self.sc.reach[n].state;
+            const pos = self.sc.reach[n].pos;
+            if (state == @as(u16, @intCast(nfa.accept))) {
+                if (best == null or pos > best.?) best = pos;
+                // Don't stop: a longer accept may lie beyond (greedy).
+            }
+            var ei: usize = 0;
+            while (ei < nfa.n_edges) : (ei += 1) {
+                if (nfa.e_from[ei] != state) continue;
+                const k = nfa.e_kind[ei];
+                if (k == 0) {
+                    n = try self.pushReach(n, nfa.e_to[ei], pos);
+                } else if (k == 2) {
+                    if (cc.lookHolds(nfa.e_look[ei], input, pos))
+                        n = try self.pushReach(n, nfa.e_to[ei], pos); // zero-width
+                } else if (pos < input.len and cc.hasBit(&nfa.sets[nfa.e_set[ei]], input[pos])) {
+                    n = try self.pushReach(n, nfa.e_to[ei], pos + 1);
+                }
+            }
+        }
         if (self.a_end) {
             if (best) |e| if (e == input.len) return e;
             return null;
@@ -154,37 +221,14 @@ pub const BoundedBt = struct {
         return best;
     }
 
-    fn dfs(self: *BoundedBt, state: u16, input: []const u8, pos: usize, best: *?usize) void {
-        if (self.seen(state, pos)) return;
-
-        if (state == @as(u16, @intCast(self.nfa.accept))) {
-            if (best.* == null or pos > best.*.?) best.* = pos;
-            // Don't return: a longer accept may lie beyond (greedy).
-        }
-        const nfa = self.nfa;
-        var ei: usize = 0;
-        while (ei < nfa.n_edges) : (ei += 1) {
-            if (nfa.e_from[ei] != state) continue;
-            const k = nfa.e_kind[ei];
-            if (k == 0) {
-                self.dfs(nfa.e_to[ei], input, pos, best);
-            } else if (k == 2) {
-                if (cc.lookHolds(nfa.e_look[ei], input, pos))
-                    self.dfs(nfa.e_to[ei], input, pos, best); // zero-width
-            } else if (pos < input.len and cc.hasBit(&nfa.sets[nfa.e_set[ei]], input[pos])) {
-                self.dfs(nfa.e_to[ei], input, pos + 1, best);
-            }
-        }
-    }
-
-    pub fn findLeftmost(self: *BoundedBt, input: []const u8) ?Span {
+    pub fn findLeftmost(self: *BoundedBt, input: []const u8) std.mem.Allocator.Error!?Span {
         if (self.a_start) {
-            if (self.matchAt(input, 0)) |e| return .{ .start = 0, .end = e };
+            if (try self.matchAt(input, 0)) |e| return .{ .start = 0, .end = e };
             return null;
         }
         var s: usize = 0;
         while (s <= input.len) : (s += 1) {
-            if (self.matchAt(input, s)) |e| return .{ .start = s, .end = e };
+            if (try self.matchAt(input, s)) |e| return .{ .start = s, .end = e };
         }
         return null;
     }
@@ -197,7 +241,7 @@ pub const BoundedBt = struct {
     /// haystack (absolute coordinates) so `lookHolds(.start_line)` sees the true
     /// preceding byte; the result span is absolute. Line starts ascend, so the
     /// first hit is the leftmost match.
-    pub fn findLineStart(self: *BoundedBt, input: []const u8, from: usize) ?Span {
+    pub fn findLineStart(self: *BoundedBt, input: []const u8, from: usize) std.mem.Allocator.Error!?Span {
         var s = from;
         // Advance `from` to the first line start at/after it.
         if (!(s == 0 or (s <= input.len and s > 0 and input[s - 1] == '\n'))) {
@@ -205,15 +249,27 @@ pub const BoundedBt = struct {
             s = nl + 1;
         }
         while (s <= input.len) {
-            if (self.matchAt(input, s)) |e| return .{ .start = s, .end = e };
+            if (try self.matchAt(input, s)) |e| return .{ .start = s, .end = e };
             const nl = std.mem.indexOfScalarPos(u8, input, s, '\n') orelse return null;
             s = nl + 1;
         }
         return null;
     }
 
-    pub fn isMatch(self: *BoundedBt, input: []const u8) bool {
-        return self.findLeftmost(input) != null;
+    pub fn isMatch(self: *BoundedBt, input: []const u8) std.mem.Allocator.Error!bool {
+        return (try self.findLeftmost(input)) != null;
+    }
+
+    /// Push a capture-trace frame; grows the pooled stack geometrically.
+    fn pushCap(self: *BoundedBt, sp: usize, frame: CapFrame) std.mem.Allocator.Error!usize {
+        const sc = self.sc;
+        if (sp == sc.cap_stack_cap) {
+            const new_cap = if (sc.cap_stack_cap == 0) 256 else sc.cap_stack_cap * 2;
+            sc.cap_stack = try sc.allocator.realloc(sc.cap_stack, new_cap);
+            sc.cap_stack_cap = new_cap;
+        }
+        sc.cap_stack[sp] = frame;
+        return sp + 1;
     }
 
     /// Leftmost match span + capture slots. `slots` (caller-sized to
@@ -222,39 +278,80 @@ pub const BoundedBt = struct {
     /// boundary search picks the span, this records the leftmost-first slot
     /// assignment for it. `(state,pos)` memo keeps it O(n·m); slot writes are
     /// restored on backtrack so sibling edges see clean state.
-    pub fn captures(self: *BoundedBt, input: []const u8, slots: []i32) ?Span {
-        const span = self.findLeftmost(input) orelse return null;
+    pub fn captures(self: *BoundedBt, input: []const u8, slots: []i32) std.mem.Allocator.Error!?Span {
+        const span = (try self.findLeftmost(input)) orelse return null;
         @memset(slots, -1);
         self.clearVisited();
         slots[0] = @intCast(span.start);
         slots[1] = @intCast(span.end);
-        _ = self.recCap(@intCast(self.nfa.start), input, span.start, span.end, slots);
+        _ = try self.recCap(@intCast(self.nfa.start), input, span.start, span.end, slots);
         return span;
     }
 
-    fn recCap(self: *BoundedBt, state: u16, input: []const u8, pos: usize, end: usize, slots: []i32) bool {
-        if (self.seen(state, pos)) return false;
-        if (state == @as(u16, @intCast(self.nfa.accept)) and pos == end) return true;
-
+    /// Explicit-stack equivalent of the former recursive priority trace: find
+    /// the first (edge-order/DFS-priority) path from `state0@start` to
+    /// `accept@end`, writing capture slots along the way and restoring them when
+    /// a frame is popped as failed — exactly the recursion's save/restore, but
+    /// driven from a heap stack so a long lineage can't overflow the native
+    /// stack. The `(state,pos)` memo keeps it O(n·m). Returns true once a
+    /// complete trace is found (its slot writes are then left in `slots`).
+    fn recCap(self: *BoundedBt, state0: u16, input: []const u8, start: usize, end: usize, slots: []i32) std.mem.Allocator.Error!bool {
         const nfa = self.nfa;
-        var ei: usize = 0;
-        while (ei < nfa.n_edges) : (ei += 1) {
-            if (nfa.e_from[ei] != state) continue;
-            const k = nfa.e_kind[ei];
-            if (k == 0) {
-                const slot = nfa.e_slot[ei];
-                var old: i32 = -1;
-                if (slot >= 0) {
-                    old = slots[@intCast(slot)];
-                    slots[@intCast(slot)] = @intCast(pos);
+        const accept: u16 = @intCast(nfa.accept);
+        // Mirror the recursive entry: seen-check then accept-check for the root.
+        if (self.seen(state0, start)) return false;
+        if (state0 == accept and start == end) return true;
+        var sp = try self.pushCap(0, .{ .state = state0, .pos = start, .ei = 0, .rslot = -1, .rold = -1 });
+        while (sp > 0) {
+            const cur = sp - 1; // index, not a pointer — `pushCap` may realloc
+            const state = self.sc.cap_stack[cur].state;
+            const pos = self.sc.cap_stack[cur].pos;
+            var descended = false;
+            while (self.sc.cap_stack[cur].ei < nfa.n_edges) {
+                const ei = self.sc.cap_stack[cur].ei;
+                self.sc.cap_stack[cur].ei += 1;
+                if (nfa.e_from[ei] != state) continue;
+                const k = nfa.e_kind[ei];
+                if (k == 0) {
+                    const slot = nfa.e_slot[ei];
+                    var old: i32 = -1;
+                    if (slot >= 0) {
+                        old = slots[@intCast(slot)];
+                        slots[@intCast(slot)] = @intCast(pos);
+                    }
+                    const to = nfa.e_to[ei];
+                    if (self.seen(to, pos)) {
+                        if (slot >= 0) slots[@intCast(slot)] = old; // child "returns false" at once
+                        continue;
+                    }
+                    if (to == accept and pos == end) return true; // success: slot write kept
+                    sp = try self.pushCap(sp, .{ .state = to, .pos = pos, .ei = 0, .rslot = slot, .rold = old });
+                    descended = true;
+                    break;
+                } else if (k == 2) {
+                    if (cc.lookHolds(nfa.e_look[ei], input, pos)) {
+                        const to = nfa.e_to[ei];
+                        if (self.seen(to, pos)) continue;
+                        if (to == accept and pos == end) return true;
+                        sp = try self.pushCap(sp, .{ .state = to, .pos = pos, .ei = 0, .rslot = -1, .rold = -1 });
+                        descended = true;
+                        break;
+                    }
+                } else if (pos < input.len and cc.hasBit(&nfa.sets[nfa.e_set[ei]], input[pos])) {
+                    const to = nfa.e_to[ei];
+                    if (self.seen(to, pos + 1)) continue;
+                    if (to == accept and pos + 1 == end) return true;
+                    sp = try self.pushCap(sp, .{ .state = to, .pos = pos + 1, .ei = 0, .rslot = -1, .rold = -1 });
+                    descended = true;
+                    break;
                 }
-                if (self.recCap(nfa.e_to[ei], input, pos, end, slots)) return true;
-                if (slot >= 0) slots[@intCast(slot)] = old;
-            } else if (k == 2) {
-                if (cc.lookHolds(nfa.e_look[ei], input, pos) and
-                    self.recCap(nfa.e_to[ei], input, pos, end, slots)) return true;
-            } else if (pos < input.len and cc.hasBit(&nfa.sets[nfa.e_set[ei]], input[pos])) {
-                if (self.recCap(nfa.e_to[ei], input, pos + 1, end, slots)) return true;
+            }
+            if (!descended) {
+                // Frame exhausted ("return false"): pop it and have the parent
+                // restore the slot it wrote to enter this frame.
+                const popped = self.sc.cap_stack[sp - 1];
+                sp -= 1;
+                if (popped.rslot >= 0) slots[@intCast(popped.rslot)] = popped.rold;
             }
         }
         return false;
@@ -282,10 +379,10 @@ test "bounded_bt: findLineStart equals per-position scan (leading line anchor)" 
         for (ins) |in| {
             var bt1 = try BoundedBt.init(a, &nfa, h.anchored_start, h.anchored_end, in.len);
             defer bt1.deinit();
-            const f = bt1.findLeftmost(in);
+            const f = try bt1.findLeftmost(in);
             var bt2 = try BoundedBt.init(a, &nfa, h.anchored_start, h.anchored_end, in.len);
             defer bt2.deinit();
-            const g = bt2.findLineStart(in, 0);
+            const g = try bt2.findLineStart(in, 0);
             try std.testing.expectEqual(f == null, g == null);
             if (f) |fs| {
                 try std.testing.expectEqual(fs.start, g.?.start);
@@ -316,7 +413,7 @@ test "bounded_bt: boundaries agree with the full DFA" {
             var bt = try BoundedBt.init(a, &nfa, h.anchored_start, h.anchored_end, in.len);
             defer bt.deinit();
             const f = core.findLeftmost(&fd, in);
-            const b = bt.findLeftmost(in);
+            const b = try bt.findLeftmost(in);
             try std.testing.expectEqual(f == null, b == null);
             if (f) |fs| {
                 try std.testing.expectEqual(fs.start, b.?.start);

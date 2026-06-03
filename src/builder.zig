@@ -206,7 +206,7 @@ pub const Builder = struct {
 
 /// Escape special regex characters in a literal string
 fn escapeLiteral(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
-    const special_chars = ".^$*+?()[]{|\\";
+    const special_chars = ".^$*+?()[]{}|\\";
     var count: usize = 0;
 
     // Count how many characters need escaping

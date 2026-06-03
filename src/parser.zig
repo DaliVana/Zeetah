@@ -82,6 +82,11 @@ const MAX_REPEAT: usize = 1000; // `{m,n}` expansion cap (bigger => fallback);
 // the `hir.MAX_NODES` ceiling still bounds total expansion (oversized products
 // like `(a{1000}){1000}` route to `Error.TooComplex` → `PatternTooComplex`).
 const MAX_RANGES: usize = 64; // ranges per `[...]`
+// Recursive-descent nesting cap. Each group body recurses one `parseAlt` level;
+// non-capturing `(?:` groups do NOT consume a `MAX_GROUPS` slot, so without an
+// explicit limit a deeply nested pattern (`(?:(?:(?:…)))`) overflows the native
+// stack before any other ceiling trips. Exceeding it → `Error.TooComplex`.
+const MAX_PARSE_DEPTH: usize = 1000;
 
 /// Per-parse mode flags. `ci`/`dot_all`/`extended` are scoped by `(?flags)` /
 /// `(?flags:..)` exactly like the legacy `(?i)` handling and inherited by the
@@ -191,6 +196,40 @@ fn prescan(pattern: []const u8) Pre {
     return .{ .body = s, .a_start = a_start, .a_end = a_end };
 }
 
+/// True if `pat` has a top-level (depth-0, outside `[...]`, unescaped)
+/// alternation `|`. With the lowest-precedence `|`, a leading `^`/`\A` or
+/// trailing `$`/`\z` then binds to a SINGLE branch (`^a|b` ≡ `(^a)|b`), so the
+/// prescan must NOT fold it into the whole-pattern anchored fast path — the
+/// anchors stay as look leaves and each branch is anchored on its own.
+/// Conservative like `containsMultilineFlag`: a rare false positive only
+/// forgoes the fast path (still correct), never a false negative.
+fn hasTopLevelAlt(pat: []const u8) bool {
+    var i: usize = 0;
+    var depth: usize = 0;
+    var in_class = false;
+    while (i < pat.len) : (i += 1) {
+        const c = pat[i];
+        if (c == '\\') {
+            i += 1; // skip the escaped byte
+            continue;
+        }
+        if (in_class) {
+            if (c == ']') in_class = false;
+            continue;
+        }
+        switch (c) {
+            '[' => in_class = true,
+            '(' => depth += 1,
+            ')' => {
+                if (depth > 0) depth -= 1;
+            },
+            '|' => if (depth == 0) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
 /// Count capturing groups in source order (group 0 = whole match; plain `(`
 /// and `(?<name>)`/`(?P<name>)` count, `(?:`/flags/lookaround do not) and
 /// record `(?<name>)` names (aliasing `pattern`) into `gnames[group]`.
@@ -198,20 +237,30 @@ fn prescan(pattern: []const u8) Pre {
 /// This is the **single source of truth** for capture numbering + names, shared
 /// by the runtime (`regex.zig`) and comptime (`pattern.zig`) `.backtrack` paths
 /// so they agree by construction. It is a *source* scan, deliberately distinct
-/// from the parser's HIR group indices: a capture inside a lookaround or a
-/// `{m,n}` re-parse is parsed non-capturing (no `.cap` node), yet its source
-/// `(` still counts here — matching the runtime, which reserves the slot and
-/// reports the (non-participating) group as absent. So this count is a safe
-/// upper bound on the highest HIR `.cap` index, which is exactly what the tree
-/// backtracker needs to size its live slot-reset range.
+/// from the parser's HIR group indices: a capture inside a `{m,n}` re-parse is
+/// parsed non-capturing (no `.cap` node) yet its source `(` is counted here
+/// once (the original copy), matching the runtime. **Captures inside a
+/// lookaround are skipped**: the parser parses them non-capturing and gives
+/// them no HIR `.cap` index, so counting them here would shift every following
+/// group's number and leave a phantom unset slot in the reported vector (the
+/// `(?=(a)b)(a)(b)` mis-numbering bug). Skipping keeps this count equal to the
+/// highest HIR `.cap` index — what the tree backtracker needs to size its live
+/// slot-reset range. (In-lookaround captures are still not *reported* — a
+/// documented Phase-E limitation — but they no longer corrupt the numbering.)
 pub fn scanGroups(pattern: []const u8, gnames: *[hir.MAX_GROUPS + 1]?[]const u8) usize {
     var n: usize = 0;
     var i: usize = 0;
     var in_class = false;
+    var depth: usize = 0;
+    // `la_active` holds between the outermost enclosing lookaround's `(` and its
+    // matching `)` (a nested look doesn't change in-ness); capturing groups are
+    // not counted while it is set, mirroring the parser's `capturing = false`.
+    var la_active = false;
+    var la_exit_depth: usize = 0;
     while (i < pattern.len) : (i += 1) {
         const c = pattern[i];
         if (c == '\\') {
-            i += 1; // skip escaped byte
+            i += 1; // skip the escaped byte
             continue;
         }
         if (in_class) {
@@ -222,26 +271,58 @@ pub fn scanGroups(pattern: []const u8, gnames: *[hir.MAX_GROUPS + 1]?[]const u8)
             in_class = true;
             continue;
         }
+        if (c == ')') {
+            if (depth > 0) depth -= 1;
+            if (la_active and depth == la_exit_depth) la_active = false;
+            continue;
+        }
         if (c != '(') continue;
+
+        // Classify this `(`: capturing (plain or `(?<name>`/`(?P<name>`), a
+        // lookaround (`(?=`/`(?!`/`(?<=`/`(?<!`), or other non-capturing
+        // (`(?:`/`(?>`/`(?flags…`). Matches `Parser.parsePrimary`'s recognition.
+        var is_cap = false;
+        var is_look = false;
+        var name: ?[]const u8 = null;
         if (i + 1 < pattern.len and pattern[i + 1] == '?') {
-            // (?<name>…) / (?P<name>…) capture; everything else non-capturing.
-            var ns: usize = 0;
             if (i + 2 < pattern.len and pattern[i + 2] == '<' and
                 i + 3 < pattern.len and pattern[i + 3] != '=' and pattern[i + 3] != '!')
             {
-                ns = i + 3;
+                const ns = i + 3; // (?<name>…
+                var j = ns;
+                while (j < pattern.len and pattern[j] != '>') j += 1;
+                if (j < pattern.len) {
+                    is_cap = true;
+                    name = pattern[ns..j];
+                }
             } else if (i + 3 < pattern.len and pattern[i + 2] == 'P' and pattern[i + 3] == '<') {
-                ns = i + 4;
-            } else continue;
-            var j = ns;
-            while (j < pattern.len and pattern[j] != '>') j += 1;
-            if (j >= pattern.len) continue;
-            if (n >= hir.MAX_GROUPS) continue;
-            n += 1;
-            gnames[n] = pattern[ns..j];
+                const ns = i + 4; // (?P<name>…
+                var j = ns;
+                while (j < pattern.len and pattern[j] != '>') j += 1;
+                if (j < pattern.len) {
+                    is_cap = true;
+                    name = pattern[ns..j];
+                }
+            } else if (i + 2 < pattern.len and (pattern[i + 2] == '=' or pattern[i + 2] == '!')) {
+                is_look = true; // (?=…) (?!…)
+            } else if (i + 2 < pattern.len and pattern[i + 2] == '<' and
+                i + 3 < pattern.len and (pattern[i + 3] == '=' or pattern[i + 3] == '!'))
+            {
+                is_look = true; // (?<=…) (?<!…)
+            }
+            // else: (?:…) / (?>…) / (?flags…) — non-capturing, not a lookaround.
         } else {
-            if (n >= hir.MAX_GROUPS) continue;
+            is_cap = true; // plain capturing group
+        }
+
+        depth += 1;
+        if (is_look and !la_active) {
+            la_active = true;
+            la_exit_depth = depth - 1;
+        }
+        if (is_cap and !la_active and n < hir.MAX_GROUPS) {
             n += 1;
+            gnames[n] = name;
         }
     }
     return n;
@@ -274,8 +355,13 @@ pub fn parse(
     // become `start_line`/`end_line` look nodes instead. Detecting an inline
     // `m` flag (or the compile flag) disables prescan entirely; pure-anchor
     // patterns keep the boolean fast path (Q3: zero blast radius).
+    // A top-level `|` makes a leading `^` / trailing `$` bind to one branch
+    // only, so folding it into the whole-pattern anchored fast path is wrong
+    // (`^a|b` must still match `b` anywhere). As with multiline, skip the
+    // prescan in that case: `^`/`$`/`\A`/`\z` then parse as look leaves and the
+    // tree backtracker anchors each branch independently.
     const ml = flags.multiline or containsMultilineFlag(raw);
-    const pre: Pre = if (ml)
+    const pre: Pre = if (ml or hasTopLevelAlt(raw))
         .{ .body = raw, .a_start = false, .a_end = false }
     else
         prescan(raw);
@@ -329,6 +415,9 @@ fn Parser(comptime cap: ?usize) type {
         names: [hir.MAX_GROUPS][]const u8 = undefined,
         name_g: [hir.MAX_GROUPS]u32 = undefined,
         n_names: usize = 0,
+        /// Recursive-descent nesting depth (one level per group body), guarded
+        /// against stack overflow in `parseAlt`. See `MAX_PARSE_DEPTH`.
+        depth: usize = 0,
 
         const Modes = struct { ci: bool, dot_all: bool, extended: bool, multiline: bool };
         fn modes(p: *const Self) Modes {
@@ -471,6 +560,12 @@ fn Parser(comptime cap: ?usize) type {
         }
 
         fn parseAlt(p: *Self) Error!NodeRef {
+            // Bound recursion: every group body re-enters here, and `(?:` groups
+            // bypass the `MAX_GROUPS` ceiling, so this is the only guard against
+            // a deeply nested pattern overflowing the native stack.
+            p.depth += 1;
+            defer p.depth -= 1;
+            if (p.depth > MAX_PARSE_DEPTH) return Error.TooComplex;
             var left = try p.parseConcat();
             while (p.peek() == '|') {
                 p.i += 1;
@@ -602,7 +697,16 @@ fn Parser(comptime cap: ?usize) type {
         /// Re-parse the atom source into a fresh subtree (mirrors the old
         /// `buildAtom`, which re-parsed per repetition into fresh NFA states).
         fn buildAtom(p: *Self, src: []const u8) Error!NodeRef {
-            var sub = Self{ .pat = src, .h = p.h, .alloc = p.alloc, .ci = p.ci, .capturing = false };
+            var sub = Self{
+                .pat = src,
+                .h = p.h,
+                .alloc = p.alloc,
+                .ci = p.ci,
+                .dot_all = p.dot_all,
+                .extended = p.extended,
+                .multiline = p.multiline,
+                .capturing = false,
+            };
             const f = try sub.parsePrimary();
             if (sub.i != src.len) return Error.Invalid;
             if (sub.saw_lazy) p.saw_lazy = true;
