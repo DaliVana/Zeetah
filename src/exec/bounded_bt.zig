@@ -84,12 +84,21 @@ pub const BtScratch = struct {
     /// no set bit ever survives un-recorded between resets.
     pub fn ensure(self: *BtScratch, nwords: usize) !void {
         if (nwords <= self.cap_words) return;
+        // Commit-after-success: allocate both new buffers BEFORE freeing the old
+        // ones. Freeing first (with `cap_words` still set) would, on an OOM from
+        // either alloc, leave freed pointers behind a non-zero `cap_words` → a
+        // double-free/UAF in `deinit`. `errdefer` frees the first buffer if the
+        // second alloc fails. (Pooled scratch reused across `findAll`, so the
+        // grow branch is reachable in normal use.)
+        const v = try self.allocator.alloc(u64, nwords);
+        errdefer self.allocator.free(v);
+        const d = try self.allocator.alloc(usize, nwords);
         if (self.cap_words != 0) {
             self.allocator.free(self.visited);
             self.allocator.free(self.dirty);
         }
-        self.visited = try self.allocator.alloc(u64, nwords);
-        self.dirty = try self.allocator.alloc(usize, nwords);
+        self.visited = v;
+        self.dirty = d;
         @memset(self.visited, 0);
         self.n_dirty = 0;
         self.cap_words = nwords;

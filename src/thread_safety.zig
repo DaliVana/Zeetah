@@ -254,6 +254,29 @@ pub fn RegexCache(comptime Regex: type) type {
     };
 }
 
+test "RegexCache.get returns pointers stable across later inserts (no UAF)" {
+    const Regex = @import("regex.zig").Regex;
+    const a = std.testing.allocator;
+    var cache = RegexCache(Regex).init(a);
+    defer cache.deinit();
+
+    // Hold a pointer handed out by an early get, then insert many more patterns
+    // to force the backing map to grow/rehash. Boxed values keep the pointer
+    // valid (an inline-value map would move them → use-after-free).
+    const first = try cache.get("\\d+");
+    var buf: [8]u8 = undefined;
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        const pat = try std.fmt.bufPrint(&buf, "x{d}y", .{i});
+        _ = try cache.get(pat);
+    }
+    // `first` must still point at a live, correct Regex after the rehash.
+    try std.testing.expect(try first.isMatch("abc123"));
+    try std.testing.expect(!try first.isMatch("abc"));
+    // Re-getting the same pattern returns the identical (stable) box.
+    try std.testing.expectEqual(first, try cache.get("\\d+"));
+}
+
 test "thread safety documentation" {
     // This test exists to ensure the module compiles
     // The actual thread safety is guaranteed by the design

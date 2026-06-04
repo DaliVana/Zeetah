@@ -73,6 +73,23 @@ test "\\Z end anchor" {
     try std.testing.expect(!try isM(a, "abc\\Z", "abcx"));
 }
 
+test "anchors over a top-level alternation bind to a single branch" {
+    const a = std.testing.allocator;
+    // `^a|b` ≡ `(^a)|b` — the `b` branch is NOT anchored, so it matches anywhere.
+    // (Regression: the prescan must not fold the anchor across a top-level `|`.)
+    try std.testing.expect(try isM(a, "^a|b", "xxxb"));
+    try std.testing.expectEqual(@as(usize, 3), (try span(a, "^a|b", "xxxb")).?.s);
+    try std.testing.expect(try isM(a, "a|b$", "axx")); // `a` branch unanchored
+    try std.testing.expectEqual(@as(usize, 0), (try span(a, "a|b$", "axx")).?.s);
+    try std.testing.expect(try isM(a, "\\Aa|b", "xxb"));
+    try std.testing.expect(try isM(a, "^foo|bar", "x bar"));
+    // A whole-pattern anchor (no top-level `|`) still anchors, and a grouped
+    // alternation under anchors is unaffected.
+    try std.testing.expect(!try isM(a, "^abc", "xabc"));
+    try std.testing.expect(try isM(a, "^(?:a|b)$", "a"));
+    try std.testing.expect(!try isM(a, "^(?:a|b)$", "ax"));
+}
+
 test "anchors: comptime Pattern agrees with runtime Regex" {
     const a = std.testing.allocator;
     const P = regex.Pattern("^\\d+$", .{});

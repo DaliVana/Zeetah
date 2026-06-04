@@ -78,8 +78,9 @@ test "edge-look: trailing width-1 look peeled onto the DFA (scheme-branch shape)
 test "edge-look: comptime Pattern engages the DFA path and matches runtime" {
     // A lookaround pattern with `has_dfa == true` can ONLY be the edge-look
     // peel (the regular DFA path can't model lookaround, and the comptime
-    // backtracker sets has_dfa = false) — so this asserts engagement.
-    const P = regex.Pattern("(?:https?:\\/\\/|ftp:\\/\\/)[\\w\\-.~:\\/?#@!$&*+,;=%]+(?<![,.])", .{});
+    // backtracker sets has_dfa = false) — so this asserts engagement. The core
+    // must be alternation-free (see the `.alt` exclusion below).
+    const P = regex.Pattern("(?:https?:\\/\\/)[\\w\\-.~:\\/?#@!$&*+,;=%]+(?<![,.])", .{});
     try std.testing.expect(P.has_dfa);
     try std.testing.expectEqualStrings("https://example.com", P.find("see https://example.com. more").?.slice);
     try std.testing.expectEqualStrings("https://a.com", P.find("x https://a.com, y").?.slice);
@@ -90,6 +91,32 @@ test "edge-look: comptime Pattern engages the DFA path and matches runtime" {
     const D = regex.Pattern("\\d(?!\\d)", .{});
     try std.testing.expect(D.has_dfa);
     try std.testing.expectEqualStrings("5", D.find("in 345 end").?.slice);
+
+    // An ALTERNATION core is NOT peeled onto edge-look: the priority-cut core
+    // DFA exposes only the highest-priority accept per start, so a lower-priority
+    // branch's look-passing accept could be dropped (e.g. `(?:.|..)(?=x)`). Such
+    // a pattern routes to the comptime tree backtracker (`has_dfa == false`) and
+    // must still match correctly. (See `edge_look.regularGreedy`.)
+    const Palt = regex.Pattern("(?:https?:\\/\\/|ftp:\\/\\/)[\\w\\-.~:\\/?#@!$&*+,;=%]+(?<![,.])", .{});
+    try std.testing.expect(!Palt.has_dfa);
+    try std.testing.expectEqualStrings("ftp://a.com", Palt.find("x ftp://a.com, y").?.slice);
+    try std.testing.expectEqualStrings("https://example.com", Palt.find("see https://example.com. more").?.slice);
+}
+
+test "edge-look: alternation core is not peeled onto the priority-cut DFA" {
+    const a = std.testing.allocator;
+    // Regression: an alternation in the core must NOT be peeled onto edge-look.
+    // The priority-cut core DFA exposes only the highest-priority accept per
+    // start, so when that branch's accept fails the trailing look a lower-
+    // priority branch's *passing* accept would be dropped — wrong span / spurious
+    // no-match. These route to the (correct) tree backtracker instead.
+    try std.testing.expectEqualStrings("ab", (try slice(a, "(?:.|..)(?=x)", "abx")).?);
+    try std.testing.expectEqualStrings("foobar", (try slice(a, "(?:foo|foobar)(?=X)", "foobarX")).?);
+    try std.testing.expectEqualStrings("abc", (try slice(a, "(?:ab|abc)(?!c)", "abc")).?);
+    // Comptime peer agrees and likewise does not engage the DFA peel.
+    const P = regex.Pattern("(?:.|..)(?=x)", .{});
+    try std.testing.expect(!P.has_dfa);
+    try std.testing.expectEqualStrings("ab", P.find("abx").?.slice);
 }
 
 test "edge-look: comptime == runtime over multi-match inputs (findAll/count)" {
