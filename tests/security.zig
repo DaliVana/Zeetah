@@ -228,6 +228,35 @@ test "nesting: deep groups hit a guard, never the stack" {
     }
 }
 
+test "nesting: deep non-capturing (?: groups hit the parse-depth guard, not the stack" {
+    const a = std.testing.allocator;
+    // `(?:` does NOT consume a MAX_GROUPS slot, so the `parseAlt` MAX_PARSE_DEPTH
+    // guard is the only thing between a deep nest and a native stack overflow.
+    // (The capturing-`(` case above is bounded earlier by MAX_GROUPS.)
+    const deep = 2000; // > MAX_PARSE_DEPTH
+    const dbuf = try a.alloc(u8, deep * 3 + 1 + deep);
+    defer a.free(dbuf);
+    var i: usize = 0;
+    while (i < deep) : (i += 1) @memcpy(dbuf[i * 3 ..][0..3], "(?:");
+    dbuf[deep * 3] = 'a';
+    i = 0;
+    while (i < deep) : (i += 1) dbuf[deep * 3 + 1 + i] = ')';
+    try std.testing.expectError(error.PatternTooComplex, Regex.compile(a, dbuf));
+
+    // A shallow non-capturing nest still compiles — no over-rejection.
+    const shallow = 100;
+    const sbuf = try a.alloc(u8, shallow * 3 + 1 + shallow);
+    defer a.free(sbuf);
+    i = 0;
+    while (i < shallow) : (i += 1) @memcpy(sbuf[i * 3 ..][0..3], "(?:");
+    sbuf[shallow * 3] = 'a';
+    i = 0;
+    while (i < shallow) : (i += 1) sbuf[shallow * 3 + 1 + i] = ')';
+    var rx = try Regex.compile(a, sbuf);
+    defer rx.deinit();
+    try std.testing.expect(try rx.isMatch("a"));
+}
+
 test "utf8: malformed input bytes do not crash or over-read" {
     const a = std.testing.allocator;
     const patterns = [_][]const u8{ "a.b", ".*", "^.+$", "\\w+", "a.*c" };

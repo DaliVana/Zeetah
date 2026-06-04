@@ -37,6 +37,7 @@ const dupword = @import("exec/dupword.zig");
 const lazy_dfa = @import("exec/lazy_dfa.zig");
 const class_span = @import("exec/class_span.zig");
 const onepass = @import("exec/onepass.zig");
+const cc = @import("exec/charclass.zig");
 const cache_mod = @import("cache.zig");
 
 pub const Match = @import("match.zig").Match;
@@ -56,17 +57,11 @@ const BLits = struct {
     ac: prefilter.AhoCorasick,
     bl: seq_extract.BoundaryLits,
 
-    inline fn isWord(c: u8) bool {
-        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
-            (c >= '0' and c <= '9') or c == '_';
-    }
-    /// `\b` truth at `pos` (out-of-range neighbour = non-word). Mirrors
-    /// `bounded_bt`'s `lookHolds(.word_boundary)`, so the contract is
-    /// identical to the engine this replaces.
+    /// `\b` truth at `pos`, via the canonical `charclass` definition — the same
+    /// `lookHolds(.word_boundary)` the bounded/tree backtrackers use, so the
+    /// contract is identical to the engine this replaces (no divergent copy).
     inline fn wbAt(input: []const u8, pos: usize) bool {
-        const before = pos > 0 and isWord(input[pos - 1]);
-        const after = pos < input.len and isWord(input[pos]);
-        return before != after;
+        return cc.lookHolds(@intFromEnum(hir.LookKind.word_boundary), input, pos);
     }
 
     /// Leftmost-first match length at exactly `p`, or null. Tries the

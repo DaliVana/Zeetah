@@ -23,6 +23,18 @@ fn isM(a: std.mem.Allocator, pat: []const u8, in: []const u8) !bool {
     return rx.isMatch(in);
 }
 
+test "boundary: large \\b\\w+\\b run matches without a stack overflow" {
+    const a = std.testing.allocator;
+    // The bounded backtracker (engine for `\b…` patterns) drives its search from
+    // an explicit heap worklist rather than native recursion, so a very long
+    // matching run is matched in full instead of overflowing the call stack.
+    const n = 200 * 1024;
+    const buf = try a.alloc(u8, n);
+    defer a.free(buf);
+    @memset(buf, 'a');
+    try std.testing.expectEqual(@as(usize, n), (try slice(a, "\\b\\w+\\b", buf)).?.len);
+}
+
 test "boundary: \\b word boundaries" {
     const a = std.testing.allocator;
     try std.testing.expectEqualStrings("cat", (try slice(a, "\\bcat\\b", "a cat scatter cat.")).?);

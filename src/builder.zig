@@ -424,6 +424,15 @@ test "escape literal" {
     defer allocator.free(escaped);
 
     try testing.expectEqualStrings("hello\\.world", escaped);
+
+    // Every metacharacter is escaped, including the closing brace `}` (common in
+    // code/JSON/template text). The escaped form must compile and match verbatim.
+    const braces = try escapeLiteral(allocator, "f(x)} = {2}");
+    defer allocator.free(braces);
+    try testing.expectEqualStrings("f\\(x\\)\\} = \\{2\\}", braces);
+    var rx = try Regex.compile(allocator, braces);
+    defer rx.deinit();
+    try testing.expect(try rx.isMatch("a f(x)} = {2} b"));
 }
 
 test "composer alternatives" {

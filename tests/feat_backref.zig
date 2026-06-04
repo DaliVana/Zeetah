@@ -61,3 +61,27 @@ test "backref: in-bounds short inputs match/return cleanly" {
     try std.testing.expect(try isM(a, "(.)(.)\\2\\1", "abba"));
     try std.testing.expect(!try isM(a, "(.+)\\1$", "abcdef")); // no even split → no match, terminates
 }
+
+test "backref: out-of-range numeric ref is rejected (no uninitialized-slot read)" {
+    const a = std.testing.allocator;
+    // A reference to a group that does not exist anywhere (dangling/forward) is
+    // rejected at compile time rather than silently reading an uninitialized
+    // capture slot. Validated post-parse against the final group count.
+    try std.testing.expectError(error.InvalidPattern, Regex.compile(a, "(a)\\2"));
+    try std.testing.expectError(error.InvalidPattern, Regex.compile(a, "\\1"));
+    try std.testing.expectError(error.InvalidPattern, Regex.compile(a, "(a)(b)\\3"));
+    // A ref to a group that DOES exist stays valid — including a quantified
+    // backref, whose `{m,n}` re-parse runs in a sub-parser with n_groups==0 and
+    // must not be spuriously rejected.
+    try std.testing.expect(try isM(a, "(a)\\1", "aa"));
+    try std.testing.expect(try isM(a, "(a)\\1{2}", "aaa"));
+}
+
+test "backref: dup-word fast path only applies to a word class" {
+    const a = std.testing.allocator;
+    // Word-class adjacent-duplicate (the optimized `dup_word` shape) matches.
+    try std.testing.expectEqualStrings("the the", (try slice(a, "(\\b[A-Za-z]+\\b) \\1", "the the end")).?);
+    // A NON-word class must not take the `dup_word` fast path (its `\b` logic
+    // assumes word chars); `\b` cannot bracket '.', so there is no match.
+    try std.testing.expect(!try isM(a, "(\\b[.]+\\b) \\1", ". ."));
+}

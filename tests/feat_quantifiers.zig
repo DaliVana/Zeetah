@@ -151,6 +151,19 @@ test "quantifier on a class and on a group" {
     try std.testing.expectEqualStrings("abcabc", (try slice(a, "(?:abc){2}", "abcabcabc")).?);
 }
 
+test "bounded {m,n}: re-parsed atom inherits (?s)/(?x) modes" {
+    const a = std.testing.allocator;
+    // The `{m,n}` expansion re-parses the atom source in a sub-parser; it must
+    // inherit dot_all/extended/multiline, not just case-insensitivity.
+    // `(?s)` makes `.` match `\n`:
+    try std.testing.expectEqual(@as(usize, 2), (try slice(a, "(?s).{2}", "a\nb")).?.len);
+    try std.testing.expect((try slice(a, "(?s)a.{1,3}b", "a\n\nb")) != null);
+    // `(?x)` extended mode: the space is ignorable, not a literal.
+    try std.testing.expect((try slice(a, "(?x)(a b){2}", "abab")) != null);
+    // Sanity: without (?s), `.{2}` does not cross a newline.
+    try std.testing.expect((try slice(a, ".{2}", "a\nb")) == null);
+}
+
 test "quantifier: comptime Pattern agrees with runtime Regex" {
     const a = std.testing.allocator;
     const P = regex.Pattern("a{2,4}b", .{});

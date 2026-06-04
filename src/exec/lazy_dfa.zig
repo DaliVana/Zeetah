@@ -90,21 +90,45 @@ pub const LazyProg = struct {
         a_start: bool,
         a_end: bool,
     ) !LazyProg {
+        // Allocate into locals with `errdefer` so a mid-sequence OOM frees the
+        // buffers already taken (a single struct-literal of `try alloc`s leaks
+        // every prior allocation if a later one fails). On success the errdefers
+        // are disarmed by the normal return; `buildCsr`/`classify` are infallible.
+        const eps_to = try allocator.alloc(u16, MAX_EDGES);
+        errdefer allocator.free(eps_to);
+        const eps_off = try allocator.alloc(usize, MAX_NFA + 1);
+        errdefer allocator.free(eps_off);
+        const cnt_to = try allocator.alloc(u16, MAX_EDGES);
+        errdefer allocator.free(cnt_to);
+        const cnt_set = try allocator.alloc(u16, MAX_EDGES);
+        errdefer allocator.free(cnt_set);
+        const cnt_off = try allocator.alloc(usize, MAX_NFA + 1);
+        errdefer allocator.free(cnt_off);
+        const reps_to = try allocator.alloc(u16, MAX_EDGES);
+        errdefer allocator.free(reps_to);
+        const reps_off = try allocator.alloc(usize, MAX_NFA + 1);
+        errdefer allocator.free(reps_off);
+        const rcnt_from = try allocator.alloc(u16, MAX_EDGES);
+        errdefer allocator.free(rcnt_from);
+        const rcnt_set = try allocator.alloc(u16, MAX_EDGES);
+        errdefer allocator.free(rcnt_set);
+        const rcnt_off = try allocator.alloc(usize, MAX_NFA + 1);
+        errdefer allocator.free(rcnt_off);
         var self = LazyProg{
             .allocator = allocator,
             .nfa = nfa,
             .a_start = a_start,
             .a_end = a_end,
-            .eps_to = try allocator.alloc(u16, MAX_EDGES),
-            .eps_off = try allocator.alloc(usize, MAX_NFA + 1),
-            .cnt_to = try allocator.alloc(u16, MAX_EDGES),
-            .cnt_set = try allocator.alloc(u16, MAX_EDGES),
-            .cnt_off = try allocator.alloc(usize, MAX_NFA + 1),
-            .reps_to = try allocator.alloc(u16, MAX_EDGES),
-            .reps_off = try allocator.alloc(usize, MAX_NFA + 1),
-            .rcnt_from = try allocator.alloc(u16, MAX_EDGES),
-            .rcnt_set = try allocator.alloc(u16, MAX_EDGES),
-            .rcnt_off = try allocator.alloc(usize, MAX_NFA + 1),
+            .eps_to = eps_to,
+            .eps_off = eps_off,
+            .cnt_to = cnt_to,
+            .cnt_set = cnt_set,
+            .cnt_off = cnt_off,
+            .reps_to = reps_to,
+            .reps_off = reps_off,
+            .rcnt_from = rcnt_from,
+            .rcnt_set = rcnt_set,
+            .rcnt_off = rcnt_off,
         };
         self.buildCsr();
         self.classify();
