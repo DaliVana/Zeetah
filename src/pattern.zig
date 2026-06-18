@@ -511,9 +511,9 @@ fn CaptureSupport(comptime built: Built) type {
         /// the `locate` path, never `deinit`'d — same as the whole-match seek).
         const cap_seek_dfa = built.seek_dfa;
         const cap_seek: ?seek_mod.Seek = if (seq_extract.requiredLeadingLookbehindByte(NN, &baked)) |b|
-            .{ .allocator = std.heap.c_allocator, .lb_byte = b }
+            .{ .allocator = std.heap.page_allocator, .lb_byte = b }
         else if (built.seek_ok)
-            .{ .allocator = std.heap.c_allocator, .dfa = @constCast(&cap_seek_dfa) }
+            .{ .allocator = std.heap.page_allocator, .dfa = @constCast(&cap_seek_dfa) }
         else
             null;
         inline fn capSeekPtr() ?*const seek_mod.Seek {
@@ -704,14 +704,15 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             ///      shapes that have no leading look-behind.
             /// `null` ⇒ no usable filter, plain per-byte scan (still correct).
             ///
-            /// `allocator` is set to the c_allocator (comptime-known) only to
-            /// satisfy the field; neither the `lb_byte` nor the `dfa` `locate`
-            /// path touches it, and `Seek.deinit` is never called here. The
+            /// `allocator` is set to the page_allocator (comptime-known, no libc
+            /// dependency) only to satisfy the field; neither the `lb_byte` nor
+            /// the `dfa` `locate` path touches it, and `Seek.deinit` is never
+            /// called here. The
             /// baked `Dfa256` lives in the struct's `.rodata`, so `&seek_dfa` is
             /// a valid 'static pointer.
             const seek_dfa = built.seek_dfa;
             const bt_seek: ?seek_mod.Seek = if (seq_extract.requiredLeadingLookbehindByte(NN, &baked)) |b|
-                .{ .allocator = std.heap.c_allocator, .lb_byte = b }
+                .{ .allocator = std.heap.page_allocator, .lb_byte = b }
             else if (built.seek_ok)
                 // `Seek.dfa` is `?*full_dfa.Dfa256` (mutable, because the runtime
                 // `Seek.deinit` frees it); the baked DFA is a `.rodata` const, so
@@ -720,7 +721,7 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
                 // (`*const`, read-only), and this comptime `Seek` is never
                 // `deinit`'d (no allocation), so the pointer is never written or
                 // freed through the mutable type.
-                .{ .allocator = std.heap.c_allocator, .dfa = @constCast(&seek_dfa) }
+                .{ .allocator = std.heap.page_allocator, .dfa = @constCast(&seek_dfa) }
             else
                 null;
             inline fn seekPtr() ?*const seek_mod.Seek {
@@ -746,7 +747,7 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             /// only to satisfy the field). `n == 0` ⇒ no delegation, plain walk.
             const del_bake = delegateIslands(NN, &baked);
             const del_plan: delegate.Plan = blk: {
-                var p = delegate.Plan{ .allocator = std.heap.c_allocator, .n = del_bake.n };
+                var p = delegate.Plan{ .allocator = std.heap.page_allocator, .n = del_bake.n };
                 for (0..del_bake.n) |i| {
                     p.refs[i] = del_bake.refs[i];
                     p.dfas[i] = @constCast(&del_bake.dfas[i]);
