@@ -50,16 +50,26 @@ pub inline fn holds(spec: *const Spec, input: []const u8, end: usize) bool {
     return if (spec.neg) !present else present;
 }
 
-/// Regular AND all-greedy? (`.look`/`.look_around`/`.backref`/`.atomic` or any
-/// lazy quantifier ⇒ false.) Generic over `cap` so runtime and comptime share it.
+/// Regular, all-greedy, AND alternation-free? (`.look`/`.look_around`/
+/// `.backref`/`.atomic` or any lazy quantifier ⇒ false.) Generic over `cap` so
+/// runtime and comptime share it.
+///
+/// `.alt` is rejected: the core is DFA-compiled with a leftmost-first priority
+/// cut, so only the highest-priority accept per start survives. With an
+/// alternation, when that branch's accept fails the trailing look, a
+/// lower-priority branch's *passing* accept has already been pruned and
+/// `nextFrom` never sees it — yielding a wrong span / spurious no-match (e.g.
+/// `(?:.|..)(?=x)` on `"abx"`). The greedy-longest⇒longest-first soundness
+/// argument (header) only holds without alternation. This mirrors the identical
+/// `.alt` exclusion in `delegate.delegatable` (`delegate.zig`).
 fn regularGreedy(comptime cap: ?usize, h: *const hir.Hir(cap), ref: hir.NodeRef) bool {
     const nd = h.node(ref);
     return switch (nd.tag) {
-        .backref, .look_around, .look, .atomic => false,
+        .alt, .backref, .look_around, .look, .atomic => false,
         .empty, .set => true,
         .star, .plus, .opt => nd.greedy and regularGreedy(cap, h, nd.a),
         .cap => regularGreedy(cap, h, nd.a),
-        .concat, .alt => regularGreedy(cap, h, nd.a) and regularGreedy(cap, h, nd.b),
+        .concat => regularGreedy(cap, h, nd.a) and regularGreedy(cap, h, nd.b),
     };
 }
 

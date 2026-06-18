@@ -56,6 +56,38 @@ test "captures: nesting numbered by opening paren" {
     try expectCaps(a, "((a)(b))", "ab", "ab", &.{ .{ .s = "ab" }, .{ .s = "a" }, .{ .s = "b" } });
 }
 
+test "captures: a group inside a lookaround does not shift outer numbering or add a phantom" {
+    const a = std.testing.allocator;
+    // In-lookaround captures are not reported (Phase-E limitation), but they must
+    // NOT be counted: counting them shifts every following group's number and
+    // leaves a phantom unset slot. `(?=(a)b)(a)(b)` on "ab" => exactly the two
+    // real groups g1=(a), g2=(b) — no phantom g3.
+    var rx = try Regex.compile(a, "(?=(a)b)(a)(b)");
+    defer rx.deinit();
+    var m = (try rx.captures(a, "ab")).?;
+    defer m.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), m.groups.len); // g0 + 2 real groups
+    try std.testing.expectEqualStrings("ab", m.groups[0].?.slice);
+    try std.testing.expectEqualStrings("a", m.groups[1].?.slice);
+    try std.testing.expectEqualStrings("b", m.groups[2].?.slice);
+}
+
+test "captures: large boundary-capturing run (explicit-stack recCap, no overflow)" {
+    const a = std.testing.allocator;
+    // `\b(\w+)\b` routes to the bounded backtracker's capture trace, whose
+    // recursion was replaced by an explicit heap stack. A long run must produce
+    // the correct group without overflowing the native stack.
+    const n = 100 * 1024;
+    const buf = try a.alloc(u8, n);
+    defer a.free(buf);
+    @memset(buf, 'x');
+    var rx = try Regex.compile(a, "\\b(\\w+)\\b");
+    defer rx.deinit();
+    var m = (try rx.captures(a, buf)).?;
+    defer m.deinit(a);
+    try std.testing.expectEqual(n, m.groups[1].?.slice.len);
+}
+
 test "captures: repetition keeps the last iteration" {
     const a = std.testing.allocator;
     try expectCaps(a, "(foo|bar)+", "foobarfoo", "foobarfoo", &.{.{ .s = "foo" }});

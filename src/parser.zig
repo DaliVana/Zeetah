@@ -381,6 +381,14 @@ pub fn parse(
     p.skipExt(); // trailing ignorable ws / `#…` comment under `(?x)`
     if (p.i != pre.body.len) return Error.Invalid;
 
+    // Reject a numeric backreference to a group that does not exist anywhere in
+    // the pattern (`(a)\2`, `\1` with no groups). Validated post-parse against
+    // the final group count so forward refs to a group that *does* exist (and
+    // `\1{2}`, whose re-parse sub-parser sees `n_groups == 0`) stay valid.
+    // Without this the backtracker reads an uninitialized capture slot. Named
+    // backrefs are already validated at parse time via `lookupName`.
+    if (p.max_backref > p.n_groups) return Error.Invalid;
+
     // Lazy + end-anchor (`a*?$`): the leftmost-first DFA accept-cut cannot
     // honor "earliest lazy accept" *and* "accept == end-of-text" at once, so
     // the construction cut can't model it. Rather than reject, `properties`
@@ -418,6 +426,9 @@ fn Parser(comptime cap: ?usize) type {
         /// Recursive-descent nesting depth (one level per group body), guarded
         /// against stack overflow in `parseAlt`. See `MAX_PARSE_DEPTH`.
         depth: usize = 0,
+        /// Highest numeric backreference seen (`\N`), validated against the final
+        /// group count after parsing (see `parse`) to reject dangling refs.
+        max_backref: u32 = 0,
 
         const Modes = struct { ci: bool, dot_all: bool, extended: bool, multiline: bool };
         fn modes(p: *const Self) Modes {
@@ -491,6 +502,12 @@ fn Parser(comptime cap: ?usize) type {
                 if (g > hir.MAX_GROUPS) return Error.Invalid;
             }
             if (g == 0) return Error.Invalid;
+            // Record the highest referenced group for a post-parse validation
+            // (see `parse`). An at-site `g > n_groups` check would wrongly reject
+            // `\1{2}` (the `{m,n}` re-parse sub-parser has `n_groups == 0`); the
+            // post-parse check against the final group count is correct and also
+            // covers backrefs inside lookarounds.
+            if (g > p.max_backref) p.max_backref = g;
             return p.node(.{ .tag = .backref, .set_idx = g });
         }
 

@@ -105,6 +105,16 @@ pub fn build(h: *const H) ?DupWord {
 
     var dw = DupWord{ .class = undefined, .sep = undefined, .group = g };
     dw.class = h.setBitmap(clsn.set_idx);
+    // `findCap`'s `\b` handling assumes the CLASS run is made of word chars
+    // ([A-Za-z0-9_]) — that is what makes the run length unique per start and
+    // the leftmost-first reduction sound. A non-word or mixed class (e.g.
+    // `(\b[.]+\b) \1`) makes the `\b` checks wrong in both directions, so accept
+    // ONLY a word-subset class here and otherwise fall through to the correct
+    // `.backtrack` engine.
+    for (0..256) |c| {
+        const b: u8 = @intCast(c);
+        if (cc.hasBit(&dw.class, b) and !cc.isWord(b)) return null;
+    }
     dw.sep = h.setBitmap(sepn.set_idx);
     return dw;
 }
