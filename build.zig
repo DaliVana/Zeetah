@@ -47,6 +47,7 @@ pub fn build(b: *std.Build) void {
         // Per-feature coverage + the rebuilt negative/security suites
         // (capture-free meta engine; see each file's header).
         "tests/feat_literals.zig",
+        "tests/feat_escapes.zig",
         "tests/feat_classes.zig",
         "tests/feat_quantifiers.zig",
         "tests/feat_lazy.zig",

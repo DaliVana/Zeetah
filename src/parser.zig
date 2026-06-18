@@ -43,6 +43,44 @@ fn singleByteSet(c: u8) [32]u8 {
     return s;
 }
 
+fn invertSet(s: [32]u8) [32]u8 {
+    var r = s;
+    for (&r) |*b| b.* = ~b.*;
+    return r;
+}
+
+/// PCRE 8-bit `\h` (horizontal whitespace): TAB, SPACE, and NBSP (0xA0, the
+/// Latin-1 member). Higher Unicode spaces are multibyte → the `(?u)` phase.
+fn horizWsSet() [32]u8 {
+    var s = [_]u8{0} ** 32;
+    setBit(&s, '\t');
+    setBit(&s, ' ');
+    setBit(&s, 0xA0);
+    return s;
+}
+
+/// PCRE 8-bit `\v` and the single-char branch of `\R` (vertical whitespace):
+/// LF, VT, FF, CR, and NEL (0x85, Latin-1). U+2028/U+2029 are multibyte → the
+/// `(?u)` phase.
+fn vertWsSet() [32]u8 {
+    var s = [_]u8{0} ** 32;
+    setBit(&s, '\n');
+    setBit(&s, 0x0B);
+    setBit(&s, 0x0C);
+    setBit(&s, '\r');
+    setBit(&s, 0x85);
+    return s;
+}
+
+fn hexVal(c: u8) ?u32 {
+    return switch (c) {
+        '0'...'9' => @as(u32, c - '0'),
+        'a'...'f' => @as(u32, c - 'a') + 10,
+        'A'...'F' => @as(u32, c - 'A') + 10,
+        else => null,
+    };
+}
+
 /// An escaped ASCII punctuation byte is the literal byte, matching the Rust
 /// `regex` / RE2 / PCRE rule ("`\x` is literal `x` for any ASCII punctuation").
 /// Rust's exact carve-out is "all ASCII except `[0-9A-Za-z<>]`"; we follow it,
@@ -526,6 +564,85 @@ fn Parser(comptime cap: ?usize) type {
             return p.node(.{ .tag = .backref, .set_idx = g });
         }
 
+        /// `\xHH` (up to two hex digits; `\x` alone ⇒ NUL, like PCRE) or
+        /// `\x{H…}` (braced). Byte-valued: a value > 0xFF (only reachable via
+        /// the braced form) is `Unsupported`, reserved for the codepoint `(?u)`
+        /// phase — never silently truncated. Caller has consumed the `x`.
+        fn parseHexByte(p: *Self) Error!u8 {
+            if (p.peek() == '{') {
+                p.i += 1;
+                var v: u32 = 0;
+                var n: usize = 0;
+                while (p.peek()) |ch| {
+                    const d = hexVal(ch) orelse break;
+                    v = v * 16 + d;
+                    n += 1;
+                    p.i += 1;
+                    if (v > 0xFF) return Error.Unsupported; // > one byte ⇒ (?u)
+                }
+                if (n == 0) return Error.Invalid;
+                if (p.peek() != '}') return Error.Invalid;
+                p.i += 1;
+                return @intCast(v);
+            }
+            var v: u32 = 0;
+            var n: usize = 0;
+            while (n < 2) : (n += 1) {
+                const ch = p.peek() orelse break;
+                const d = hexVal(ch) orelse break;
+                v = v * 16 + d;
+                p.i += 1;
+            }
+            return @intCast(v);
+        }
+
+        /// `\0`, `\0o`, `\0oo` — leading-zero octal, up to two further octal
+        /// digits (≤ 0o77, always one byte). Caller has consumed the leading
+        /// `0`. `\1`–`\9` stay backreferences, never octal (PCRE/Perl rule).
+        fn parseOctalAfterZero(p: *Self) u8 {
+            var v: u32 = 0;
+            var n: usize = 0;
+            while (n < 2) : (n += 1) {
+                const ch = p.peek() orelse break;
+                if (ch < '0' or ch > '7') break;
+                v = v * 8 + (ch - '0');
+                p.i += 1;
+            }
+            return @intCast(v);
+        }
+
+        /// `\o{ooo}` — braced octal. > 0xFF ⇒ `Unsupported` (the `(?u)`
+        /// follow-on). Caller has consumed the `o`.
+        fn parseOctalBraced(p: *Self) Error!u8 {
+            if (p.peek() != '{') return Error.Invalid;
+            p.i += 1;
+            var v: u32 = 0;
+            var n: usize = 0;
+            while (p.peek()) |ch| {
+                if (ch < '0' or ch > '7') break;
+                v = v * 8 + (ch - '0');
+                n += 1;
+                p.i += 1;
+                if (v > 0xFF) return Error.Unsupported;
+            }
+            if (n == 0) return Error.Invalid;
+            if (p.peek() != '}') return Error.Invalid;
+            p.i += 1;
+            return @intCast(v);
+        }
+
+        /// `\R` — line break. PCRE 8-bit default: `(?:\r\n | [\n\x0B\f\r\x85])`.
+        /// Kept a plain (non-atomic) alternation so it stays on the DFA path;
+        /// the only divergence from PCRE's atomic `\R` is the rare overlap case
+        /// (e.g. `\R\n` on "\r\n\n"), noted in PCRE_COMPATIBILITY.md.
+        fn parseLineBreak(p: *Self) Error!NodeRef {
+            const cr = try p.setLeaf(singleByteSet('\r'));
+            const lf = try p.setLeaf(singleByteSet('\n'));
+            const crlf = try p.node(.{ .tag = .concat, .a = cr, .b = lf });
+            const any_nl = try p.setLeaf(vertWsSet());
+            return p.node(.{ .tag = .alt, .a = crlf, .b = any_nl });
+        }
+
         fn lookLeaf(p: *Self, kind: hir.LookKind) Error!NodeRef {
             // Look-assertions (`\b \B`, `\A \z \Z`, `(?m)^ $`) are evaluated by
             // the tree backtracker — at runtime via `.bt_look`, and at comptime
@@ -929,6 +1046,15 @@ fn Parser(comptime cap: ?usize) type {
                         't' => p.setLeaf(singleByteSet('\t')),
                         'r' => p.setLeaf(singleByteSet('\r')),
                         ' ' => p.setLeaf(singleByteSet(' ')), // `\ ` literal space (extended mode)
+                        'x' => p.setLeaf(singleByteSet(try p.parseHexByte())),
+                        'o' => p.setLeaf(singleByteSet(try p.parseOctalBraced())),
+                        '0' => p.setLeaf(singleByteSet(p.parseOctalAfterZero())),
+                        'h' => p.setLeaf(horizWsSet()),
+                        'H' => p.setLeaf(invertSet(horizWsSet())),
+                        'v' => p.setLeaf(vertWsSet()),
+                        'V' => p.setLeaf(invertSet(vertWsSet())),
+                        'N' => p.setLeaf(anySet()), // any byte except '\n' (unaffected by (?s))
+                        'R' => p.parseLineBreak(),
                         'p', 'P' => p.parsePropClass(e == 'P'),
                         'b' => p.lookLeaf(.word_boundary),
                         'B' => p.lookLeaf(.non_word_boundary),
@@ -1040,6 +1166,24 @@ fn Parser(comptime cap: ?usize) type {
                         continue;
                     }
                 }
+                // Horizontal/vertical whitespace shorthands as class members
+                // (`[\h\v]`). `\R`/`\N` are NOT class-legal in PCRE, so they
+                // fall through to `classChar` ⇒ `Unsupported`, matching PCRE.
+                if (c == '\\' and p.i + 1 < p.pat.len) {
+                    const ws: ?[32]u8 = switch (p.pat[p.i + 1]) {
+                        'h' => horizWsSet(),
+                        'H' => invertSet(horizWsSet()),
+                        'v' => vertWsSet(),
+                        'V' => invertSet(vertWsSet()),
+                        else => null,
+                    };
+                    if (ws) |set| {
+                        p.i += 2;
+                        var k: usize = 0;
+                        while (k < 32) : (k += 1) bm[k] |= set[k];
+                        continue;
+                    }
+                }
                 // `\p{Name}` / `\P{Name}` / `\pL` as a class member: OR the
                 // property's ≤0xFF byte set (its complement for `\P`) into
                 // `bm`, exactly the standalone-`\p` Latin-1 semantics. An
@@ -1112,6 +1256,11 @@ fn Parser(comptime cap: ?usize) type {
                     'n' => '\n',
                     't' => '\t',
                     'r' => '\r',
+                    // Byte-valued escapes also serve as range endpoints
+                    // (`[\x00-\x1F]`, `[\0-\a]`).
+                    'x' => try p.parseHexByte(),
+                    'o' => try p.parseOctalBraced(),
+                    '0' => p.parseOctalAfterZero(),
                     // Escaped ASCII punctuation (incl. `\/` and `\-`) is literal.
                     else => escapedPunct(e) orelse Error.Unsupported,
                 };

@@ -279,6 +279,7 @@ compile-time path — live in **[Architecture](docs/ARCHITECTURE.md)**.
 | Possessive quantifiers | `*+`, `++`, `?+`, `{m,n}+` | ✅ lower to atomic groups; run on the backtracker (match-budget bounded)¹ |
 | Alternation | `a\|b\|c` | ✅ |
 | Predefined classes | `\d \w \s \D \W \S` | ✅ (including inside `[…]`) |
+| Whitespace / line-break | `\h \H \v \V \R \N` | ✅ DFA path; PCRE 8-bit sets (`\h`+NBSP, `\v`+NEL); `\R` ≈ `(?:\r\n\|[\n\x0B\f\r\x85])`⁶ |
 | Custom classes | `[abc]`, `[a-z]`, `[^0-9]`, `[[:alpha:]]` | ✅ unknown POSIX name → `NotImplemented` |
 | Unicode properties | `\p{L}`, `\P{Nd}`, `\pL`, `[^\p{L}]` | ⚠️ **General_Category, Latin-1 bytes only**²; scripts/binary props/`\p` under `(?i)`/multibyte codepoints → `NotImplemented`⁵ |
 | Inline flags | `(?i)`, `(?s)`, `(?x)`, `(?m)` and scoped `(?i:…)` | ✅ |
@@ -293,6 +294,7 @@ compile-time path — live in **[Architecture](docs/ARCHITECTURE.md)**.
 | Compile flags | `.case_insensitive`, `.dot_all`, `.extended`, `.multiline` | ✅ peers of `(?i)`/`(?s)`/`(?x)`/`(?m)` |
 | Compile flags | `.unicode` (codepoint mode) | ❌ `NotImplemented`⁵ |
 | Escaping | `\\`, `\.`, `\n`, `\t`, `\r` | ✅ |
+| Byte escapes | `\xHH`, `\x{…}`, `\0`, `\0oo`, `\o{…}` | ✅ single byte; a `\x{…}`/`\o{…}` value > `0xFF` → `NotImplemented` (codepoint `(?u)` follow-on)⁶ |
 
 > **¹ Possessive quantifiers** (`*+`/`++`/`?+`/`{m,n}+`) lower to **atomic
 > groups** (`a*+` ≡ `(?>a*)`) with true atomic semantics — they commit and never
@@ -330,6 +332,18 @@ compile-time path — live in **[Architecture](docs/ARCHITECTURE.md)**.
 > **⁴ Captures.** `find` / `isMatch` / `findAll` return the correct whole-match
 > span but leave `groups` empty. Use [`captures`](#capture-groups) to extract
 > submatch slices (it allocates; the returned `Match` must be `deinit`-ed).
+>
+> **⁶ Byte / whitespace escapes** are pure byte-level sugar and stay on the DFA
+> path (no backtracker). `\xHH` takes up to two hex digits (`\x` alone ⇒ NUL);
+> `\x{…}` / `\o{…}` are braced; `\0` plus up to two octal digits is the
+> leading-zero octal form (`\1`–`\9` remain backreferences, never octal). A
+> braced value above `0xFF` is `NotImplemented`, reserved for the codepoint
+> `(?u)` phase — never silently truncated. `\h`/`\v` use the **PCRE 8-bit**
+> definitions (`\h` = TAB/SPACE/NBSP `0xA0`; `\v` = LF/VT/FF/CR/NEL `0x85`);
+> `\h \H \v \V` are also valid `[…]` members and byte escapes work as range
+> endpoints (`[\x00-\x1F]`). `\N` is "any byte except `\n`" (unaffected by
+> `(?s)`). `\R` is a *plain* (non-atomic) alternation, so it differs from
+> PCRE's atomic `\R` only in the rare overlap case (e.g. `\R\n` on `"\r\n\n"`).
 
 ### What `compile` returns on rejection
 
