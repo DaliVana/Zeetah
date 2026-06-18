@@ -1,6 +1,8 @@
 # Zig build artifacts
 zig-cache/
 zig-out/
+# Fetched dependency cache (`zig fetch` output, if it lands in-tree)
+zig-pkg/
 
 # Local configuration
 .zig-cache/

@@ -48,14 +48,20 @@ Requires **Zig 0.16+**. Zeetah has no external dependencies.
 
 ### As a package
 
-Add the dependency to your `build.zig.zon` (replace the URL/hash with a
-published release once available):
+The recommended way — `zig fetch --save` resolves the release tag and writes the
+dependency, with its content hash, into your `build.zig.zon`:
+
+```bash
+zig fetch --save git+https://github.com/DaliVana/Zeetah.git#v0.16.0
+```
+
+Or add the entry to `build.zig.zon` by hand:
 
 ```zig
 .dependencies = .{
     .zeetah = .{
-        .url = "TBD", // e.g. a release tarball; `zig fetch --save <url>` fills the hash
-        .hash = "...",
+        .url = "git+https://github.com/DaliVana/Zeetah.git#v0.16.0",
+        .hash = "zeetah-0.16.0-X1D6OTq1CwBCfcJ5KYMnqngIgUlDcxNaL6VLXLALzi3H",
     },
 },
 ```
