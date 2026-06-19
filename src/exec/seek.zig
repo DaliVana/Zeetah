@@ -36,6 +36,7 @@ const full_dfa = @import("full_dfa.zig");
 const lazy_dfa = @import("lazy_dfa.zig");
 const core = @import("core.zig");
 const seq_extract = @import("seq_extract.zig");
+const properties = @import("../properties.zig");
 
 const H = hir.Hir(null);
 const NodeRef = hir.NodeRef;
@@ -143,6 +144,20 @@ pub fn build(allocator: std.mem.Allocator, h: *const H) ?*Seek {
     oh.anchored_start = h.anchored_start;
     oh.anchored_end = h.anchored_end;
     oh.saw_lazy = h.saw_lazy;
+
+    // Non-selective over-approximation guard. When the relaxation is
+    // `Σ*`-shaped — every `set` in it matches (near-)all bytes, so it is only a
+    // length constraint with no selective byte anywhere — *no* regular
+    // prefilter can skip: every position is a candidate. Building and running
+    // one (the O(n) dense pass, or the Dfa256 + reverse-start) is then pure
+    // overhead layered on the tree-walk, so drop it; the backtracker's plain
+    // `start += 1` scan is correct and far cheaper. The canonical case is a
+    // multiline lookaround validator like `(?m)^(?=.*[a-z])(?=.*\d).{8,}$`,
+    // whose relaxation collapses to `.{8,}` — measured at ~80% of that
+    // pattern's run time spent in a prefilter that never skipped. A single
+    // selective set (a literal, a digit/letter/punct class — tokenizer,
+    // modsec) keeps the filter, where the dense engine genuinely skips.
+    if (properties.nonSelectiveApprox(null, &oh, oh.root)) return null;
 
     var nfa = thompson.build(null, &oh) catch return null;
 

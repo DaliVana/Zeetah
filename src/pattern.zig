@@ -229,6 +229,10 @@ fn overApproxDfa(h: *const hir.Hir(HIR_CAP)) ?full_dfa.Dfa256 {
     oh.anchored_end = h.anchored_end;
     oh.saw_lazy = h.saw_lazy;
     oh.root = hir.cloneSubtree(HIR_CAP, HIR_CAP, &oh, undefined, h, h.root, true) catch return null;
+    // Non-selective relaxation (`Σ*`-shaped, e.g. `.{8,}`): a match can begin
+    // anywhere, so this prefilter could never skip — baking and running it is
+    // pure overhead. Mirrors the runtime `seek.build` guard (shared helper).
+    if (properties.nonSelectiveApprox(HIR_CAP, &oh, oh.root)) return null;
     var onfa = thompson.build(HIR_CAP, &oh) catch return null;
     var od = full_dfa.compute(HIR_CAP, &onfa, oh.anchored_start, oh.anchored_end);
     if (od.outcome != .ok) return null;

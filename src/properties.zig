@@ -196,6 +196,42 @@ fn firstBytes(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, set: *
     }
 }
 
+/// A byte class is "near-universal" when it matches all but ≤2 of the 256
+/// byte values — `.` (255, excludes `\n`), dot-all (256), `[^x]` — i.e. it
+/// constrains essentially nothing. Below this it is selective enough that a
+/// prefilter keyed on it can skip non-members.
+const UNIVERSAL_MIN: usize = 254;
+
+fn allSetsUniversal(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, seen: *bool) bool {
+    const nd = h.node(ref);
+    return switch (nd.tag) {
+        .empty, .look, .look_around, .backref => true, // zero-width / ε: no set
+        .set => {
+            seen.* = true;
+            const bm = h.setBitmap(nd.set_idx);
+            var bits: usize = 0;
+            for (bm) |b| bits += @popCount(b);
+            return bits >= UNIVERSAL_MIN;
+        },
+        .concat, .alt => allSetsUniversal(cap, h, nd.a, seen) and allSetsUniversal(cap, h, nd.b, seen),
+        .star, .plus, .opt, .cap, .atomic => allSetsUniversal(cap, h, nd.a, seen),
+    };
+}
+
+/// True iff the regular over-approximation rooted at `ref` is `Σ*`-shaped: it
+/// contains at least one `set` and *every* `set` in it is near-universal. Such
+/// a relaxation is only a length constraint (`.{8,}`, `.+`, `[^\n]*…`) — a
+/// match can begin at (almost) every position, so **no** regular prefilter can
+/// skip and building/running one is pure overhead on the tree-walk. A single
+/// selective set anywhere ⇒ `false` (keep the prefilter; it genuinely skips).
+/// The backtracker-tier seek (`exec/seek.zig`) and its comptime analogue
+/// (`pattern.overApproxDfa`) both gate on this — one definition, both paths.
+/// Pass the *already-lowered* over-approximation HIR (looks/backref → ε).
+pub fn nonSelectiveApprox(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) bool {
+    var seen_set = false;
+    return allSetsUniversal(cap, h, ref, &seen_set) and seen_set;
+}
+
 /// Pure analysis of `h`. Comptime-evaluable; never reads a haystack.
 pub fn analyze(comptime cap: ?usize, h: *const hir.Hir(cap)) Properties {
     @setEvalBranchQuota(1_000_000);
