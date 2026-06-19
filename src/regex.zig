@@ -37,7 +37,6 @@ const dupword = @import("exec/dupword.zig");
 const lazy_dfa = @import("exec/lazy_dfa.zig");
 const class_span = @import("exec/class_span.zig");
 const onepass = @import("exec/onepass.zig");
-const cc = @import("exec/charclass.zig");
 const cache_mod = @import("cache.zig");
 
 pub const Match = @import("match.zig").Match;
@@ -53,54 +52,11 @@ const MetaKind = enum { literal, dfa, lit_prefix, reverse_suffix, bt_look, backt
 /// linear pass and an O(1) `\b` check verifies the two span edges — no NFA,
 /// no `bt_look` `visited` array. See memory
 /// `deep-alternation-reject-is-architectural`.
-const BLits = struct {
-    ac: prefilter.AhoCorasick,
-    bl: seq_extract.BoundaryLits,
-
-    /// `\b` truth at `pos`, via the canonical `charclass` definition — the same
-    /// `lookHolds(.word_boundary)` the bounded/tree backtrackers use, so the
-    /// contract is identical to the engine this replaces (no divergent copy).
-    inline fn wbAt(input: []const u8, pos: usize) bool {
-        return cc.lookHolds(@intFromEnum(hir.LookKind.word_boundary), input, pos);
-    }
-
-    /// Leftmost-first match length at exactly `p`, or null. Tries the
-    /// alternatives in *source order* (regex `a|b` prefers `a`), so this is
-    /// independent of which needle Aho-Corasick happened to report.
-    fn matchAt(self: *const BLits, input: []const u8, p: usize) ?usize {
-        if (!wbAt(input, p)) return null;
-        var i: usize = 0;
-        while (i < self.bl.n) : (i += 1) {
-            const L = self.bl.alt(i);
-            if (p + L.len <= input.len and
-                std.mem.eql(u8, input[p .. p + L.len], L) and
-                wbAt(input, p + L.len)) return L.len;
-        }
-        return null;
-    }
-
-    /// Leftmost match at/after absolute `from`. AC gives the minimal needle
-    /// *end* `e0 ≥ from`; any leftmost match whose needle ends at `e0` has a
-    /// start in `[e0-maxlen+1, e0]` (a shorter needle ending earlier than
-    /// `e0` would contradict AC minimality), so brute-scanning that window in
-    /// increasing order and trying *all* alternatives at each position is
-    /// leftmost-correct; otherwise the match ends > `e0` and we advance.
-    fn find(self: *const BLits, input: []const u8, from: usize) ?core.Span {
-        var pos = from;
-        while (self.ac.find(input, pos)) |h| {
-            const e0 = h.start + h.len - 1; // minimal needle end ≥ pos
-            const ml: usize = self.bl.maxlen;
-            const lo0 = if (e0 + 1 >= ml) e0 + 1 - ml else 0;
-            var p = @max(lo0, from);
-            while (p <= e0) : (p += 1) {
-                if (self.matchAt(input, p)) |len| return .{ .start = p, .end = p + len };
-            }
-            pos = e0 + 1; // every remaining match ends strictly after e0
-            if (pos > input.len) break;
-        }
-        return null;
-    }
-};
+/// The matcher (AC locate + O(1) `\b` verify) lives in `seq_extract` as a
+/// node-budget-generic `BoundaryMatcher`, so the runtime engine here and the
+/// comptime `Pattern.boundary_lits` arm share one implementation. Runtime uses
+/// the 1024-node `prefilter.AhoCorasick`; the comptime arm trims the table.
+const BLits = seq_extract.BoundaryMatcher(prefilter.AhoCorasick);
 
 /// Capture-group numbering + `(?<name>)` names, in source order. Lifted to
 /// `parser.zig` as the single source of truth so the runtime and comptime
@@ -591,7 +547,7 @@ pub const Regex = struct {
                 for (0..bl.n) |i| needles[i] = bl.alt(i);
                 if (prefilter.AhoCorasick.build(needles[0..bl.n])) |ac| {
                     const e = try allocator.create(BLits);
-                    e.* = .{ .ac = ac, .bl = bl };
+                    e.* = BLits.init(ac, bl);
                     return Regex{
                         .allocator = allocator,
                         .pattern = owned,

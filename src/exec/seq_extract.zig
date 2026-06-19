@@ -12,6 +12,8 @@
 const std = @import("std");
 const hir = @import("../hir.zig");
 const pf = @import("../prefilter.zig");
+const cc = @import("charclass.zig");
+const search = @import("search.zig");
 
 const NodeRef = hir.NodeRef;
 
@@ -431,6 +433,124 @@ pub const BoundaryLits = struct {
         return s.lits[i][0..s.lens[i]];
     }
 };
+
+/// The `\b(?:lit|lit|…)\b` matcher: Aho-Corasick locate + an O(1) `\b`-verify
+/// walk, leftmost-first by *source order*. Generic on the AC table type so the
+/// SAME logic drives the runtime `.boundary_lits` engine (`AcT` = the 1024-node
+/// `pf.AhoCorasick`) and the comptime `Pattern.boundary_lits` arm (`AcT` = the
+/// node-trimmed `pf.AhoCorasickN(N)` baked into `.rodata`) — no divergent copy.
+/// `find` returns a `search.Span`; the recogniser that fills `bl` is
+/// `boundaryLiterals` above.
+pub fn BoundaryMatcher(comptime AcT: type) type {
+    return struct {
+        const Self = @This();
+        ac: AcT,
+        bl: BoundaryLits,
+        /// SIMD prefilter that skips runs containing no possible keyword start,
+        /// so the (scalar) Aho-Corasick automaton only runs near candidates —
+        /// the prefilter every comparable AC engine (e.g. rust `aho-corasick`)
+        /// carries. Chosen at `init`: `.teddy` (PSHUFB/TBL, keys on the first
+        /// ~3 bytes) when the set fits Teddy's 8-needle cap and builds; else
+        /// `.none` (pure AC). A union-of-first-bytes scan was tried for the
+        /// >8-needle case and DROPPED: A/B showed it is input-dependent (≈2.3×
+        /// on keyword-dense text but ≈0.68× on sparse text whose filler words
+        /// share the keyword first-byte ranges → false positives dominate), so
+        /// large sets like `deep_alternation` (40 kw) stay on pure AC — no
+        /// prefilter rather than a gamble. Teddy, by contrast, keys on 3 bytes
+        /// so it stays selective regardless of input (A/B: 12–16× either way).
+        /// Shared runtime+comptime.
+        pre: Pre = .none,
+
+        const Pre = union(enum) {
+            none,
+            teddy: pf.Teddy,
+        };
+
+        /// Build the matcher and choose its prefilter from the literal set.
+        pub fn init(ac: AcT, bl: BoundaryLits) Self {
+            return .{ .ac = ac, .bl = bl, .pre = buildPre(&bl) };
+        }
+
+        /// Choose the prefilter (see `pre`). Pure + comptime-evaluable: `Teddy.build`
+        /// is the same allocation-free scalar builder the comptime `.literal` arm
+        /// bakes, so the comptime `Pattern` arm bakes the chosen prefilter into
+        /// `.rodata` exactly as runtime does. Teddy needs ≤ 8 needles, each ≥ 2
+        /// bytes (it returns `null` otherwise ⇒ pure AC).
+        fn buildPre(bl: *const BoundaryLits) Pre {
+            if (bl.n == 0 or bl.n > pf.Teddy.MAX_NEEDLES) return .none;
+            var needles: [pf.Teddy.MAX_NEEDLES][]const u8 = undefined;
+            for (0..bl.n) |i| needles[i] = bl.alt(i);
+            if (pf.Teddy.build(needles[0..bl.n])) |t| return .{ .teddy = t };
+            return .none;
+        }
+
+        /// `\b` truth at `pos`, via the canonical `charclass` definition — the
+        /// same `lookHolds(.word_boundary)` the bounded/tree backtrackers use, so
+        /// the contract is identical to the engine this serves (no divergent copy).
+        inline fn wbAt(input: []const u8, pos: usize) bool {
+            return cc.lookHolds(@intFromEnum(hir.LookKind.word_boundary), input, pos);
+        }
+
+        /// Leftmost-first match length at exactly `p`, or null. Tries the
+        /// alternatives in *source order* (regex `a|b` prefers `a`), so this is
+        /// independent of which needle Aho-Corasick happened to report.
+        fn matchAt(self: *const Self, input: []const u8, p: usize) ?usize {
+            if (!wbAt(input, p)) return null;
+            var i: usize = 0;
+            while (i < self.bl.n) : (i += 1) {
+                const L = self.bl.alt(i);
+                if (p + L.len <= input.len and
+                    std.mem.eql(u8, input[p .. p + L.len], L) and
+                    wbAt(input, p + L.len)) return L.len;
+            }
+            return null;
+        }
+
+        /// Leftmost match at/after absolute `from`. With the Teddy prefilter,
+        /// locate candidate **starts** (needle occurrences) with SIMD and verify
+        /// each via `matchAt` (which re-checks `\b` + tries alts in source order
+        /// ⇒ leftmost-first). Every real match start IS a needle occurrence, so
+        /// Teddy is a sound necessary condition — it only skips proven-non-start
+        /// runs (e.g. `class` in `classy` is located, then `matchAt` rejects it
+        /// on the trailing `\b`). Without a prefilter, fall back to the AC walk.
+        pub fn find(self: *const Self, input: []const u8, from: usize) ?search.Span {
+            switch (self.pre) {
+                .none => return self.findAC(input, from),
+                .teddy => |*t| {
+                    var pos = from;
+                    while (t.find(input, pos)) |hit| {
+                        if (self.matchAt(input, hit.start)) |len|
+                            return .{ .start = hit.start, .end = hit.start + len };
+                        pos = hit.start + 1;
+                    }
+                    return null;
+                },
+            }
+        }
+
+        /// Prefilter-free path: AC gives the minimal needle *end* `e0 ≥ from`;
+        /// any leftmost match whose needle ends at `e0` has a start in
+        /// `[e0-maxlen+1, e0]` (a shorter needle ending earlier than `e0` would
+        /// contradict AC minimality), so brute-scanning that window in increasing
+        /// order and trying *all* alternatives is leftmost-correct; otherwise the
+        /// match ends > `e0` and we advance.
+        fn findAC(self: *const Self, input: []const u8, from: usize) ?search.Span {
+            var pos = from;
+            while (self.ac.find(input, pos)) |h| {
+                const e0 = h.start + h.len - 1; // minimal needle end ≥ pos
+                const ml: usize = self.bl.maxlen;
+                const lo0 = if (e0 + 1 >= ml) e0 + 1 - ml else 0;
+                var p = @max(lo0, from);
+                while (p <= e0) : (p += 1) {
+                    if (self.matchAt(input, p)) |len| return .{ .start = p, .end = p + len };
+                }
+                pos = e0 + 1; // every remaining match ends strictly after e0
+                if (pos > input.len) break;
+            }
+            return null;
+        }
+    };
+}
 
 /// Flatten the concat/cap spine into ordered factor refs (≤ `cap_n`, else
 /// fail). `.cap` is transparent (a capturing group is rejected later via

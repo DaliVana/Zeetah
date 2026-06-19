@@ -340,6 +340,50 @@ test "comptime Pattern <-> runtime Regex agree: non-regular (tree backtracker) t
     try btAgree(".*?b$", "aabxb");
 }
 
+// The comptime `.boundary_lits` arm: a `\b(?:lit|lit|…)\b` keyword alternation
+// routes to the Aho-Corasick locate + O(1) `\b`-verify engine — NOT the DFA and
+// NOT the tree backtracker — with the AC node-TRIMMED into `.rodata`. The
+// `ac_node_count` decl is the trim proof; its presence (plus `!has_dfa`) is what
+// proves THIS arm engaged: the DFA/literal arms expose no such decl, and the
+// backtracker arm exposes `bt_node_count` instead. Values are checked against
+// the runtime engine over haystacks with boundary edge cases — substrings that
+// share a keyword prefix ("classy", "forever") must NOT match as whole words.
+fn blAgree(comptime p: []const u8, in: []const u8) !void {
+    const a = std.testing.allocator;
+    const P = regex.Pattern(p, .{});
+    comptime std.debug.assert(!P.has_dfa); // not the DFA/literal tier
+    comptime std.debug.assert(@hasDecl(P, "ac_node_count") and P.ac_node_count > 1); // boundary_lits engaged
+    var rx = try Regex.compile(a, p);
+    defer rx.deinit();
+    try std.testing.expectEqual(try rx.isMatch(in), P.isMatch(in));
+    try std.testing.expectEqual(try rx.count(in), P.count(in)); // the count/grep metric
+    const pm = P.find(in);
+    var rm = try rx.find(in);
+    defer if (rm) |*x| x.deinit(a);
+    try std.testing.expectEqual(rm == null, pm == null);
+    if (pm) |pmm| {
+        try std.testing.expectEqual(rm.?.start, pmm.start);
+        try std.testing.expectEqual(rm.?.end, pmm.end);
+    }
+}
+
+test "comptime Pattern <-> runtime Regex agree: boundary-literals (Aho-Corasick) tier" {
+    // The benchmark's `deep_alternation` shape: a 40-keyword JS alternation.
+    const kw = "\\b(?:break|case|catch|class|const|continue|default|delete|do|else|" ++
+        "enum|export|extends|false|finally|for|function|if|import|in|instanceof|new|" ++
+        "null|return|super|switch|this|throw|true|try|typeof|var|void|while|with|" ++
+        "yield|let|static|async|await)\\b";
+    try blAgree(kw, "the function returns true while the class extends typeof yield");
+    try blAgree(kw, "classy superb forever iffy returns"); // near-misses → 0 whole-word hits
+    try blAgree(kw, "if (x) return null; else throw new Error; do { } while (true)");
+    try blAgree(kw, "no keywords at all here");
+    try blAgree(kw, ""); // empty input
+    // A small keyword set routes here too (AC node-trimmed); exercises
+    // leftmost-first source-order tie-break and shared-prefix overlap.
+    try blAgree("\\b(?:do|double|doc)\\b", "a do double doc done do dom");
+    try blAgree("\\b(?:get|getter|set)\\b", "set getter get getty");
+}
+
 test "comptime backtracker inherits the ReDoS step budget over a longer input" {
     // The comptime tree backtracker reuses `backtrack.run`, so it inherits the
     // O(n) step budget — a backref pattern over a longer input terminates (no

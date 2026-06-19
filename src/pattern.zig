@@ -157,7 +157,7 @@ const Outcome = enum { ok, unsupported, exploded, invalid };
 /// §6/(c) monomorphization: which planner strategy the baked matcher emits.
 /// `.literal` skips the DFA table entirely (Teddy only); the other three bake
 /// the DFA and differ only in the per-position prefilter wrapped around it.
-const Strat = enum { literal, reverse_suffix, lit_prefix, dfa, backtrack, edge_look };
+const Strat = enum { literal, reverse_suffix, lit_prefix, dfa, backtrack, edge_look, boundary_lits };
 
 /// Search mode for the baked-DFA matcher (everything except `.literal`). A
 /// comptime constant, so the `switch (mode)` in each method folds to the one
@@ -188,6 +188,10 @@ const Built = struct {
     /// `.edge_look` arm: verify spec for the peeled trailing width-1 look.
     /// `dfa` holds the regular core's DFA; this is the O(1) edge check.
     el_spec: edge_look.Spec = .{ .set = [_]u8{0} ** 32, .behind = false, .neg = false },
+    /// `.boundary_lits` arm: the `\b(?:lit|…)\b` literal set. Comptime-only —
+    /// the Aho-Corasick automaton is rebuilt + node-trimmed in `Pattern` (not
+    /// stored here) so `Built` stays small. Empty (`n == 0`) for other strats.
+    bl: seq_extract.BoundaryLits = .{},
     /// `.backtrack` arm: a regular over-approximation DFA used as the seek
     /// prefilter (skip proven-dead prefixes). Built at comptime by the SAME
     /// zero-allocator `full_dfa.compute` the regular arm uses, over a relaxed
@@ -359,6 +363,34 @@ fn buildAll(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) 
         }
     }
 
+    // `\b(?:lit|lit|…)\b` keyword alternation: regular, but a big literal set
+    // blows `MAX_NFA` so the DFA path can't build it. The runtime routes this to
+    // its `.boundary_lits` engine (Aho-Corasick locate + O(1) `\b` verify); the
+    // comptime path does the same, baking a node-trimmed AC into `.rodata`. Both
+    // building blocks (`boundaryLiterals` + `AhoCorasick.build`) are zero-allocator
+    // and comptime-evaluable. `ng == 0` only (the engine reports no submatches,
+    // mirroring the runtime gate). Checked BEFORE the backtracker fallback — the
+    // bracketing `\b`s would otherwise route here via `has_look`.
+    if (ng == 0) {
+        if (seq_extract.boundaryLiterals(HIR_CAP, &h)) |bl| {
+            var needles: [seq_extract.MAX_BL][]const u8 = undefined;
+            for (0..bl.n) |i| needles[i] = bl.alt(i);
+            // Confirm the AC fits the build budget here so routing is decided now;
+            // `Pattern` rebuilds + trims it (kept out of `Built` to stay small).
+            if (pf.AhoCorasick.build(needles[0..bl.n]) != null) {
+                return .{
+                    .dfa = full_dfa.emptyDfa256(.ok),
+                    .outcome = .ok,
+                    .strat = .boundary_lits,
+                    .hir = h,
+                    .n_groups = ng,
+                    .gnames = gnames,
+                    .bl = bl,
+                };
+            }
+        }
+    }
+
     if (props.requires_backtracking or props.has_look) {
         // Comptime seek prefilter: a regular OVER-APPROXIMATION DFA (built by
         // `overApproxDfa` below — see its doc for the soundness/guards). When
@@ -523,6 +555,45 @@ fn WholeMatchVerbs(comptime nextSpanFrom: fn ([]const u8, usize) ?search.Span) t
         pub fn splitIterator(input: []const u8) SplitIterator {
             return .{ .input = input };
         }
+
+        // ── Whole-match eager verbs (the `nextSpanFrom`-driven scaffold every
+        // arm shares) ──. `find`/`count`/`findAll` are identical across all arms,
+        // so they live here once; an arm re-exports them (`pub const find =
+        // V.find;`). `isMatch` is the GENERIC default (run a leftmost search,
+        // discard) — arms with a cheaper existence check (literal Teddy / DFA
+        // `table.isMatch` / edge-look) define their own `isMatch` instead of
+        // re-exporting this one.
+        pub fn isMatch(input: []const u8) bool {
+            return nextSpanFrom(input, 0) != null;
+        }
+
+        pub fn find(input: []const u8) ?Match {
+            const sp = nextSpanFrom(input, 0) orelse return null;
+            return wholeMatch(input, sp.start, sp.end);
+        }
+
+        pub fn count(input: []const u8) usize {
+            var n: usize = 0;
+            var pos: usize = 0;
+            while (pos <= input.len) {
+                const sp = nextSpanFrom(input, pos) orelse break;
+                n += 1;
+                pos = advanceEmpty(sp.start, sp.end);
+            }
+            return n;
+        }
+
+        pub fn findAll(allocator: std.mem.Allocator, input: []const u8) ![]Match {
+            var list: std.ArrayList(Match) = .empty;
+            errdefer list.deinit(allocator);
+            var pos: usize = 0;
+            while (pos <= input.len) {
+                const sp = nextSpanFrom(input, pos) orelse break;
+                try list.append(allocator, wholeMatch(input, sp.start, sp.end));
+                pos = advanceEmpty(sp.start, sp.end);
+            }
+            return list.toOwnedSlice(allocator);
+        }
     };
 }
 
@@ -591,7 +662,13 @@ fn CaptureSupport(comptime built: Built) type {
         pub const Caps = Captures(NG, gnames);
         const cap_h = baked;
         const nfa = op_nfa;
-        const dfa = op_dfa;
+        /// One-pass span DFA, baked COMPRESSED (`compress`) so it costs `[ns][nk]`
+        /// `.rodata` instead of a full 131 KB `Dfa256` — the same trim the
+        /// `cap_seek_cdfa` / main-DFA / edge-look / seek bakes already use. `void`
+        /// when the one-pass path is unavailable (then `capturesFrom`'s reference
+        /// is comptime-dead). Its `findLeftmost` is differential-pinned to the
+        /// `core.findLeftmost(&Dfa256, …)` it replaces (exact-fit compression).
+        const cdfa = if (op_dfa_usable) compress(op_dfa) else {};
 
         /// Seek prefilter for the (fallback) capture backtracker — the SAME
         /// `lb_byte` / compressed over-approximation-DFA layering the whole-match
@@ -648,8 +725,8 @@ fn CaptureSupport(comptime built: Built) type {
             var slots: [2 * (hir.MAX_GROUPS + 1)]i32 = undefined;
             const nslots = 2 * (NG + 1);
             if (comptime op_dfa_usable) {
-                // O(n) span from the baked DFA, then a single deterministic fill.
-                const r = core.findLeftmost(&dfa, input[from..]) orelse return null;
+                // O(n) span from the baked (compressed) DFA, then a single fill.
+                const r = cdfa.findLeftmost(input[from..]) orelse return null;
                 const span: onepass.Span = .{ .start = from + r.start, .end = from + r.end };
                 @memset(slots[0..nslots], -1);
                 slots[0] = @intCast(span.start);
@@ -912,7 +989,6 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
                 const sp = (bt.runFrom(input, from, slots[0 .. 2 * (n_groups + 1)]) catch return null) orelse return null;
                 return .{ .start = sp.start, .end = sp.end };
             }
-            const nextSpan = nextSpanFrom; // back-compat alias for in-arm callers
 
             // Lazy whole-match verbs (zero-alloc), built on this arm's
             // `nextSpanFrom`. Re-exported individually (no `usingnamespace` in
@@ -936,37 +1012,78 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             pub const CapturesIterator = C.CapturesIterator;
             pub const capturesIterator = C.capturesIterator;
 
-            pub fn isMatch(input: []const u8) bool {
-                return nextSpan(input, 0) != null;
+            // Whole-match eager verbs — generic `nextSpan`-driven scaffold (see
+            // `WholeMatchVerbs`); this arm has no faster existence check.
+            pub const isMatch = V.isMatch;
+            pub const find = V.find;
+            pub const count = V.count;
+            pub const findAll = V.findAll;
+        };
+    }
+
+    // Boundary-literals tier: `\b(?:lit|lit|…)\b` runs the comptime peer of the
+    // runtime `.boundary_lits` engine — Aho-Corasick locate + an O(1) `\b` verify
+    // (shared `seq_extract.BoundaryMatcher`). The AC is rebuilt at comptime and
+    // node-TRIMMED (`trimmed`) so the baked `.rodata` is `[n_nodes][256]u16`
+    // (~84 KB for a 40-keyword set) instead of the full 1024-node 516 KB build
+    // table. `has_dfa = false` (no DFA table), matching the backtracker arm's
+    // convention; `ng == 0` by construction (buildAll routes here capture-free).
+    if (built.strat == .boundary_lits) {
+        const bl = built.bl;
+        // `buildAll` already built this AC once (to decide routing) and dropped
+        // it; we rebuild here to trim. The rebuild is the deliberate cost of NOT
+        // carrying the full 1024-node `AhoCorasickN(1024)` (~528 KB) in `Built`:
+        // `Built` is one concrete type returned for EVERY pattern, so an AC field
+        // would add 528 KB of comptime memory to every (non-boundary-lits) build
+        // too. A second comptime build, paid only by `\b(?:lit|…)\b` patterns, is
+        // the cheaper trade. (We can't trim inside `buildAll` either — the trimmed
+        // `AhoCorasickN(n_nodes)` type is pattern-dependent, like the HIR trim.)
+        const trimmed_ac = comptime blk: {
+            @setEvalBranchQuota(50_000_000);
+            var needles: [seq_extract.MAX_BL][]const u8 = undefined;
+            for (0..bl.n) |i| needles[i] = bl.alt(i);
+            const full = pf.AhoCorasick.build(needles[0..bl.n]).?;
+            break :blk full.trimmed(full.n_nodes);
+        };
+        const Matcher = seq_extract.BoundaryMatcher(@TypeOf(trimmed_ac));
+        const matcher: Matcher = comptime Matcher.init(trimmed_ac, bl);
+        return struct {
+            pub const has_dfa = false;
+            /// Trim proof: the baked AC's exact node count, NOT the 1024-node
+            /// build cap — a tiny keyword set bakes a tiny `.rodata` table.
+            pub const ac_node_count = trimmed_ac.n_nodes;
+            const mtr = matcher;
+
+            /// Next leftmost span at/after absolute `from` (AC locate + `\b`
+            /// verify). Absolute coords already — no slice, so the edge `\b`
+            /// checks see true context, like the runtime engine.
+            pub fn nextSpanFrom(input: []const u8, from: usize) ?search.Span {
+                return mtr.find(input, from);
             }
 
-            pub fn find(input: []const u8) ?Match {
-                const sp = nextSpan(input, 0) orelse return null;
-                return wholeMatch(input, sp.start, sp.end);
-            }
+            // Lazy whole-match verbs (zero-alloc), built on `nextSpanFrom`.
+            const V = WholeMatchVerbs(nextSpanFrom);
+            pub const Iterator = V.Iterator;
+            pub const iterator = V.iterator;
+            pub const startsWith = V.startsWith;
+            pub const SplitIterator = V.SplitIterator;
+            pub const splitIterator = V.splitIterator;
+            // Zero-alloc captures (group 0 = whole match; `ng == 0`). Shares the
+            // CaptureSupport machinery with the other arms for a uniform API.
+            const C = CaptureSupport(built);
+            pub const Captures = C.Caps;
+            pub const captures = C.captures;
+            pub const capturesFrom = C.capturesFrom;
+            pub const capturesAll = C.capturesAll;
+            pub const CapturesIterator = C.CapturesIterator;
+            pub const capturesIterator = C.capturesIterator;
 
-            pub fn count(input: []const u8) usize {
-                var n: usize = 0;
-                var pos: usize = 0;
-                while (pos <= input.len) {
-                    const sp = nextSpan(input, pos) orelse break;
-                    n += 1;
-                    pos = advanceEmpty(sp.start, sp.end);
-                }
-                return n;
-            }
-
-            pub fn findAll(allocator: std.mem.Allocator, input: []const u8) ![]Match {
-                var list: std.ArrayList(Match) = .empty;
-                errdefer list.deinit(allocator);
-                var pos: usize = 0;
-                while (pos <= input.len) {
-                    const sp = nextSpan(input, pos) orelse break;
-                    try list.append(allocator, wholeMatch(input, sp.start, sp.end));
-                    pos = advanceEmpty(sp.start, sp.end);
-                }
-                return list.toOwnedSlice(allocator);
-            }
+            // Whole-match eager verbs — generic `nextSpan`-driven scaffold (see
+            // `WholeMatchVerbs`); the AC walk has no cheaper existence check.
+            pub const isMatch = V.isMatch;
+            pub const find = V.find;
+            pub const count = V.count;
+            pub const findAll = V.findAll;
         };
     }
 
@@ -985,36 +1102,15 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             pub fn nextSpanFrom(input: []const u8, from: usize) ?search.Span {
                 return edge_look.nextFrom(&core_dfa, &spec, input, from);
             }
-            const nextSpan = nextSpanFrom;
 
+            // Specialized existence check (edge verify, no match materialized);
+            // find/count/findAll are the generic scaffold (see `WholeMatchVerbs`).
             pub fn isMatch(input: []const u8) bool {
                 return edge_look.nextFrom(&core_dfa, &spec, input, 0) != null;
             }
-            pub fn find(input: []const u8) ?Match {
-                const sp = nextSpan(input, 0) orelse return null;
-                return wholeMatch(input, sp.start, sp.end);
-            }
-            pub fn count(input: []const u8) usize {
-                var n: usize = 0;
-                var pos: usize = 0;
-                while (pos <= input.len) {
-                    const sp = nextSpan(input, pos) orelse break;
-                    n += 1;
-                    pos = advanceEmpty(sp.start, sp.end);
-                }
-                return n;
-            }
-            pub fn findAll(allocator: std.mem.Allocator, input: []const u8) ![]Match {
-                var list: std.ArrayList(Match) = .empty;
-                errdefer list.deinit(allocator);
-                var pos: usize = 0;
-                while (pos <= input.len) {
-                    const sp = nextSpan(input, pos) orelse break;
-                    try list.append(allocator, wholeMatch(input, sp.start, sp.end));
-                    pos = advanceEmpty(sp.start, sp.end);
-                }
-                return list.toOwnedSlice(allocator);
-            }
+            pub const find = V.find;
+            pub const count = V.count;
+            pub const findAll = V.findAll;
             const V = WholeMatchVerbs(nextSpanFrom);
             pub const Iterator = V.Iterator;
             pub const iterator = V.iterator;
@@ -1065,37 +1161,14 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
                 return core.literalFindT(&t, input, from);
             }
 
+            // Specialized existence check (Teddy, no match materialized);
+            // find/count/findAll are the generic scaffold (see `WholeMatchVerbs`).
             pub fn isMatch(input: []const u8) bool {
                 return core.literalIsMatchT(&t, input);
             }
-
-            pub fn find(input: []const u8) ?Match {
-                const sp = nextSpanFrom(input, 0) orelse return null;
-                return wholeMatch(input, sp.start, sp.end);
-            }
-
-            pub fn count(input: []const u8) usize {
-                var n: usize = 0;
-                var pos: usize = 0;
-                while (pos <= input.len) {
-                    const sp = nextSpanFrom(input, pos) orelse break;
-                    n += 1;
-                    pos = advanceEmpty(sp.start, sp.end);
-                }
-                return n;
-            }
-
-            pub fn findAll(allocator: std.mem.Allocator, input: []const u8) ![]Match {
-                var list: std.ArrayList(Match) = .empty;
-                errdefer list.deinit(allocator);
-                var pos: usize = 0;
-                while (pos <= input.len) {
-                    const sp = nextSpanFrom(input, pos) orelse break;
-                    try list.append(allocator, wholeMatch(input, sp.start, sp.end));
-                    pos = advanceEmpty(sp.start, sp.end);
-                }
-                return list.toOwnedSlice(allocator);
-            }
+            pub const find = V.find;
+            pub const count = V.count;
+            pub const findAll = V.findAll;
 
             // Lazy whole-match verbs (zero-alloc): iterator / startsWith / split.
             const V = WholeMatchVerbs(nextSpanFrom);
@@ -1167,8 +1240,10 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
                     },
                 };
             }
-            const nextSpan = nextSpanFrom; // back-compat alias for in-arm callers
 
+            // Specialized existence check (per-strategy fast `isMatch`, no match
+            // materialized); find/count/findAll are the generic scaffold (see
+            // `WholeMatchVerbs`).
             pub fn isMatch(input: []const u8) bool {
                 return switch (mode) {
                     .dfa => table.isMatch(input),
@@ -1176,34 +1251,9 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
                     .lit_prefix => search.litPrefixIsMatch(&table, &t, input),
                 };
             }
-
-            pub fn find(input: []const u8) ?Match {
-                const sp = nextSpan(input, 0) orelse return null;
-                return wholeMatch(input, sp.start, sp.end);
-            }
-
-            pub fn count(input: []const u8) usize {
-                var n: usize = 0;
-                var pos: usize = 0;
-                while (pos <= input.len) {
-                    const sp = nextSpan(input, pos) orelse break;
-                    n += 1;
-                    pos = advanceEmpty(sp.start, sp.end);
-                }
-                return n;
-            }
-
-            pub fn findAll(allocator: std.mem.Allocator, input: []const u8) ![]Match {
-                var list: std.ArrayList(Match) = .empty;
-                errdefer list.deinit(allocator);
-                var pos: usize = 0;
-                while (pos <= input.len) {
-                    const sp = nextSpan(input, pos) orelse break;
-                    try list.append(allocator, wholeMatch(input, sp.start, sp.end));
-                    pos = advanceEmpty(sp.start, sp.end);
-                }
-                return list.toOwnedSlice(allocator);
-            }
+            pub const find = V.find;
+            pub const count = V.count;
+            pub const findAll = V.findAll;
 
             // Lazy whole-match verbs (zero-alloc): iterator / startsWith / split.
             const V = WholeMatchVerbs(nextSpanFrom);

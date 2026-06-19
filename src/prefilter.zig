@@ -1003,85 +1003,113 @@ test "teddy: SIMD find == scalar reference (differential, leftmost+order)" {
 // Both are *necessary-condition* candidate finders — the engine re-runs from
 // the reported offset, so an over-approximation is still correct.
 
-pub const AhoCorasick = struct {
-    pub const MAX_NODES: usize = 1024;
+/// Aho-Corasick automaton over a fixed `MAX_NODES`-node table. Generic on the
+/// node budget so the SAME code serves the runtime (`AhoCorasick` = the
+/// 1024-node build cap) and the comptime `Pattern.boundary_lits` arm, which
+/// builds at the 1024 cap then `trimmed`s the live nodes into an exact-sized
+/// table baked into `.rodata` (a 40-keyword set is ~165 nodes ⇒ ~84 KB instead
+/// of the full 516 KB).
+pub fn AhoCorasickN(comptime MAX_NODES: usize) type {
+    return struct {
+        const Self = @This();
 
-    // goto[node][byte] -> child node (0 = none, root = 0 is fine since root is
-    // never a goto target). fail[node] -> failure link. out_len[node] -> the
-    // length of a needle ending here (0 = none); ties keep the shortest so the
-    // reported start is the earliest possible (still a sound prefilter).
-    goto: [MAX_NODES][256]u16 = [_][256]u16{[_]u16{0} ** 256} ** MAX_NODES,
-    fail: [MAX_NODES]u16 = [_]u16{0} ** MAX_NODES,
-    out_len: [MAX_NODES]u16 = [_]u16{0} ** MAX_NODES,
-    n_nodes: usize = 1, // node 0 = root
+        // goto[node][byte] -> child node (0 = none, root = 0 is fine since root
+        // is never a goto target). fail[node] -> failure link. out_len[node] ->
+        // the length of a needle ending here (0 = none); ties keep the shortest
+        // so the reported start is the earliest possible (still a sound prefilter).
+        goto: [MAX_NODES][256]u16 = [_][256]u16{[_]u16{0} ** 256} ** MAX_NODES,
+        fail: [MAX_NODES]u16 = [_]u16{0} ** MAX_NODES,
+        out_len: [MAX_NODES]u16 = [_]u16{0} ** MAX_NODES,
+        n_nodes: usize = 1, // node 0 = root
 
-    pub const Hit = struct { start: usize, len: usize };
+        pub const Hit = struct { start: usize, len: usize };
 
-    /// Build from needles. Returns null if it would exceed the node budget or
-    /// any needle is empty.
-    pub fn build(needles: []const []const u8) ?AhoCorasick {
-        var ac = AhoCorasick{};
-        for (needles) |nd| {
-            if (nd.len == 0) return null;
-            var cur: u16 = 0;
-            for (nd) |b| {
-                if (ac.goto[cur][b] == 0) {
-                    if (ac.n_nodes >= MAX_NODES) return null;
-                    ac.goto[cur][b] = @intCast(ac.n_nodes);
-                    ac.n_nodes += 1;
-                }
-                cur = ac.goto[cur][b];
+        /// Copy the live `[0..n_nodes)` rows into a smaller fixed table — used at
+        /// comptime to shrink the baked `.rodata` from the 1024-node build cap to
+        /// the pattern's actual node count. `NewMax` must be `>= n_nodes` (every
+        /// stored `goto`/`fail` index is `< n_nodes`, so it fits the new table).
+        pub fn trimmed(self: *const Self, comptime NewMax: usize) AhoCorasickN(NewMax) {
+            var out = AhoCorasickN(NewMax){};
+            out.n_nodes = self.n_nodes;
+            for (0..self.n_nodes) |i| {
+                out.goto[i] = self.goto[i];
+                out.fail[i] = self.fail[i];
+                out.out_len[i] = self.out_len[i];
             }
-            if (ac.out_len[cur] == 0 or nd.len < ac.out_len[cur]) {
-                ac.out_len[cur] = @intCast(nd.len);
-            }
+            return out;
         }
-        // BFS to compute failure links + propagate outputs.
-        var queue: [MAX_NODES]u16 = undefined;
-        var qh: usize = 0;
-        var qt: usize = 0;
-        var c: usize = 0;
-        while (c < 256) : (c += 1) {
-            const ch = ac.goto[0][c];
-            if (ch != 0) {
-                ac.fail[ch] = 0;
-                queue[qt] = ch;
-                qt += 1;
-            }
-        }
-        while (qh < qt) {
-            const u = queue[qh];
-            qh += 1;
-            var b: usize = 0;
-            while (b < 256) : (b += 1) {
-                const v = ac.goto[u][b];
-                if (v == 0) {
-                    ac.goto[u][b] = ac.goto[ac.fail[u]][@intCast(b)];
-                } else {
-                    ac.fail[v] = ac.goto[ac.fail[u]][@intCast(b)];
-                    if (ac.out_len[v] == 0 and ac.out_len[ac.fail[v]] != 0) {
-                        ac.out_len[v] = ac.out_len[ac.fail[v]];
+
+        /// Build from needles. Returns null if it would exceed the node budget or
+        /// any needle is empty.
+        pub fn build(needles: []const []const u8) ?Self {
+            var ac = Self{};
+            for (needles) |nd| {
+                if (nd.len == 0) return null;
+                var cur: u16 = 0;
+                for (nd) |b| {
+                    if (ac.goto[cur][b] == 0) {
+                        if (ac.n_nodes >= MAX_NODES) return null;
+                        ac.goto[cur][b] = @intCast(ac.n_nodes);
+                        ac.n_nodes += 1;
                     }
-                    queue[qt] = v;
+                    cur = ac.goto[cur][b];
+                }
+                if (ac.out_len[cur] == 0 or nd.len < ac.out_len[cur]) {
+                    ac.out_len[cur] = @intCast(nd.len);
+                }
+            }
+            // BFS to compute failure links + propagate outputs.
+            var queue: [MAX_NODES]u16 = undefined;
+            var qh: usize = 0;
+            var qt: usize = 0;
+            var c: usize = 0;
+            while (c < 256) : (c += 1) {
+                const ch = ac.goto[0][c];
+                if (ch != 0) {
+                    ac.fail[ch] = 0;
+                    queue[qt] = ch;
                     qt += 1;
                 }
             }
+            while (qh < qt) {
+                const u = queue[qh];
+                qh += 1;
+                var b: usize = 0;
+                while (b < 256) : (b += 1) {
+                    const v = ac.goto[u][b];
+                    if (v == 0) {
+                        ac.goto[u][b] = ac.goto[ac.fail[u]][@intCast(b)];
+                    } else {
+                        ac.fail[v] = ac.goto[ac.fail[u]][@intCast(b)];
+                        if (ac.out_len[v] == 0 and ac.out_len[ac.fail[v]] != 0) {
+                            ac.out_len[v] = ac.out_len[ac.fail[v]];
+                        }
+                        queue[qt] = v;
+                        qt += 1;
+                    }
+                }
+            }
+            return ac;
         }
-        return ac;
-    }
 
-    /// First needle occurrence at/after `pos`, or null. One linear pass.
-    pub fn find(self: *const AhoCorasick, input: []const u8, pos: usize) ?Hit {
-        var node: u16 = 0;
-        var i = pos;
-        while (i < input.len) : (i += 1) {
-            node = self.goto[node][input[i]];
-            const l = self.out_len[node];
-            if (l != 0) return .{ .start = i + 1 - l, .len = l };
+        /// First needle occurrence at/after `pos`, or null. One linear pass.
+        pub fn find(self: *const Self, input: []const u8, pos: usize) ?Hit {
+            var node: u16 = 0;
+            var i = pos;
+            while (i < input.len) : (i += 1) {
+                node = self.goto[node][input[i]];
+                const l = self.out_len[node];
+                if (l != 0) return .{ .start = i + 1 - l, .len = l };
+            }
+            return null;
         }
-        return null;
-    }
-};
+    };
+}
+
+/// The runtime Aho-Corasick: the 1024-node build cap (heap-stored in the
+/// `.boundary_lits` engine). The comptime `Pattern` arm builds at this cap then
+/// `trimmed`s to its exact node count for a compact `.rodata` bake.
+pub const AhoCorasick = AhoCorasickN(1024);
 
 test "aho-corasick: finds leftmost needle == naive scan" {
     const needles = [_][]const u8{ "he", "she", "his", "hers" };
