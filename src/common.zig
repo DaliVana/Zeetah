@@ -157,6 +157,22 @@ pub const CompileFlags = packed struct {
     multiline: bool = false,
     dot_all: bool = false,
     extended: bool = false,
+    /// Codepoint-aware matching (the inline `(?u)` mode): full-Unicode `\p`,
+    /// scripts, simple case folding, codepoint-granular `.`, Unicode `\b`, and
+    /// character-class set operations. Reserved follow-on — currently rejected
+    /// with `error.NotImplemented` (see `tests/feat_unicode.zig`).
+    ///
+    /// INVARIANT — byte-mode is frozen, Unicode is always opt-in.
+    /// The default (this flag off) is a byte-oriented engine: `.`/`\d`/`\w`/`\b`
+    /// operate on bytes, `\p` is Latin-1, multibyte literals are byte sequences.
+    /// That semantics MUST NOT change. When the Unicode extension lands, every
+    /// codepoint-aware behavior — including any syntax with a benign byte-mode
+    /// meaning today (e.g. `&&`/`--` as literals inside `[...]`) — lives behind
+    /// this flag and is never retrofitted into the default. This is what lets
+    /// the extension be purely additive and breaks zero existing patterns.
+    /// Corollary: keep the reserved-syntax rejections (`(?u)`, `\x{>0xFF}`,
+    /// `\p{Script}`, …) erroring rather than silently matching, so no pattern
+    /// can come to depend on a byte-meaning the extension would later reinterpret.
     unicode: bool = false,
 };
 

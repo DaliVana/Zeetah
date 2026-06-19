@@ -50,6 +50,14 @@ pub const Properties = struct {
     /// engine enumerate line starts (via a `\n` memchr) instead of every
     /// position — the difference between O(n) and O(n·lines) start attempts.
     leading_line_anchor: bool = false,
+    /// The non-nullable body's leading-byte set, kept ONLY for a
+    /// `leading_line_anchor` pattern (`(?m)^body$`, body needs ≥1 byte). A
+    /// match at a line start `s` requires `input[s] ∈ line_first`, so the line
+    /// scan rejects non-matching lines with a single byte test before paying a
+    /// full `matchAt` — the dominant per-line cost. Distinct from
+    /// `first_byte_set` (which is `null` for look patterns so the literal/
+    /// prefilter planner skips them); this one feeds only the line scan.
+    line_first: ?[32]u8 = null,
 };
 
 fn containsLook(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) bool {
@@ -88,6 +96,92 @@ fn leadingLineAnchor(comptime cap: ?usize, h: *const hir.Hir(cap)) bool {
     const f = firstFactor(cap, h, h.root) orelse return false;
     const nd = h.node(f);
     return nd.tag == .look and nd.set_idx == @intFromEnum(hir.LookKind.start_line);
+}
+
+/// Shape result for a line-anchored regular pattern (`(?m)^body$` or
+/// `(?m)^body`): the body is regular (no backref/lookaround/atomic), contains
+/// no other look than the leading `^`/optional trailing `$`, and matches no
+/// `\n`. Such a pattern is matched by a *single DFA per line* — enumerate line
+/// starts (`\n` memchr), run the looks-stripped body DFA from each, and (for
+/// `$`) accept when the longest body end lands on the line terminator. Because
+/// the body is `\n`-free, the determinized DFA's longest accept never crosses
+/// the line, so this is sound even with alternation (unlike `edge_look`).
+pub const LineShape = struct { has_dollar: bool };
+
+fn setHasNewline(comptime cap: ?usize, h: *const hir.Hir(cap), set_idx: u32) bool {
+    const bm = h.setBitmap(set_idx);
+    return (bm['\n' >> 3] & (@as(u8, 1) << (@as(u3, @intCast('\n' & 7))))) != 0;
+}
+
+const LineWalk = struct { n_start: usize = 0, n_end: usize = 0, prio: bool = false };
+
+/// Walk the whole HIR: allow only regular nodes plus `start_line`/`end_line`
+/// looks (counted), rejecting any other look, backref, lookaround, atomic, or a
+/// set that can match `\n`. Returns false on any disallowed node. `prio` records
+/// whether the body contains an alternation or a lazy quantifier — constructs
+/// where a shorter, higher-priority accept can shadow a longer one (see
+/// `lineAnchoredRegular`).
+fn walkLineBody(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, w: *LineWalk) bool {
+    const nd = h.node(ref);
+    return switch (nd.tag) {
+        .backref, .look_around, .atomic => false,
+        .look => blk: {
+            if (nd.set_idx == @intFromEnum(hir.LookKind.start_line)) {
+                w.n_start += 1;
+                break :blk true;
+            }
+            if (nd.set_idx == @intFromEnum(hir.LookKind.end_line)) {
+                w.n_end += 1;
+                break :blk true;
+            }
+            break :blk false; // \b \A \z \B … not line-anchored ⇒ keep on NFA
+        },
+        .set => !setHasNewline(cap, h, nd.set_idx),
+        .empty => true,
+        .star, .plus, .opt => {
+            if (!nd.greedy) w.prio = true; // lazy quantifier
+            return walkLineBody(cap, h, nd.a, w);
+        },
+        .cap => walkLineBody(cap, h, nd.a, w),
+        .alt => {
+            w.prio = true;
+            return walkLineBody(cap, h, nd.a, w) and walkLineBody(cap, h, nd.b, w);
+        },
+        .concat => walkLineBody(cap, h, nd.a, w) and walkLineBody(cap, h, nd.b, w),
+    };
+}
+
+/// Recognize `(?m)^body$` / `(?m)^body` with a regular, `\n`-free body whose
+/// ONLY looks are the leading `^` (exactly one, leftmost — `leadingLineAnchor`)
+/// and an optional trailing `$` (at most one, the last factor). `null` ⇒ not
+/// this shape (caller keeps the NFA line scan). Generic over `cap`.
+pub fn lineAnchoredRegular(comptime cap: ?usize, h: *const hir.Hir(cap)) ?LineShape {
+    if (h.root == hir.none) return null;
+    if (!leadingLineAnchor(cap, h)) return null;
+    var w: LineWalk = .{};
+    if (!walkLineBody(cap, h, h.root, &w)) return null;
+    if (w.n_start != 1 or w.n_end > 1) return null; // exactly the leading ^, ≤1 trailing $
+    var has_dollar = false;
+    if (w.n_end == 1) {
+        // The single end_line must be the trailing factor (left-leaning concat
+        // ⇒ root.b is the last factor); otherwise it is a mid-pattern `$` that
+        // the per-line scan would not enforce.
+        const root = h.node(h.root);
+        if (root.tag != .concat) return null;
+        const last = h.node(root.b);
+        if (!(last.tag == .look and last.set_idx == @intFromEnum(hir.LookKind.end_line))) return null;
+        has_dollar = true;
+    }
+    // SOUNDNESS: the body DFA is the leftmost-first (priority-cut) DFA, so its
+    // longest accept is the highest-priority match, NOT necessarily the longest
+    // in the language. With `$`, an alternation/lazy body can have a shorter,
+    // higher-priority accept that fails the line-end check while a longer one
+    // would pass (e.g. `(?m)^(?:a|aa)$` on "aa", or `(?m)^(?:\d{9}[\dXx]|\d{13})$`
+    // on a 13-digit line). Such bodies must stay on the backtracker. (Without
+    // `$` the priority-cut longest accept IS the leftmost-first result, so alt/
+    // lazy are fine there — this mirrors why `edge_look` rejects `.alt`.)
+    if (has_dollar and w.prio) return null;
+    return .{ .has_dollar = has_dollar };
 }
 
 fn containsCap(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) bool {
@@ -268,6 +362,10 @@ pub fn analyze(comptime cap: ?usize, h: *const hir.Hir(cap)) Properties {
         // Look-bearing patterns route to the bounded backtracker; the
         // literal/prefilter strategies (and their Seqs) don't apply.
         p.leading_line_anchor = leadingLineAnchor(cap, h);
+        // For `(?m)^body$` keep the body's leading-byte set (computed above
+        // into `first_byte_set`, valid since `start_line` is zero-width so
+        // `firstBytes` falls through to the body) as a per-line reject filter.
+        if (p.leading_line_anchor) p.line_first = p.first_byte_set;
         p.first_byte_set = null;
         return p;
     }

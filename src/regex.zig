@@ -23,6 +23,8 @@ const parser = @import("parser.zig");
 const thompson = @import("thompson.zig");
 const full_dfa = @import("exec/full_dfa.zig");
 const core = @import("exec/core.zig");
+const cc = @import("exec/charclass.zig");
+const line_dfa_mod = @import("exec/line_dfa.zig");
 const planner = @import("planner.zig");
 const properties = @import("properties.zig");
 const prefilter = @import("prefilter.zig");
@@ -183,6 +185,18 @@ pub const Regex = struct {
     /// line-start-enumeration fast path (`btLookLineScan`) — a `\n` memchr
     /// instead of trying every byte position.
     bt_line_anchor: bool = false,
+    /// `.bt_look` + `bt_line_anchor` only: the body's leading-byte set, used to
+    /// reject a line start with one byte test before the full `matchAt` (see
+    /// `properties.line_first`). `null` ⇒ no filter (nullable body).
+    bt_line_first: ?[32]u8 = null,
+    /// `.bt_look` + `bt_line_anchor` only: a looks-stripped DFA for the regular
+    /// `\n`-free body of `(?m)^body$` / `(?m)^body` (no captures). When set, the
+    /// line scan runs ONE DFA pass per line (`matchEndFrom`) instead of the NFA
+    /// `matchAt` — the dominant per-line cost. `$` is verified by the longest
+    /// body end landing on a line terminator (sound: a `\n`-free body's longest
+    /// accept never crosses the line). See `properties.lineAnchoredRegular`.
+    line_dfa: ?*full_dfa.Dfa256 = null,
+    line_has_dollar: bool = false,
     /// Capture metadata (set when the pattern has groups). `nfa` doubles as
     /// the capture engine's automaton. `gnames[g]` is group g's `(?<name>)`
     /// name (aliases `pattern`), or null.
@@ -583,6 +597,23 @@ pub const Regex = struct {
             const bt_pool = try allocator.create(cache_mod.Pool(bounded_bt.BtScratch));
             errdefer allocator.destroy(bt_pool);
             bt_pool.* = cache_mod.Pool(bounded_bt.BtScratch).init(allocator);
+            // Line-anchored regular fast path: `(?m)^body$` with a regular,
+            // `\n`-free body matches each line with a single looks-stripped DFA
+            // pass instead of the per-line NFA `matchAt`. Captures are fine —
+            // the DFA locates the whole-match span (span-only models read it
+            // directly; the one-pass capture path fills group slots over that
+            // span via `onepass.fill`), so no `ng==0` restriction is needed.
+            var line_dfa: ?*full_dfa.Dfa256 = null;
+            var line_has_dollar = false;
+            errdefer if (line_dfa) |p| allocator.destroy(p);
+            if (props.leading_line_anchor) {
+                if (properties.lineAnchoredRegular(null, &h)) |shape| {
+                    if (buildLineDfa(allocator, &h)) |d| {
+                        line_dfa = d;
+                        line_has_dollar = shape.has_dollar;
+                    }
+                }
+            }
             return Regex{
                 .allocator = allocator,
                 .pattern = owned,
@@ -592,6 +623,9 @@ pub const Regex = struct {
                 .bt_a_start = h.anchored_start,
                 .bt_a_end = h.anchored_end,
                 .bt_line_anchor = props.leading_line_anchor,
+                .bt_line_first = props.line_first,
+                .line_dfa = line_dfa,
+                .line_has_dollar = line_has_dollar,
                 .n_groups = ng,
                 .gnames = gnames,
                 .bt_pool = bt_pool,
@@ -794,6 +828,7 @@ pub const Regex = struct {
     pub fn deinit(self: *Regex) void {
         self.allocator.free(self.pattern);
         if (self.dfa) |p| self.allocator.destroy(p);
+        if (self.line_dfa) |p| self.allocator.destroy(p);
         if (self.nfa) |p| self.allocator.destroy(p);
         if (self.bt_hir) |p| {
             p.deinit(self.allocator);
@@ -849,14 +884,42 @@ pub const Regex = struct {
     /// This is what turns multiline `^…$` from O(n) start attempts into one
     /// `\n` memchr pass plus a match per matching line.
     fn btLookLineScan(self: *const Regex, input: []const u8, from: usize) !?core.Span {
+        // Fast path FIRST: the line-DFA scan needs none of the NFA scratch, so
+        // take it before paying the O(n) `(state,pos)` bitset `ensure` below.
+        if (self.line_dfa) |dfa| return self.lineDfaScan(dfa, input, from);
         const pool = self.bt_pool.?;
         const sc = try pool.get();
         defer pool.put(sc);
         const n_pos1 = input.len + 1;
         try sc.ensure((self.nfa.?.n_states * n_pos1 + 63) / 64);
         var bt = bounded_bt.BoundedBt.initWith(self.nfa.?, self.bt_a_start, self.bt_a_end, sc, n_pos1);
-        const s = (try bt.findLineStart(input, from)) orelse return null;
+        const s = (try bt.findLineStart(input, from, if (self.bt_line_first) |*set| set else null)) orelse return null;
         return core.Span{ .start = s.start, .end = s.end };
+    }
+
+    /// Line-anchored regular fast path (`line_dfa` set): the shared
+    /// `line_dfa.nextFrom` walker (also used by the comptime `Pattern`) runs one
+    /// looks-stripped body-DFA pass per line over the FULL input (absolute
+    /// coords). See `exec/line_dfa.zig` for the soundness argument.
+    fn lineDfaScan(self: *const Regex, dfa: *const full_dfa.Dfa256, input: []const u8, from: usize) ?core.Span {
+        return line_dfa_mod.nextFrom(dfa, self.line_has_dollar, if (self.bt_line_first) |*set| set else null, input, from);
+    }
+
+    /// Build the looks-stripped body DFA for a `lineAnchoredRegular` pattern:
+    /// clone the HIR relaxing every look to `ε` (the body, since the only looks
+    /// are the line anchors handled by the scan), Thompson-build, and
+    /// determinize. `null` on any build/ceiling failure ⇒ caller keeps the NFA
+    /// line scan. The DFA is unanchored (`runFrom` anchors at each line start).
+    fn buildLineDfa(allocator: std.mem.Allocator, h: *const hir.Hir(null)) ?*full_dfa.Dfa256 {
+        var oh = hir.Hir(null).initRuntime();
+        defer oh.deinit(allocator);
+        oh.root = hir.cloneSubtree(null, null, &oh, allocator, h, h.root, true) catch return null;
+        var nfa = thompson.build(null, &oh) catch return null;
+        const d = full_dfa.compute(null, &nfa, false, false);
+        if (d.outcome != .ok) return null;
+        const heap = allocator.create(full_dfa.Dfa256) catch return null;
+        heap.* = d;
+        return heap;
     }
 
     /// `.backtrack` leftmost span (backref/lookaround tree backtracker). The
@@ -1005,6 +1068,26 @@ pub const Regex = struct {
             // always-correct fallback if the pattern is not truly one-pass
             // (the deterministic walk bails ⇒ `fill` returns false).
             done: {
+                // Line-anchored capture pattern: the line-DFA (via
+                // `nextSpanFrom`) locates the whole-match span fast — skipping
+                // non-matching lines — then capture slots are reconstructed
+                // with the bounded backtracker over JUST that line span (scratch
+                // sized to one line, not the whole input — the latter is what
+                // makes the generic fallback O(n) per match). The span is a line
+                // (a line start `s` and `$`/EOF end), so both-anchoring the
+                // backtracker on the slice reproduces the same leftmost-first
+                // captures. `nextSpanFrom` is exact ⇒ no span ahead ⇒ no match.
+                if (self.line_dfa != null) {
+                    const sp = (try self.nextSpanFrom(input, pos)) orelse return null; // absolute
+                    var bt = try bounded_bt.BoundedBt.init(allocator, self.nfa.?, true, true, sp.end - sp.start);
+                    defer bt.deinit();
+                    _ = (try bt.captures(input[sp.start..sp.end], slots[0..nslots])) orelse return null;
+                    shiftSlots(slots[0..nslots], sp.start);
+                    slots[0] = @intCast(sp.start);
+                    slots[1] = @intCast(sp.end);
+                    span = sp;
+                    break :done;
+                }
                 if (self.op_onepass) {
                     const sp = (try self.nextSpanFrom(input, pos)) orelse return null; // absolute
                     @memset(slots[0..nslots], -1);

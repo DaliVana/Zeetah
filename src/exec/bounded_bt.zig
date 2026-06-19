@@ -250,7 +250,7 @@ pub const BoundedBt = struct {
     /// haystack (absolute coordinates) so `lookHolds(.start_line)` sees the true
     /// preceding byte; the result span is absolute. Line starts ascend, so the
     /// first hit is the leftmost match.
-    pub fn findLineStart(self: *BoundedBt, input: []const u8, from: usize) std.mem.Allocator.Error!?Span {
+    pub fn findLineStart(self: *BoundedBt, input: []const u8, from: usize, first: ?*const [32]u8) std.mem.Allocator.Error!?Span {
         var s = from;
         // Advance `from` to the first line start at/after it.
         if (!(s == 0 or (s <= input.len and s > 0 and input[s - 1] == '\n'))) {
@@ -258,7 +258,17 @@ pub const BoundedBt = struct {
             s = nl + 1;
         }
         while (s <= input.len) {
-            if (try self.matchAt(input, s)) |e| return .{ .start = s, .end = e };
+            // First-byte reject: a non-nullable body can only begin on a member
+            // of `first`, so skip whole lines with one byte test instead of
+            // entering the (dominant-cost) `matchAt`. `s == input.len` (trailing
+            // empty line) has no byte to test, so fall through to `matchAt`.
+            const skip = if (first) |set|
+                (s < input.len and !cc.hasBit(set, input[s]))
+            else
+                false;
+            if (!skip) {
+                if (try self.matchAt(input, s)) |e| return .{ .start = s, .end = e };
+            }
             const nl = std.mem.indexOfScalarPos(u8, input, s, '\n') orelse return null;
             s = nl + 1;
         }
@@ -391,7 +401,7 @@ test "bounded_bt: findLineStart equals per-position scan (leading line anchor)" 
             const f = try bt1.findLeftmost(in);
             var bt2 = try BoundedBt.init(a, &nfa, h.anchored_start, h.anchored_end, in.len);
             defer bt2.deinit();
-            const g = try bt2.findLineStart(in, 0);
+            const g = try bt2.findLineStart(in, 0, null);
             try std.testing.expectEqual(f == null, g == null);
             if (f) |fs| {
                 try std.testing.expectEqual(fs.start, g.?.start);

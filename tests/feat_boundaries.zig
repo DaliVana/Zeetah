@@ -89,6 +89,55 @@ test "boundary: .multiline struct flag mirrors inline (?m)" {
     try std.testing.expect(try rx.isMatch("a\nb"));
 }
 
+test "boundary: (?m)^body$ line-DFA fast path matches the NFA semantics" {
+    const a = std.testing.allocator;
+    const countM = struct {
+        fn f(al: std.mem.Allocator, pat: []const u8, in: []const u8) !usize {
+            var rx = try Regex.compileWithFlags(al, pat, .{ .multiline = true });
+            defer rx.deinit();
+            return rx.count(in);
+        }
+    }.f;
+    const sliceM = struct {
+        fn f(al: std.mem.Allocator, pat: []const u8, in: []const u8) !?[]const u8 {
+            var rx = try Regex.compileWithFlags(al, pat, .{ .multiline = true });
+            defer rx.deinit();
+            var m = try rx.find(in);
+            defer if (m) |*mm| mm.deinit(al);
+            return if (m) |mm| mm.slice else null;
+        }
+    }.f;
+    // Only whole-line matches count; a body that fills only part of a line is
+    // rejected (the `$` must land on the line terminator).
+    try std.testing.expectEqual(@as(usize, 2), try countM(a, "^\\d{3}$", "123\n12\n4567\n890\nx999"));
+    // Alternation body: sound here (determinized DFA's longest accept, not the
+    // priority cut that forces edge_look to reject `.alt`).
+    try std.testing.expectEqual(@as(usize, 3), try countM(a, "^(?:ab|cd)$", "ab\ncd\nabc\nxy\ncd"));
+    // `$` satisfied at EOF with no trailing newline.
+    try std.testing.expectEqualStrings("99", (try sliceM(a, "^\\d+$", "ab\n99")).?);
+    // Empty-line match (`^$`).
+    try std.testing.expectEqual(@as(usize, 2), try countM(a, "^$", "a\n\nb\n"));
+    // `\s` includes `\n`, so this body is NOT line-DFA-eligible (it could match
+    // across a line break) — it must fall back to the NFA and still be correct.
+    try std.testing.expectEqualStrings("a b", (try sliceM(a, "^\\w\\s\\w$", "xx\na b\ncc")).?);
+}
+
+test "boundary: (?m)^(cap)$ line-DFA locates span, captures reconstructed per line" {
+    const a = std.testing.allocator;
+    // Capture-bearing line pattern: the line-DFA finds the span fast and the
+    // groups are filled over just that line — must match the NFA semantics.
+    var rx = try Regex.compileWithFlags(a, "^(\\d{3})-(\\d{2})$", .{ .multiline = true });
+    defer rx.deinit();
+    // count (span-only) skips non-matching lines via the DFA.
+    try std.testing.expectEqual(@as(usize, 2), try rx.count("123-45\nxx\n678-90\n12-3"));
+    // captures: correct group spans on a matching line preceded by noise.
+    var m = (try rx.captures(a, "noise\n123-45\ntail")).?;
+    defer m.deinit(a);
+    try std.testing.expectEqualStrings("123-45", m.slice);
+    try std.testing.expectEqualStrings("123", m.groups[1].?.slice);
+    try std.testing.expectEqualStrings("45", m.groups[2].?.slice);
+}
+
 test "boundary: non-multiline ^ $ are text anchors; mid is zero-width" {
     const a = std.testing.allocator;
     // $ without (?m) = end of text only (the [1] 'x' before \n is skipped).

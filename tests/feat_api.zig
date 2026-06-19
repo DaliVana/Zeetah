@@ -514,9 +514,87 @@ test "comptime backtracker look-assertions: \\b / \\A\\z\\Z / (?m) anchors vs ru
     //   are covered by the anchored-DFA tests instead.)
     try btAgree("baz\\Z", "foobaz\n");
     try btAgree("baz\\Z", "foobaz");
-    //   inline (?m) line anchors (the `multiline_log` shape):
-    try seekParity("(?m)^[0-9]{4}-[0-9]{2}-[0-9]{2}.*$", "2024-01-02 hi\njunk\n2025-12-31 yo\n2026-06-01 z\n");
-    try seekParity("(?m)^#", "a\n#one\nb\n#two\n##three");
+}
+
+// `(?m)^body$` / `(?m)^body` with a regular, \n-free body now routes to the
+// comptime line-DFA fast path (`.line_dfa`, `has_dfa == true`) — one looks-
+// stripped DFA pass per line, the peer of the runtime `.bt_look` line-DFA.
+// Assert it IS DFA-backed and that comptime == runtime span-for-span.
+fn lineParity(comptime p: []const u8, in: []const u8) !void {
+    const a = std.testing.allocator;
+    const P = regex.Pattern(p, .{});
+    comptime std.debug.assert(P.has_dfa);
+    var rx = try Regex.compile(a, p);
+    defer rx.deinit();
+    try std.testing.expectEqual(try rx.count(in), P.count(in));
+    const rms = try rx.findAll(a, in);
+    defer a.free(rms);
+    const pms = try P.findAll(a, in);
+    defer a.free(pms);
+    try std.testing.expectEqual(rms.len, pms.len);
+    for (rms, pms) |r, q| {
+        try std.testing.expectEqual(r.start, q.start);
+        try std.testing.expectEqual(r.end, q.end);
+    }
+}
+
+test "comptime line-DFA (?m)^body$: DFA-backed, comptime == runtime" {
+    // DFA-eligible: no-alt greedy bodies ($-anchored and leading-only). The
+    // multiline_log shape, a leading-only `^#` (no `$`), and personnummer.
+    try lineParity("(?m)^[0-9]{4}-[0-9]{2}-[0-9]{2}.*$", "2024-01-02 hi\njunk\n2025-12-31 yo\n2026-06-01 z\n");
+    try lineParity("(?m)^#", "a\n#one\nb\n#two\n##three");
+    try lineParity("(?m)^\\d{6}-[\\dpPtTfF]\\d{3}$", "x\n123456-7890\n999999-p001\nbad\n");
+    // Alternation WITHOUT `$`: the priority-cut DFA's longest accept is the
+    // leftmost-first result, so this is sound and stays DFA-backed.
+    try lineParity("(?m)^(?:GET|POST)", "GET /a\nPOST /b\nPUT /c\nGETX\n");
+}
+
+test "comptime line-DFA soundness: alt/lazy + $ fall back (priority-cut), comptime == runtime" {
+    // `$` + alternation/lazy: the leftmost-first priority-cut DFA could return a
+    // shorter, higher-priority accept that fails `$` while a longer alt would
+    // pass. These MUST NOT use the line-DFA (`!has_dfa`) and must match the
+    // backtracker. Pins the regression fix (isbn 13-digit, `(?:a|aa)$`).
+    const a = std.testing.allocator;
+    const Cases = [_]struct { p: []const u8, in: []const u8, want: usize }{
+        .{ .p = "(?m)^(?:a|aa)$", .in = "aa\nb\na", .want = 2 },
+        .{ .p = "(?m)^(?:\\d{9}[\\dXx]|\\d{13})$", .in = "123456789X\n1234567890123\nbad", .want = 2 },
+        .{ .p = "(?m)^a{2,3}?$", .in = "aaa\naa\nb", .want = 2 },
+    };
+    inline for (Cases) |c| {
+        comptime std.debug.assert(!regex.Pattern(c.p, .{}).has_dfa); // fell back
+        var rx = try Regex.compile(a, c.p);
+        defer rx.deinit();
+        try std.testing.expectEqual(c.want, try rx.count(c.in));
+        try std.testing.expectEqual(c.want, regex.Pattern(c.p, .{}).count(c.in));
+    }
+}
+
+test "comptime line-DFA with captures: DFA-backed, slots == runtime" {
+    // `(?m)^(cap)$` now routes to the line-DFA even with groups: the DFA locates
+    // the span, the capture backtracker fills slots anchored at the line start.
+    const a = std.testing.allocator;
+    const P = regex.Pattern("(?m)^(\\d{3})-(\\d{2})$", .{});
+    comptime std.debug.assert(P.has_dfa);
+    var rx = try Regex.compile(a, "(?m)^(\\d{3})-(\\d{2})$");
+    defer rx.deinit();
+    const in = "noise\n123-45\nxx\n678-90\n12-3";
+    // span count agrees
+    try std.testing.expectEqual(try rx.count(in), P.count(in));
+    // capture slots agree, match-for-match
+    var pit = P.capturesIterator(in);
+    var pos: usize = 0;
+    while (try rx.capturesFrom(a, in, pos)) |rm| {
+        defer {
+            var m = rm;
+            m.deinit(a);
+        }
+        const pc = pit.next().?;
+        try std.testing.expectEqualStrings(rm.slice, pc.groups[0].?.slice);
+        try std.testing.expectEqualStrings(rm.groups[1].?.slice, pc.groups[1].?.slice);
+        try std.testing.expectEqualStrings(rm.groups[2].?.slice, pc.groups[2].?.slice);
+        pos = if (rm.end == rm.start) rm.end + 1 else rm.end;
+    }
+    try std.testing.expect(pit.next() == null);
 }
 
 // Capture-submatch parity on the `.backtrack` arm: the comptime **zero-alloc**

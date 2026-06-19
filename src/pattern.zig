@@ -21,6 +21,7 @@ const core = @import("exec/core.zig");
 const search = @import("exec/search.zig");
 const seq_extract = @import("exec/seq_extract.zig");
 const edge_look = @import("exec/edge_look.zig");
+const line_dfa = @import("exec/line_dfa.zig");
 const backtrack = @import("exec/backtrack.zig");
 const seek_mod = @import("exec/seek.zig");
 const class_span = @import("exec/class_span.zig");
@@ -158,7 +159,7 @@ const Outcome = enum { ok, unsupported, exploded, invalid };
 /// §6/(c) monomorphization: which planner strategy the baked matcher emits.
 /// `.literal` skips the DFA table entirely (Teddy only); the other three bake
 /// the DFA and differ only in the per-position prefilter wrapped around it.
-const Strat = enum { literal, reverse_suffix, lit_prefix, dfa, backtrack, edge_look, boundary_lits };
+const Strat = enum { literal, reverse_suffix, lit_prefix, dfa, backtrack, edge_look, boundary_lits, line_dfa };
 
 /// Search mode for the baked-DFA matcher (everything except `.literal`). A
 /// comptime constant, so the `switch (mode)` in each method folds to the one
@@ -204,6 +205,12 @@ const Built = struct {
     /// in `Pattern` (it takes precedence when present, exactly as runtime does).
     seek_dfa: full_dfa.Dfa256 = undefined,
     seek_ok: bool = false,
+    /// `.line_dfa` arm: `dfa` holds the looks-stripped body DFA of a
+    /// `(?m)^body$` / `(?m)^body` line validator. `line_has_dollar` ⇒ verify the
+    /// body end lands on the line terminator; `line_first` is the body's
+    /// non-nullable leading-byte set (per-line reject filter), `null` if none.
+    line_has_dollar: bool = false,
+    line_first: ?[32]u8 = null,
 };
 
 /// Regular OVER-APPROXIMATION DFA for the `.backtrack` seek prefilter, or
@@ -241,6 +248,22 @@ fn overApproxDfa(h: *const hir.Hir(HIR_CAP)) ?full_dfa.Dfa256 {
     if (od.start < od.n_states and od.accepting[od.start]) return null; // nullable
     // Necessary-byte memchr fast-negative (same as the runtime seek DFA).
     od.required = seq_extract.requiredByte(HIR_CAP, &oh);
+    return od;
+}
+
+/// Looks-stripped body DFA for a `lineAnchoredRegular` pattern (comptime peer of
+/// runtime `regex.buildLineDfa`): clone the HIR relaxing every look to `ε` (the
+/// only looks are the line anchors, handled by the line scan), Thompson-build,
+/// and determinize unanchored (`line_dfa.nextFrom` anchors at each line start).
+/// Unlike `overApproxDfa` there is no nullable/anchored/non-selective guard — a
+/// nullable body (`(?m)^.*$`) is a valid empty-line matcher. `null` on failure.
+fn lineDfaDfa(h: *const hir.Hir(HIR_CAP)) ?full_dfa.Dfa256 {
+    @setEvalBranchQuota(8_000_000);
+    var oh = hir.Hir(HIR_CAP).initComptime();
+    oh.root = hir.cloneSubtree(HIR_CAP, HIR_CAP, &oh, undefined, h, h.root, true) catch return null;
+    var onfa = thompson.build(HIR_CAP, &oh) catch return null;
+    const od = full_dfa.compute(HIR_CAP, &onfa, false, false);
+    if (od.outcome != .ok) return null;
     return od;
 }
 
@@ -403,6 +426,29 @@ fn buildAll(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) 
                     .bl = bl,
                 };
             }
+        }
+    }
+
+    // Line-anchored regular fast path (comptime peer of the runtime `.bt_look`
+    // line-DFA): `(?m)^body$` / `(?m)^body` with a regular, `\n`-free body
+    // matches each line with ONE looks-stripped DFA pass instead of the tree
+    // backtracker. Checked BEFORE the backtracker fallback (the `^`/`$` looks
+    // would otherwise route there via `has_look`). Captures are handled too:
+    // the DFA locates the span (skipping non-matching lines) and the baked
+    // capture backtracker fills slots anchored at that line start (see
+    // `CaptureSupport`).
+    if (properties.lineAnchoredRegular(HIR_CAP, &h)) |shape| {
+        if (lineDfaDfa(&h)) |d| {
+            return .{
+                .dfa = d,
+                .outcome = .ok,
+                .strat = .line_dfa,
+                .hir = h,
+                .n_groups = ng,
+                .gnames = gnames,
+                .line_has_dollar = shape.has_dollar,
+                .line_first = props.line_first,
+            };
         }
     }
 
@@ -685,6 +731,13 @@ fn CaptureSupport(comptime built: Built) type {
         /// `core.findLeftmost(&Dfa256, …)` it replaces (exact-fit compression).
         const cdfa = if (op_dfa_usable) compress(op_dfa) else {};
 
+        /// `.line_dfa` capture path: the looks-stripped body DFA (baked
+        /// COMPRESSED) locates each line match via `line_dfa.nextFrom`; the
+        /// capture backtracker then fills slots anchored at that line start —
+        /// `void` for other strats (then the references below are comptime-dead).
+        const line_body = if (built.strat == .line_dfa) compress(built.dfa) else {};
+        const line_first_const: ?[32]u8 = built.line_first;
+
         /// Seek prefilter for the (fallback) capture backtracker — the SAME
         /// `lb_byte` / compressed over-approximation-DFA layering the whole-match
         /// `.backtrack` arm uses (see `bt_seek`). Only consulted when the
@@ -741,6 +794,19 @@ fn CaptureSupport(comptime built: Built) type {
         pub fn capturesFrom(input: []const u8, from: usize) ?Caps {
             var slots: [2 * (hir.MAX_GROUPS + 1)]i32 = undefined;
             const nslots = 2 * (NG + 1);
+            if (comptime built.strat == .line_dfa) {
+                // Locate the whole-match span with the line-DFA (skips non-
+                // matching lines at DFA speed), then fill group slots with the
+                // capture backtracker anchored at that line start — it matches
+                // immediately there, so the cost is one tree-walk per match, not
+                // a per-position scan. Mirrors the runtime line-DFA capture path.
+                const sp = line_dfa.nextFrom(&line_body, built.line_has_dollar, if (line_first_const) |*fs| fs else null, input, from) orelse return null;
+                var bt = BT.init(&cap_h, cap_h.anchored_start, cap_h.anchored_end, NG, null, null);
+                _ = (bt.runFrom(input, sp.start, slots[0..nslots]) catch return null) orelse return null;
+                slots[0] = @intCast(sp.start);
+                slots[1] = @intCast(sp.end);
+                return slotsToCaps(input, slots[0..nslots]);
+            }
             if (comptime op_dfa_usable) {
                 // O(n) span from the baked (compressed) DFA, then a single fill.
                 const r = cdfa.findLeftmost(input[from..]) orelse return null;
@@ -1126,6 +1192,40 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             // find/count/findAll are the generic scaffold (see `WholeMatchVerbs`).
             pub fn isMatch(input: []const u8) bool {
                 return edge_look.nextFrom(&core_dfa, &spec, input, 0) != null;
+            }
+            pub const find = V.find;
+            pub const count = V.count;
+            pub const findAll = V.findAll;
+            const V = WholeMatchVerbs(nextSpanFrom);
+            pub const Iterator = V.Iterator;
+            pub const iterator = V.iterator;
+            pub const startsWith = V.startsWith;
+            pub const SplitIterator = V.SplitIterator;
+            pub const splitIterator = V.splitIterator;
+            const C = CaptureSupport(built);
+            pub const Captures = C.Caps;
+            pub const captures = C.captures;
+            pub const capturesFrom = C.capturesFrom;
+            pub const capturesAll = C.capturesAll;
+            pub const CapturesIterator = C.CapturesIterator;
+            pub const capturesIterator = C.capturesIterator;
+        };
+    }
+
+    // Line-anchored regular fast path (comptime peer of runtime `.bt_look`
+    // line-DFA): bake the looks-stripped body DFA COMPRESSED and drive the
+    // shared `line_dfa.nextFrom` — one DFA pass per line, no tree backtracker.
+    if (built.strat == .line_dfa) {
+        const body_dfa = compress(built.dfa);
+        const has_dollar = built.line_has_dollar;
+        const first_const: ?[32]u8 = built.line_first;
+        return struct {
+            pub const has_dfa = true;
+            pub fn nextSpanFrom(input: []const u8, from: usize) ?search.Span {
+                return line_dfa.nextFrom(&body_dfa, has_dollar, if (first_const) |*fs| fs else null, input, from);
+            }
+            pub fn isMatch(input: []const u8) bool {
+                return line_dfa.nextFrom(&body_dfa, has_dollar, if (first_const) |*fs| fs else null, input, 0) != null;
             }
             pub const find = V.find;
             pub const count = V.count;
