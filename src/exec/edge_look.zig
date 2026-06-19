@@ -101,7 +101,12 @@ pub fn recognize(comptime cap: ?usize, h: *const hir.Hir(cap)) ?Recognized {
 /// the core DFA (skipping bytes that cannot begin a core match), and at each
 /// start returns the longest end where the trailing look holds. Linear in the
 /// scanned span per start — no backtracking, so no catastrophic blow-up.
-pub fn nextFrom(dfa: *const full_dfa.Dfa256, spec: *const Spec, input: []const u8, from: usize) ?Span {
+/// `dfa` is `anytype` so this single walker drives both the runtime
+/// `full_dfa.Dfa256` and the comptime-baked compressed `comptime_dfa.Dfa(ns,nk)`
+/// (the comptime path bakes the core as the compact `[ns][nk]` table, not a
+/// 131 KB `Dfa256`). Both expose `start`/`accepting`/`class_of`/`start_byte_set`/
+/// `required` and the `step(state, cls)` table accessor used below.
+pub fn nextFrom(dfa: anytype, spec: *const Spec, input: []const u8, from: usize) ?Span {
     // Whole-input fast negative: a byte every core match must consume that is
     // absent ⇒ no match anywhere.
     if (dfa.required) |rb| {
@@ -119,7 +124,7 @@ pub fn nextFrom(dfa: *const full_dfa.Dfa256, spec: *const Spec, input: []const u
         var i: usize = s;
         while (i < input.len) : (i += 1) {
             const cls = dfa.class_of[input[i]];
-            state = dfa.trans[state][cls];
+            state = dfa.step(state, cls);
             if (state == 0) break; // DEAD sink
             if (dfa.accepting[state] and holds(spec, input, i + 1)) best = i + 1;
         }

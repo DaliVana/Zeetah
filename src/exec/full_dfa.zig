@@ -76,6 +76,14 @@ pub const Dfa256 = struct {
     /// `isMatch`, which previously inlined a file-private `runFrom`. Forcing
     /// inline keeps the cross-file method call zero-cost (no throughput
     /// regression on the DFA hot path).
+    /// Next state from `state` on byte-class `cls`. The table-access primitive
+    /// shared with the comptime `comptime_dfa.Dfa` (whose field is named
+    /// `transitions`, not `trans`) so generic walkers — e.g. `edge_look.nextFrom`
+    /// — drive either representation uniformly.
+    pub inline fn step(self: *const Dfa256, state: u16, cls: u8) u16 {
+        return self.trans[state][cls];
+    }
+
     pub inline fn runFrom(self: *const Dfa256, input: []const u8, start_pos: usize) ?usize {
         var state: u16 = @intCast(self.start);
         var last_accept: ?usize = if (self.accepting[state]) start_pos else null;

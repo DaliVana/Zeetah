@@ -97,23 +97,55 @@ inline fn copyReg(dst: *H, a: std.mem.Allocator, src: *const H, ref: NodeRef) hi
     return hir.cloneSubtree(null, null, dst, a, src, ref, false);
 }
 
+/// Type-erased "match this island anchored from `pos`, return its
+/// greedy-maximal end" function. The pointer is the island's compiled DFA
+/// (a runtime heap `full_dfa.Dfa256`, or a comptime-baked compressed
+/// `comptime_dfa.Dfa(ns,nk)`); the function knows the concrete type. Erasure
+/// lets a single `Plan` hold islands of heterogeneous compressed types — the
+/// comptime path bakes each island as its own minimized `[ns][nk]` table
+/// (a few hundred `.rodata` bytes) instead of a full 131 KB `Dfa256`.
+pub const MatchFn = *const fn (*const anyopaque, []const u8, usize) ?usize;
+
+/// An island handle: its DFA pointer + monomorphized matcher. `matchEnd`
+/// returns the anchored leftmost-longest end at `pos`, or null.
+pub const Island = struct {
+    ptr: *const anyopaque,
+    match_fn: MatchFn,
+    pub inline fn matchEnd(self: Island, input: []const u8, pos: usize) ?usize {
+        return self.match_fn(self.ptr, input, pos);
+    }
+};
+
+/// Runtime island matcher: the erased pointer is a heap `full_dfa.Dfa256`.
+fn dfa256MatchEnd(p: *const anyopaque, input: []const u8, pos: usize) ?usize {
+    const d: *const full_dfa.Dfa256 = @ptrCast(@alignCast(p));
+    return d.runFrom(input, pos);
+}
+
 pub const Plan = struct {
     allocator: std.mem.Allocator,
     refs: [MAX_ISLANDS]NodeRef = [_]NodeRef{hir.none} ** MAX_ISLANDS,
-    dfas: [MAX_ISLANDS]*full_dfa.Dfa256 = undefined,
+    /// Erased island DFA pointers (`*full_dfa.Dfa256` at runtime, baked
+    /// `comptime_dfa.Dfa(ns,nk)` at comptime) + their monomorphized matchers.
+    dfas: [MAX_ISLANDS]*const anyopaque = undefined,
+    match_fns: [MAX_ISLANDS]MatchFn = undefined,
     n: usize = 0,
 
-    /// The compiled anchored DFA for island root `ref`, or null if `ref`
-    /// is not a delegated island. Linear scan over a tiny table.
-    pub fn dfaFor(self: *const Plan, ref: NodeRef) ?*const full_dfa.Dfa256 {
+    /// The island handle for HIR root `ref`, or null if `ref` is not a
+    /// delegated island. Linear scan over a tiny table.
+    pub fn dfaFor(self: *const Plan, ref: NodeRef) ?Island {
         var i: usize = 0;
-        while (i < self.n) : (i += 1) if (self.refs[i] == ref) return self.dfas[i];
+        while (i < self.n) : (i += 1) if (self.refs[i] == ref)
+            return .{ .ptr = self.dfas[i], .match_fn = self.match_fns[i] };
         return null;
     }
 
     pub fn deinit(self: *Plan) void {
         var i: usize = 0;
-        while (i < self.n) : (i += 1) self.allocator.destroy(self.dfas[i]);
+        // Runtime islands are heap `full_dfa.Dfa256` (the only builder that
+        // calls `deinit`); the comptime baked `Plan` is never `deinit`'d.
+        while (i < self.n) : (i += 1)
+            self.allocator.destroy(@as(*full_dfa.Dfa256, @constCast(@ptrCast(@alignCast(self.dfas[i])))));
         self.allocator.destroy(self);
     }
 };
@@ -146,6 +178,7 @@ pub fn build(allocator: std.mem.Allocator, h: *const H) ?*Plan {
         heap.* = d;
         pl.refs[pl.n] = nd.a;
         pl.dfas[pl.n] = heap;
+        pl.match_fns[pl.n] = dfa256MatchEnd;
         pl.n += 1;
     }
 

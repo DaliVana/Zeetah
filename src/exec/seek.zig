@@ -47,6 +47,23 @@ inline fn lowerApprox(dst: *H, a: std.mem.Allocator, src: *const H, ref: NodeRef
     return hir.cloneSubtree(null, null, dst, a, src, ref, true);
 }
 
+/// Type-erased compressed over-approximation DFA for the **comptime** path.
+/// The comptime `Pattern` bakes its seek DFA as a class-width
+/// `comptime_dfa.Dfa(ns,nk)` (a few hundred `.rodata` bytes) instead of a full
+/// 131 KB `Dfa256`; `ptr` points at that baked const and `locate_fn` is its
+/// monomorphized `findLeftmost`-based locator (`pattern.zig` supplies both as a
+/// pair). `locate` returns the same absolute candidate start the runtime `dfa`
+/// path would (it wraps the differential-pinned `findLeftmost`). Bundling the
+/// pointer + function in one optional encodes the both-or-neither invariant —
+/// mirrors `delegate.Island`.
+pub const Cdfa = struct {
+    ptr: *const anyopaque,
+    locate_fn: *const fn (*const anyopaque, []const u8, usize) ?usize,
+    inline fn locate(self: Cdfa, input: []const u8, from: usize) ?usize {
+        return self.locate_fn(self.ptr, input, from);
+    }
+};
+
 /// Over-approximation prefilter for the backtracker tier. Locates the next
 /// position where the regular relaxation can begin a match; the tree
 /// backtracker only runs there. Prefers the lever-A `DenseSearch` (O(n));
@@ -55,6 +72,9 @@ pub const Seek = struct {
     allocator: std.mem.Allocator,
     dense: ?*lazy_dfa.DenseSearch = null,
     dfa: ?*full_dfa.Dfa256 = null,
+    /// Comptime-path compressed over-approximation DFA (see `Cdfa`). Runtime
+    /// `build` leaves this `null` and uses `dense`/`dfa`.
+    cdfa: ?Cdfa = null,
     /// Leading positive single-byte look-behind `(?<=X)` ⇒ `X`. Every match
     /// is immediately preceded by `X`, so the only candidate starts are
     /// `{X_pos + 1}`. Strictly the most selective sound filter when present
@@ -77,6 +97,7 @@ pub const Seek = struct {
             const sp = ds.findFrom(input, from) orelse return null;
             return sp.start;
         }
+        if (self.cdfa) |c| return c.locate(input, from);
         const sp = core.findLeftmost(self.dfa.?, input[from..]) orelse return null;
         return from + sp.start;
     }

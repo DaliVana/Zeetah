@@ -12,7 +12,6 @@ const std = @import("std");
 const hir = @import("../hir.zig");
 const full_dfa = @import("full_dfa.zig");
 const seek_mod = @import("seek.zig");
-const core = @import("core.zig");
 const delegate = @import("delegate.zig");
 const cc = @import("charclass.zig");
 
@@ -152,8 +151,8 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
                     // tree-walk; if the continuation fails we fall through to the
                     // exact original `m(nd.a,…)` recursion (full enumeration).
                     if (self.del) |pl| {
-                        if (pl.dfaFor(nd.a)) |d| {
-                            if (core.matchEndFrom(d, self.input, pos)) |e| {
+                        if (pl.dfaFor(nd.a)) |isl| {
+                            if (isl.matchEnd(self.input, pos)) |e| {
                                 if (try self.cont(e, &k2)) return true;
                             }
                             return self.m(nd.a, pos, &k2);

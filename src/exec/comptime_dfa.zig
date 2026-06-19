@@ -124,6 +124,14 @@ pub fn Dfa(comptime n_states: usize, comptime n_classes: usize) type {
             return self.accepting[s];
         }
 
+        /// Next state from `state` on byte-class `cls`. Mirrors
+        /// `full_dfa.Dfa256.step` (whose table field is `trans`) so generic
+        /// walkers — e.g. `edge_look.nextFrom` — drive either representation
+        /// uniformly. Widens the (possibly `u8`) cell to `u16`.
+        pub inline fn step(self: *const Self, state: u16, cls: u8) u16 {
+            return self.transitions[state][cls];
+        }
+
         /// Anchored run from `start_pos`: walk the table consuming input until
         /// the DEAD state or end of input, tracking the last accepting
         /// position reached. Because the lower-priority threads were already

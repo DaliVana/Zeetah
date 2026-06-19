@@ -31,6 +31,95 @@ const Captures = @import("match.zig").Captures;
 const wholeMatch = @import("match.zig").wholeMatch;
 const advanceEmpty = @import("match.zig").advanceEmpty;
 
+/// A comptime-known placeholder `Allocator` for the seek/delegate `Plan` fields
+/// on the **comptime** path. Those plans bake their DFAs into `.rodata` and
+/// never allocate (no `deinit`, no `realloc`, no `locate` path touches the
+/// allocator), so the field only needs a well-typed value. Crucially — unlike
+/// `std.heap.page_allocator` — this references no OS page-size machinery, so the
+/// comptime `Pattern` compiles for **freestanding / bare-metal** targets. On
+/// e.g. `thumb-freestanding` (no `page_size_min`), naming `page_allocator` here
+/// is a hard `@compileError`, which previously made every seek/delegate-using
+/// pattern (`\w+`, atomic groups, required-literal patterns) fail to build for
+/// embedded. `alloc` returns null and resize/remap/free are no-ops; if the
+/// comptime path ever did allocate through this, it would fail safe rather than
+/// touch the OS.
+const placeholder_allocator: std.mem.Allocator = .{
+    .ptr = undefined,
+    .vtable = &.{
+        .alloc = struct {
+            fn f(_: *anyopaque, _: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
+                return null;
+            }
+        }.f,
+        .resize = std.mem.Allocator.noResize,
+        .remap = std.mem.Allocator.noRemap,
+        .free = std.mem.Allocator.noFree,
+    },
+};
+
+/// The compact, class-width comptime DFA type for a given `full_dfa.Dfa256`
+/// value: `comptime_dfa.Dfa(ns, nk)`, whose table is `[ns][⌈nk⌉₂]` `u8`/`u16`
+/// cells (see `comptime_dfa.zig`) — not the fixed `[256][256]u16` (~131 KB) of
+/// `Dfa256`. `m` is a comptime value, so reading it here costs no `.rodata`.
+fn Compressed(comptime m: full_dfa.Dfa256) type {
+    return comptime_dfa.Dfa(m.n_states, m.n_classes);
+}
+
+/// Compress a comptime `full_dfa.Dfa256` into its `Compressed(m)` form for
+/// baking into `.rodata`. Used for the seek and delegate prefilter DFAs on the
+/// comptime path: each would otherwise bake a full 131 KB `Dfa256` (the
+/// dominant flash cost for backtracker-tier patterns — atomic groups, look-
+/// around, back-references — on embedded targets). The main matcher table bakes
+/// the same shape inline in the `use_dfa` arm below. Field-for-field identical
+/// to that inline bake; the padding columns `[nk..Stride)` are filled with
+/// `DEAD` so the baked `.rodata` is fully initialized.
+/// Exact-fit compression: bake `m` into `comptime_dfa.Dfa(m.n_states,
+/// m.n_classes)`. The single source of truth for turning a `full_dfa.Dfa256`
+/// into a baked comptime table — used for the main matcher DFA and (via
+/// `compressTo`) the seek / edge-look prefilter DFAs. Thin wrapper over
+/// `compressTo` so all bake sites share ONE field-mapping implementation.
+fn compress(comptime m: full_dfa.Dfa256) Compressed(m) {
+    return compressTo(Compressed(m), m);
+}
+
+/// Like `compress`, but into a CALLER-CHOSEN (possibly larger) target type
+/// `T = comptime_dfa.Dfa(NS, NK)` with `NS ≥ m.n_states`, `NK ≥ m.n_classes`.
+/// Used for delegate islands: a `Pattern` may have several islands of differing
+/// minimized dimensions, so they are all baked into one homogeneous `[N]T`
+/// array sized to the per-pattern max — letting a single `delegate.Plan` /
+/// matcher serve them all while still costing `[NS][NK]` `.rodata` instead of
+/// a 131 KB `Dfa256` each. Surplus states/classes are filled with `DEAD` (never
+/// reached: each island's own `class_of` emits only its `0..n_classes`, and its
+/// live states are `0..n_states`). This is the ONE place the `Dfa256`→baked
+/// field mapping lives; the decompressors (`comptime_dfa.Dfa.runFrom` /
+/// `findLeftmost` / `step`) read those fields back identically.
+fn compressTo(comptime T: type, comptime m: full_dfa.Dfa256) T {
+    @setEvalBranchQuota(4_000_000);
+    var t: T = undefined;
+    t.class_of = m.class_of;
+    t.start = @intCast(m.start);
+    t.anchored_start = m.a_start;
+    t.anchored_end = m.a_end;
+    var i: usize = 0;
+    while (i < T.NumStates) : (i += 1) {
+        t.accepting[i] = i < m.n_states and m.accepting[i];
+        var k: usize = 0;
+        while (k < T.Stride) : (k += 1) {
+            t.transitions[i][k] = if (i < m.n_states and k < m.n_classes)
+                @intCast(m.trans[i][k])
+            else
+                comptime_dfa.DEAD;
+        }
+    }
+    t.start_bytes = m.start_bytes;
+    t.n_start_bytes = m.n_start_bytes;
+    t.start_byte_set = m.start_byte_set;
+    t.start_pf = pf.Prefilter.fromBitset(&m.start_byte_set);
+    t.required = m.required;
+    t.req_lit = m.req_lit;
+    return t;
+}
+
 /// Comptime build budget for the shared IR store (exceeding it routes to
 /// `Error.TooComplex` -> explosion).
 const HIR_CAP: usize = 2048;
@@ -505,15 +594,28 @@ fn CaptureSupport(comptime built: Built) type {
         const dfa = op_dfa;
 
         /// Seek prefilter for the (fallback) capture backtracker — the SAME
-        /// `lb_byte` / over-approximation-`Dfa256` layering the whole-match
-        /// `.backtrack` arm uses. Only consulted when the one-pass path is
-        /// unavailable (non-regular patterns). `@constCast` is sound (read-only on
-        /// the `locate` path, never `deinit`'d — same as the whole-match seek).
-        const cap_seek_dfa = built.seek_dfa;
+        /// `lb_byte` / compressed over-approximation-DFA layering the whole-match
+        /// `.backtrack` arm uses (see `bt_seek`). Only consulted when the
+        /// one-pass path is unavailable (non-regular patterns). The DFA is baked
+        /// compressed (`compress`) and fed type-erased via `seek.Cdfa`, so it
+        /// costs `[ns][nk]` `.rodata` rather than a 131 KB `Dfa256`.
+        const cap_seek_cdfa = if (built.seek_ok) compress(built.seek_dfa) else {};
         const cap_seek: ?seek_mod.Seek = if (seq_extract.requiredLeadingLookbehindByte(NN, &baked)) |b|
-            .{ .allocator = std.heap.page_allocator, .lb_byte = b }
+            .{ .allocator = placeholder_allocator, .lb_byte = b }
         else if (built.seek_ok)
-            .{ .allocator = std.heap.page_allocator, .dfa = @constCast(&cap_seek_dfa) }
+            .{
+                .allocator = placeholder_allocator,
+                .cdfa = .{
+                    .ptr = &cap_seek_cdfa,
+                    .locate_fn = struct {
+                        fn f(p: *const anyopaque, input: []const u8, from: usize) ?usize {
+                            const d: *const @TypeOf(cap_seek_cdfa) = @ptrCast(@alignCast(p));
+                            const sp = d.findLeftmost(input[from..]) orelse return null;
+                            return from + sp.start;
+                        }
+                    }.f,
+                },
+            }
         else
             null;
         inline fn capSeekPtr() ?*const seek_mod.Seek {
@@ -704,24 +806,36 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             ///      shapes that have no leading look-behind.
             /// `null` ⇒ no usable filter, plain per-byte scan (still correct).
             ///
-            /// `allocator` is set to the page_allocator (comptime-known, no libc
-            /// dependency) only to satisfy the field; neither the `lb_byte` nor
-            /// the `dfa` `locate` path touches it, and `Seek.deinit` is never
-            /// called here. The
-            /// baked `Dfa256` lives in the struct's `.rodata`, so `&seek_dfa` is
-            /// a valid 'static pointer.
-            const seek_dfa = built.seek_dfa;
+            /// `allocator` is set to the placeholder (comptime-known, no OS /
+            /// libc dependency) only to satisfy the field; neither the `lb_byte`
+            /// nor the `cdfa` `locate` path touches it, and `Seek.deinit` is
+            /// never called here.
+            ///
+            /// The over-approximation DFA is baked **compressed** as a
+            /// `comptime_dfa.Dfa(ns,nk)` (`compress`), so its `.rodata` is the
+            /// minimized `[ns][nk]` table — not a full 131 KB `Dfa256`. It is
+            /// fed to `Seek` type-erased via `seek.Cdfa` because each pattern's
+            /// compressed type is distinct; `Cdfa.locate_fn` is that type's
+            /// monomorphized `findLeftmost`-based locator, returning the same
+            /// absolute candidate start the old `dfa`+`core.findLeftmost` path
+            /// did (the two are differential-pinned).
+            const seek_cdfa = if (built.seek_ok) compress(built.seek_dfa) else {};
             const bt_seek: ?seek_mod.Seek = if (seq_extract.requiredLeadingLookbehindByte(NN, &baked)) |b|
-                .{ .allocator = std.heap.page_allocator, .lb_byte = b }
+                .{ .allocator = placeholder_allocator, .lb_byte = b }
             else if (built.seek_ok)
-                // `Seek.dfa` is `?*full_dfa.Dfa256` (mutable, because the runtime
-                // `Seek.deinit` frees it); the baked DFA is a `.rodata` const, so
-                // `&seek_dfa` is `*const`. `@constCast` is sound HERE: the `dfa`
-                // `locate` path only ever passes it to `core.findLeftmost`
-                // (`*const`, read-only), and this comptime `Seek` is never
-                // `deinit`'d (no allocation), so the pointer is never written or
-                // freed through the mutable type.
-                .{ .allocator = std.heap.page_allocator, .dfa = @constCast(&seek_dfa) }
+                .{
+                    .allocator = placeholder_allocator,
+                    .cdfa = .{
+                        .ptr = &seek_cdfa,
+                        .locate_fn = struct {
+                            fn f(p: *const anyopaque, input: []const u8, from: usize) ?usize {
+                                const d: *const @TypeOf(seek_cdfa) = @ptrCast(@alignCast(p));
+                                const sp = d.findLeftmost(input[from..]) orelse return null;
+                                return from + sp.start;
+                            }
+                        }.f,
+                    },
+                }
             else
                 null;
             inline fn seekPtr() ?*const seek_mod.Seek {
@@ -738,19 +852,43 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             /// This is the comptime analogue of runtime `delegate.build`; the
             /// island DFAs are baked into `.rodata` (no heap `Plan`).
             ///
-            /// `del_bake` holds the baked island DFAs as a struct const ⇒ each
-            /// `&del_bake.dfas[i]` is a stable `.rodata` pointer. `del_plan` is a
-            /// `delegate.Plan` VALUE whose `dfas[i]` are `@constCast` of those
-            /// pointers — sound for the same reason as the seek DFA: the
-            /// backtracker only *reads* them (`matchEndFrom` → `runFrom`), and
-            /// this comptime `Plan` is never `deinit`'d (its `allocator` is set
-            /// only to satisfy the field). `n == 0` ⇒ no delegation, plain walk.
+            /// `del_bake` (the `Dfa256` islands) is read **only at comptime** to
+            /// produce the COMPRESSED `del_cdfas`, so the 131 KB-each `Dfa256`s
+            /// never reach `.rodata`. The islands are baked into one homogeneous
+            /// `[MAX_DELEGATE]DelIslandT` array sized to the per-pattern max
+            /// dimensions (`del_dims`), so a single `delegate.Plan` / matcher
+            /// serves them all. `del_plan.dfas[i]` are type-erased `&del_cdfas[i]`
+            /// pointers (`.rodata` consts, read-only on the `matchEnd`/`runFrom`
+            /// path; this comptime `Plan` is never `deinit`'d). `n == 0` ⇒ no
+            /// delegation, plain walk.
             const del_bake = delegateIslands(NN, &baked);
+            const del_dims = blk: {
+                var mns: usize = 1;
+                var mnk: usize = 1;
+                for (0..del_bake.n) |i| {
+                    mns = @max(mns, del_bake.dfas[i].n_states);
+                    mnk = @max(mnk, del_bake.dfas[i].n_classes);
+                }
+                break :blk .{ .ns = mns, .nk = mnk };
+            };
+            const DelIslandT = comptime_dfa.Dfa(del_dims.ns, del_dims.nk);
+            const del_cdfas: [MAX_DELEGATE]DelIslandT = blk: {
+                var arr: [MAX_DELEGATE]DelIslandT = undefined;
+                for (0..del_bake.n) |i| arr[i] = compressTo(DelIslandT, del_bake.dfas[i]);
+                break :blk arr;
+            };
+            const delIslandMatch = struct {
+                fn f(p: *const anyopaque, input: []const u8, pos: usize) ?usize {
+                    const d: *const DelIslandT = @ptrCast(@alignCast(p));
+                    return d.runFrom(input, pos);
+                }
+            }.f;
             const del_plan: delegate.Plan = blk: {
-                var p = delegate.Plan{ .allocator = std.heap.page_allocator, .n = del_bake.n };
+                var p = delegate.Plan{ .allocator = placeholder_allocator, .n = del_bake.n };
                 for (0..del_bake.n) |i| {
                     p.refs[i] = del_bake.refs[i];
-                    p.dfas[i] = @constCast(&del_bake.dfas[i]);
+                    p.dfas[i] = &del_cdfas[i];
+                    p.match_fns[i] = delIslandMatch;
                 }
                 break :blk p;
             };
@@ -836,7 +974,11 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
     // `Dfa256` + the verify spec and drive the shared `edge_look.nextFrom`.
     // Placed before the DFA-state-budget gate so the core table is baked as-is.
     if (built.strat == .edge_look) {
-        const core_dfa = built.dfa;
+        // Bake the regular core COMPRESSED (`compress`) — `edge_look.nextFrom`
+        // is generic over the DFA representation, so this costs `[ns][nk]`
+        // `.rodata` instead of a 131 KB `Dfa256` (the dominant flash cost for
+        // trailing-look patterns like `[a-z]+(?=!)`, `\w+\b`).
+        const core_dfa = compress(built.dfa);
         const spec = built.el_spec;
         return struct {
             pub const has_dfa = true;
@@ -976,35 +1118,12 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
     }
 
     if (use_dfa) {
-        const ns = m.n_states;
-        const nk = m.n_classes;
-        const T = comptime_dfa.Dfa(ns, nk);
-        const baked: T = comptime blk: {
-            var t: T = undefined;
-            t.class_of = m.class_of;
-            t.start = @intCast(m.start);
-            t.anchored_start = m.a_start;
-            t.anchored_end = m.a_end;
-            var i: usize = 0;
-            while (i < ns) : (i += 1) {
-                t.accepting[i] = m.accepting[i];
-                var k: usize = 0;
-                while (k < nk) : (k += 1) t.transitions[i][k] = @intCast(m.trans[i][k]);
-                // Padding columns `[nk..Stride)` are never indexed (`class_of`
-                // emits only `0..nk`), but must be defined so the baked `.rodata`
-                // is fully initialized rather than `undefined`.
-                while (k < T.Stride) : (k += 1) t.transitions[i][k] = comptime_dfa.DEAD;
-            }
-            t.start_bytes = m.start_bytes;
-            t.n_start_bytes = m.n_start_bytes;
-            t.start_byte_set = m.start_byte_set;
-            t.start_pf = pf.Prefilter.fromBitset(&m.start_byte_set);
-            // (a): carry the necessary-condition prefilters into the baked
-            // table so the comptime walk consults them just like the runtime.
-            t.required = m.required;
-            t.req_lit = m.req_lit;
-            break :blk t;
-        };
+        // Bake the minimized DFA into its compact `comptime_dfa.Dfa(ns,nk)`
+        // `.rodata` table via the shared `compress` (the same field mapping the
+        // seek / delegate / edge-look prefilters use), so the necessary-condition
+        // prefilters (`required`/`req_lit`) and start-byte filter ride along and
+        // the comptime walk consults them just like the runtime `Dfa256`.
+        const baked = compress(m);
         // (c): bake the planner's literal prefilter. `.reverse_suffix` uses the
         // trailing literal as a Teddy fast-negative before the forward DFA;
         // `.lit_prefix` Teddy-locates the leading literal then verifies anchored
