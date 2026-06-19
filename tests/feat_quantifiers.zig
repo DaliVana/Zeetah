@@ -16,6 +16,12 @@ fn slice(a: std.mem.Allocator, pat: []const u8, in: []const u8) !?[]const u8 {
     return null;
 }
 
+fn isMq(a: std.mem.Allocator, pat: []const u8, in: []const u8) !bool {
+    var rx = try Regex.compile(a, pat);
+    defer rx.deinit();
+    return rx.isMatch(in);
+}
+
 fn span(a: std.mem.Allocator, pat: []const u8, in: []const u8) !?struct { s: usize, e: usize } {
     var rx = try Regex.compile(a, pat);
     defer rx.deinit();
@@ -23,6 +29,37 @@ fn span(a: std.mem.Allocator, pat: []const u8, in: []const u8) !?struct { s: usi
     defer if (m) |*mm| mm.deinit(a);
     if (m) |mm| return .{ .s = mm.start, .e = mm.end };
     return null;
+}
+
+test "greedy class-run SIMD fast path (backtracker tier)" {
+    // These all carry a non-regular feature (lookaround / backref) so the
+    // whole pattern routes to the tree backtracker, where the greedy `set*` /
+    // `set+` loop is consumed by the `class_span` SIMD fast path. The asserts
+    // pin the give-back semantics that path must reproduce byte-for-byte.
+    const a = std.testing.allocator;
+
+    // `+` greedy give-back: `[a-z]+` grabs "abc", then yields one char so the
+    // trailing literal `c` can match. (`(?=.)` only forces the backtracker.)
+    try std.testing.expectEqualStrings("abc", (try slice(a, "(?=.)[a-z]+c", "abc")).?);
+    // `+` needs ≥1 member: no lowercase at start ⇒ no match.
+    try std.testing.expect(!try isMq(a, "(?=.)[a-z]+", "123"));
+    // `*` matches zero members (empty greedy run) yet the pattern still holds.
+    try std.testing.expectEqualStrings("", (try slice(a, "(?=1)[a-z]*", "123")).?);
+    // `.*` (dot is a single set) give-back to land the backref repeat.
+    try std.testing.expectEqualStrings("abab", (try slice(a, "(.+)\\1", "abab")).?);
+    try std.testing.expectEqualStrings("aa", (try slice(a, "(.+)\\1", "aaa")).?);
+    // Run that spans the 16-byte SIMD chunk boundary, then give-back: `[a-z]+`
+    // grabs all 20 'a's, fails the trailing `a`, yields one, matches at 19.
+    try std.testing.expectEqualStrings(
+        "aaaaaaaaaaaaaaaaaaaa",
+        (try slice(a, "(?=.)[a-z]+a", "aaaaaaaaaaaaaaaaaaaa1")).?,
+    );
+    // Backref repeat of a >16-byte captured run (exercises the SIMD path on
+    // both the capture's `+` and the equality of the repeated span).
+    try std.testing.expectEqualStrings(
+        "abcabcabcabcabcabcabcabcabcabc" ++ "abcabcabcabcabcabcabcabcabcabc",
+        (try slice(a, "([a-c]+)\\1", "abcabcabcabcabcabcabcabcabcabc" ++ "abcabcabcabcabcabcabcabcabcabc")).?,
+    );
 }
 
 test "greedy *: zero-or-more is maximal, matches empty" {

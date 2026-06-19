@@ -14,6 +14,7 @@ const full_dfa = @import("full_dfa.zig");
 const seek_mod = @import("seek.zig");
 const delegate = @import("delegate.zig");
 const cc = @import("charclass.zig");
+const class_span = @import("class_span.zig");
 
 const NodeRef = hir.NodeRef;
 
@@ -173,10 +174,15 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
                     return self.m(nd.a, pos, k);
                 },
                 .star => {
+                    // SIMD fast path: greedy repetition of a single byte class.
+                    if (nd.greedy and self.h.node(nd.a).tag == .set)
+                        return self.greedySetRun(nd.a, pos, k, 0);
                     const lp: Cont = .{ .loop = .{ .ref = nd.a, .next = k, .greedy = nd.greedy, .loop_from = pos } };
                     return self.loopStep(pos, &lp);
                 },
                 .plus => {
+                    if (nd.greedy and self.h.node(nd.a).tag == .set)
+                        return self.greedySetRun(nd.a, pos, k, 1);
                     const lp: Cont = .{ .loop = .{ .ref = nd.a, .next = k, .greedy = nd.greedy, .loop_from = pos } };
                     return self.m(nd.a, pos, &lp);
                 },
@@ -237,6 +243,37 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
                     return false;
                 },
             }
+        }
+
+        /// SIMD fast path for a **greedy** repetition whose body is a single
+        /// byte class (`[a-z]+`, `.*`, `\w*`, the `.*` inside `(?=.*X)`, …).
+        /// Instead of one recursive `m`/`cont`/`loopStep` frame per byte (a
+        /// scalar `hasBit` each), consume the maximal class run with one
+        /// vectorized scan (`class_span.Ranges.runEnd`, NEON `cmhs`+`uminv`),
+        /// then backtrack by trying the post-loop continuation at decreasing
+        /// end positions — byte-identical to the recursive greedy order
+        /// (longest first, giving back one byte at a time down to the minimum)
+        /// but O(1) stack depth and full-rate run consumption. `min` is 0 for
+        /// `*`, 1 for `+`. Classes needing >16 ranges (`fromBitmap` ⇒ null)
+        /// fall back to the exact recursive loop. Caller guarantees
+        /// `greedy and body.tag == .set`.
+        fn greedySetRun(self: *Self, body: NodeRef, pos: usize, k: *const Cont, min: usize) Error!bool {
+            const bm = self.h.setBitmap(self.h.node(body).set_idx);
+            const r = class_span.Ranges.fromBitmap(bm) orelse {
+                // Rare wide class: preserve the exact recursive semantics.
+                const lp: Cont = .{ .loop = .{ .ref = body, .next = k, .greedy = true, .loop_from = pos } };
+                return if (min == 0) self.loopStep(pos, &lp) else self.m(body, pos, &lp);
+            };
+            const e = r.runEnd(self.input, pos); // SIMD: maximal greedy extent
+            if (e - pos < min) return false; // `+` needs ≥1 member
+            // Greedy give-back: try the continuation at e, e-1, …, pos+min.
+            var p = e;
+            while (true) : (p -= 1) {
+                try self.tick();
+                if (try self.cont(p, k)) return true;
+                if (p == pos + min) break;
+            }
+            return false;
         }
 
         fn loopStep(self: *Self, pos: usize, lp: *const Cont) Error!bool {
