@@ -119,12 +119,41 @@ const Step = union(enum) { matched, fail, consume: u16 };
 /// `span.end` (a mis-gated non-one-pass pattern, an ε-cycle, or a look edge):
 /// the caller then falls back to `bounded_bt`, which is always correct. So
 /// this is a pure speed path — never a correctness risk.
+/// Per-state out-edge index (CSR). `order[off[s]..off[s+1]]` are the edge ids
+/// leaving state `s`, in original (priority) order. Lets `epsWalk` iterate a
+/// state's own out-edges instead of rescanning all `n_edges` at every visit —
+/// the dominant cost on capture-heavy patterns (`log_parse` count-captures).
+const EdgeIndex = struct {
+    off: [MAX_NFA + 1]u16 = [_]u16{0} ** (MAX_NFA + 1),
+    order: [thompson.MAX_EDGES]u16 = undefined,
+
+    fn build(comptime cap: ?usize, nfa: *const thompson.Nfa(cap)) EdgeIndex {
+        var idx: EdgeIndex = .{};
+        // Counting sort of edge ids by from-state (stable ⇒ priority preserved).
+        var ei: usize = 0;
+        while (ei < nfa.n_edges) : (ei += 1) idx.off[nfa.e_from[ei] + 1] += 1;
+        var s: usize = 0;
+        while (s < nfa.n_states) : (s += 1) idx.off[s + 1] += idx.off[s]; // prefix sum
+        var next: [MAX_NFA]u16 = undefined;
+        s = 0;
+        while (s < nfa.n_states) : (s += 1) next[s] = idx.off[s];
+        ei = 0;
+        while (ei < nfa.n_edges) : (ei += 1) {
+            const f = nfa.e_from[ei];
+            idx.order[next[f]] = @intCast(ei);
+            next[f] += 1;
+        }
+        return idx;
+    }
+};
+
 pub fn fill(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), input: []const u8, span: Span, slots: []i32) bool {
+    const idx = EdgeIndex.build(cap, nfa);
     var st: u16 = @intCast(nfa.start);
     var pos: usize = span.start;
     while (true) {
         var seen = [_]bool{false} ** MAX_NFA;
-        switch (epsWalk(cap, nfa, input, pos, span.end, slots, &seen, st)) {
+        switch (epsWalk(cap, nfa, input, pos, span.end, slots, &seen, st, &idx)) {
             .matched => return true,
             .fail => return false,
             .consume => |nx| {
@@ -144,14 +173,15 @@ fn epsWalk(
     slots: []i32,
     seen: *[MAX_NFA]bool,
     st: u16,
+    idx: *const EdgeIndex,
 ) Step {
     if (seen[st]) return .fail; // ε-revisit ⇒ not a one-pass tree ⇒ fall back
     seen[st] = true;
     if (st == @as(u16, @intCast(nfa.accept)) and pos == end) return .matched;
 
-    var ei: usize = 0;
-    while (ei < nfa.n_edges) : (ei += 1) {
-        if (nfa.e_from[ei] != st) continue;
+    var k: usize = idx.off[st];
+    while (k < idx.off[st + 1]) : (k += 1) {
+        const ei: usize = idx.order[k];
         switch (nfa.e_kind[ei]) {
             0 => {
                 const slot = nfa.e_slot[ei];
@@ -160,7 +190,7 @@ fn epsWalk(
                     old = slots[@intCast(slot)];
                     slots[@intCast(slot)] = @intCast(pos);
                 }
-                const r = epsWalk(cap, nfa, input, pos, end, slots, seen, nfa.e_to[ei]);
+                const r = epsWalk(cap, nfa, input, pos, end, slots, seen, nfa.e_to[ei], idx);
                 if (r != .fail) return r; // chosen path: keep the saves
                 if (slot >= 0) slots[@intCast(slot)] = old; // dead branch: undo
             },
