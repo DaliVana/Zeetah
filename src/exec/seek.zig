@@ -37,6 +37,7 @@ const lazy_dfa = @import("lazy_dfa.zig");
 const core = @import("core.zig");
 const seq_extract = @import("seq_extract.zig");
 const properties = @import("../properties.zig");
+const class_span = @import("class_span.zig");
 
 const H = hir.Hir(null);
 const NodeRef = hir.NodeRef;
@@ -82,6 +83,12 @@ pub const Seek = struct {
     /// (`X` is typically rare, e.g. `$`), and it captures the very
     /// constraint the over-approximation *drops* — so it takes precedence.
     lb_byte: ?u8 = null,
+    /// Leading positive look-behind over a *multi-byte* class `(?<=[?&])` ⇒ the
+    /// class as `Ranges`. The set generalization of `lb_byte`: candidate starts
+    /// are `{m_pos + 1 : input[m_pos] ∈ class}`, found by a SIMD class search
+    /// (`Ranges.firstMember`). Same precedence rationale as `lb_byte` (it is the
+    /// exact dropped constraint); only one of `lb_byte`/`lb_set` is ever set.
+    lb_set: ?class_span.Ranges = null,
 
     /// Smallest absolute position `≥ from` where a match can begin, or
     /// `null` (⇒ no candidate ahead ⇒ no real match either; every branch
@@ -92,6 +99,13 @@ pub const Seek = struct {
             // so the first qualifying s is ≥ from; s = b_pos + 1.
             const sq = if (from == 0) 0 else from - 1;
             const q = std.mem.indexOfScalarPos(u8, input, sq, b) orelse return null;
+            return q + 1;
+        }
+        if (self.lb_set) |r| {
+            // As `lb_byte`, but the preceding byte must be any class member:
+            // SIMD-scan for the leftmost member at/after `from-1`; s = m_pos + 1.
+            const sq = if (from == 0) 0 else from - 1;
+            const q = r.firstMember(input, sq) orelse return null;
             return q + 1;
         }
         if (self.dense) |ds| {
@@ -136,6 +150,16 @@ pub fn build(allocator: std.mem.Allocator, h: *const H) ?*Seek {
         const sk = allocator.create(Seek) catch return null;
         sk.* = .{ .allocator = allocator, .lb_byte = b };
         return sk;
+    }
+    // Multi-byte leading look-behind `(?<=[?&])`: same most-selective filter,
+    // a SIMD class search instead of a `memchr`. Skipped if the class needs
+    // >16 ranges (`fromBitmap` ⇒ null) — then fall through to the over-approx.
+    if (seq_extract.requiredLeadingLookbehindSet(null, h)) |bm| {
+        if (class_span.Ranges.fromBitmap(bm)) |r| {
+            const sk = allocator.create(Seek) catch return null;
+            sk.* = .{ .allocator = allocator, .lb_set = r };
+            return sk;
+        }
     }
 
     var oh = H.initRuntime();

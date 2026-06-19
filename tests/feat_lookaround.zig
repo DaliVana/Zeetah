@@ -47,6 +47,22 @@ test "lookbehind: fixed-width (?<=…) / (?<!…)" {
     try std.testing.expect(!try isM(a, "(?<!a)b", "ab"));
 }
 
+test "lookbehind: multi-byte class seek (?<=[?&]) — lb_set prefilter" {
+    const a = std.testing.allocator;
+    // Only tokens immediately after `?` or `&` qualify; the seek scans for the
+    // class members and starts one byte past each (the dropped constraint).
+    try std.testing.expectEqualStrings("foo", (try slice(a, "(?<=[?&])\\w+", "x?foo&bar zfoo")).?);
+    try std.testing.expect(!try isM(a, "(?<=[?&])\\w+", "nofoo here"));
+    var rx = try Regex.compile(a, "(?<=[?&])[a-z]+");
+    defer rx.deinit();
+    // `?aa &bb #cc &dd` → aa, bb, dd (cc follows `#`, not `?`/`&`).
+    try std.testing.expectEqual(@as(usize, 3), try rx.count("?aa&bb#cc&dd"));
+    // comptime Pattern bakes the same lb_set seek; must agree byte-for-byte.
+    const P = regex.Pattern("(?<=[?&])[a-z]+", .{});
+    try std.testing.expectEqual(@as(usize, 3), P.count("?aa&bb#cc&dd"));
+    try std.testing.expectEqualStrings("foo", P.find("x?foo&bar").?.slice);
+}
+
 test "lookaround: combined with quantifiers / anchors" {
     const a = std.testing.allocator;
     try std.testing.expectEqualStrings("100", (try slice(a, "\\d+(?= dollars)", "I owe 100 dollars")).?);

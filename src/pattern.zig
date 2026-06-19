@@ -23,6 +23,7 @@ const seq_extract = @import("exec/seq_extract.zig");
 const edge_look = @import("exec/edge_look.zig");
 const backtrack = @import("exec/backtrack.zig");
 const seek_mod = @import("exec/seek.zig");
+const class_span = @import("exec/class_span.zig");
 const delegate = @import("exec/delegate.zig");
 
 const Match = @import("match.zig").Match;
@@ -241,6 +242,16 @@ fn overApproxDfa(h: *const hir.Hir(HIR_CAP)) ?full_dfa.Dfa256 {
     // Necessary-byte memchr fast-negative (same as the runtime seek DFA).
     od.required = seq_extract.requiredByte(HIR_CAP, &oh);
     return od;
+}
+
+/// Comptime analogue of `seek.build`'s `lb_set` branch: a leading positive
+/// multi-byte look-behind `(?<=[?&])` ⇒ its class as `Ranges`, baked into the
+/// seek so `locate` runs the SIMD class search. `null` (⇒ fall through to the
+/// over-approx DFA) when there is no such look-behind or the class needs >16
+/// ranges. The single-byte case routes through `requiredLeadingLookbehindByte`.
+fn lbSet(comptime cap: ?usize, h: *const hir.Hir(cap)) ?class_span.Ranges {
+    const bm = seq_extract.requiredLeadingLookbehindSet(cap, h) orelse return null;
+    return class_span.Ranges.fromBitmap(bm);
 }
 
 /// Max delegated islands baked per comptime `.backtrack` pattern (mirrors
@@ -683,6 +694,8 @@ fn CaptureSupport(comptime built: Built) type {
         const cap_seek_cdfa = if (built.seek_ok) compress(built.seek_dfa) else {};
         const cap_seek: ?seek_mod.Seek = if (seq_extract.requiredLeadingLookbehindByte(NN, &baked)) |b|
             .{ .allocator = placeholder_allocator, .lb_byte = b }
+        else if (lbSet(NN, &baked)) |r|
+            .{ .allocator = placeholder_allocator, .lb_set = r }
         else if (built.seek_ok)
             .{
                 .allocator = placeholder_allocator,
@@ -903,6 +916,8 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             const seek_cdfa = if (built.seek_ok) compress(built.seek_dfa) else {};
             const bt_seek: ?seek_mod.Seek = if (seq_extract.requiredLeadingLookbehindByte(NN, &baked)) |b|
                 .{ .allocator = placeholder_allocator, .lb_byte = b }
+            else if (lbSet(NN, &baked)) |r|
+                .{ .allocator = placeholder_allocator, .lb_set = r }
             else if (built.seek_ok)
                 .{
                     .allocator = placeholder_allocator,

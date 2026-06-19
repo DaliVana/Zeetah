@@ -387,25 +387,54 @@ pub fn requiredLiteralBack(comptime cap: ?usize, h: *const hir.Hir(cap)) ?ReqLit
 /// `[0-9]+…`) into a `memchr` for a rare byte. Only the leading spine is
 /// walked (`concat` left, `cap` through); negative / multi-byte /
 /// non-leading look-behinds and all look-aheads return `null`.
-fn leadingLookbehind(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) ?u8 {
+/// Bitmap of a leading positive *single-`set`* look-behind `(?<=[…])` — the
+/// set every match start `s` must satisfy at `input[s-1]`. The single spine
+/// walk both `requiredLeadingLookbehindByte` (popcount 1 ⇒ `memchr`) and
+/// `requiredLeadingLookbehindSet` (popcount ≥2 ⇒ memchr-over-set) build on.
+/// Only the leading spine is walked (`concat` left, `cap` through); negative /
+/// non-`set` / non-leading look-behinds and all look-aheads return `null`.
+fn leadingLookbehindSet(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) ?[32]u8 {
     const nd = h.node(ref);
     return switch (nd.tag) {
-        .concat => leadingLookbehind(cap, h, nd.a), // leftmost on the spine
-        .cap => leadingLookbehind(cap, h, nd.a), // capture is transparent
+        .concat => leadingLookbehindSet(cap, h, nd.a), // leftmost on the spine
+        .cap => leadingLookbehindSet(cap, h, nd.a), // capture is transparent
         .look_around => blk: {
             if (nd.set_idx & hir.LA_BEHIND == 0) break :blk null; // look-ahead
             if (nd.set_idx & hir.LA_NEGATIVE != 0) break :blk null; // negative
             const sub = h.node(nd.a);
-            if (sub.tag != .set) break :blk null; // not a single fixed byte
-            break :blk singleByte(cap, h, sub.set_idx);
+            if (sub.tag != .set) break :blk null; // not a single fixed-width class
+            break :blk h.setBitmap(sub.set_idx);
         },
         else => null,
     };
 }
 
+fn popcount(bm: [32]u8) usize {
+    var n: usize = 0;
+    for (bm) |b| n += @popCount(b);
+    return n;
+}
+
 pub fn requiredLeadingLookbehindByte(comptime cap: ?usize, h: *const hir.Hir(cap)) ?u8 {
     if (h.root == hir.none) return null;
-    return leadingLookbehind(cap, h, h.root);
+    const bm = leadingLookbehindSet(cap, h, h.root) orelse return null;
+    if (popcount(bm) != 1) return null; // ≥2 members ⇒ the set path handles it
+    var c: usize = 0;
+    while (c < 256) : (c += 1) if (hasBit(&bm, @intCast(c))) return @intCast(c);
+    return null;
+}
+
+/// Leading positive look-behind over a *multi-byte* class `(?<=[?&])` — the
+/// set generalization of `requiredLeadingLookbehindByte`. Returns the class
+/// bitmap (≥2 members; the single-byte case routes through the `memchr` path
+/// above). A match can begin only one byte past a member, so the seek scans
+/// for the next member with a SIMD class search — exactly the constraint the
+/// over-approximation drops, and the most selective sound filter when present.
+pub fn requiredLeadingLookbehindSet(comptime cap: ?usize, h: *const hir.Hir(cap)) ?[32]u8 {
+    if (h.root == hir.none) return null;
+    const bm = leadingLookbehindSet(cap, h, h.root) orelse return null;
+    if (popcount(bm) < 2) return null; // 1 member ⇒ `requiredLeadingLookbehindByte`
+    return bm;
 }
 
 // --- `\b(lit|lit|…)\b` recogniser -------------------------------------------
