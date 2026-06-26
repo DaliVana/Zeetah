@@ -61,6 +61,14 @@ pub const SplitAlt = struct {
         a_end: bool,
         seek: ?*const seek_mod.Seek,
     ) Error!?Span {
+        // `$`-anchored fast-negative (same as `backtrack.runFrom`): one O(n)
+        // reverse pass over the over-approximation rejects the whole search when
+        // no suffix ends at `input.len`, before the per-start backtracker scan.
+        if (a_end and !a_start) {
+            if (seek) |sd| {
+                if (sd.rejectsAnchoredEnd(input, 0)) return null;
+            }
+        }
         var s: usize = 0;
         while (s <= input.len) : (s += 1) {
             if (!a_start) {

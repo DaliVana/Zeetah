@@ -273,8 +273,16 @@ pub const LazyProg = struct {
     /// memoized reverse pass for the start. `a_start`/`a_end`/`has_cond`
     /// delegate to the always-correct restart (zero regression).
     pub fn findLeftmostFrom(self: *const LazyProg, m: *LazyMemo, input: []const u8, from: usize) !?Span {
-        if (self.a_start or self.a_end or self.has_cond)
+        if (self.a_start or self.has_cond)
             return self.restartFrom(m, input, from);
+        // `$`/`\z`-anchored: the `Σ*?` forward injection runs to `input.len`
+        // and an accepting *final* state means the pattern matches a suffix
+        // ending there; one reverse pass then recovers the leftmost start.
+        // This replaces the per-position `restartFrom` — O(n²) on non-matching
+        // `class+$` input (`a+$`, `\s+$`, `(a+)+$`, …) — with one forward + one
+        // reverse pass (the anti-ReDoS fix for the `$` family).
+        if (self.a_end)
+            return self.findAnchoredEndFrom(m, input, from);
 
         var flushes: usize = 0;
         restart: while (true) {
@@ -323,11 +331,69 @@ pub const LazyProg = struct {
         }
     }
 
+    /// Single-pass `$`/`\z`-anchored leftmost match (see `findLeftmostFrom`):
+    /// a match must end exactly at `input.len`, so this is a **pure reverse
+    /// reachability** pass from `input.len` back toward `from`. `P` matches a
+    /// suffix ending at `input.len` iff the reverse automaton (seeded from the
+    /// forward accept) reaches the forward start; the leftmost position where
+    /// it does is the leftmost match start. Reverse reachability is used (not
+    /// the `Σ*?` forward pass) precisely because the forward leftmost-first
+    /// accept-cut would drop a later-starting thread once an earlier thread
+    /// accepts *mid-string* — but for `$` only an accept at the very end counts,
+    /// so that thread must survive (`ab$` on `"ababab"`: the match is the *last*
+    /// `ab`, whose thread the forward cut discards). One O(n) reverse pass,
+    /// replacing the per-position `restartFrom` (O(n²) on `class+$` input).
+    ///
+    /// No flush/restart guard (unlike the forward fast path): every `rStep`
+    /// re-interns and returns a current-generation reverse-state id, and the
+    /// loop reassigns `rsid` before reading `m.rhas_start[rsid]`, so a mid-walk
+    /// reverse-memo flush is self-healing — the same idiom `reverseStart` uses.
+    /// (A `restartFrom` fallback would be pointless: it IS the per-position scan
+    /// this method exists to avoid.)
+    /// Shared backward walk over the reverse memo: from `end` toward `lo`, find
+    /// whether any suffix ending at `end` reaches the forward start (`exists`)
+    /// and the leftmost position where it does (`start`, defaulting to `end` for
+    /// the empty/nullable match). Self-healing across reverse-memo flushes (each
+    /// `rStep` returns a current-generation id; the loop reassigns `rsid` before
+    /// the `rhas_start` read). The single core of `findAnchoredEndFrom`
+    /// (existence + start at `end == input.len`) and `reverseStart` (start only,
+    /// caller guarantees existence).
+    const RevScan = struct { exists: bool, start: usize };
+    fn reverseScan(self: *const LazyProg, m: *LazyMemo, input: []const u8, end: usize, lo: usize) !RevScan {
+        var seed = [_]u16{@intCast(self.nfa.accept)};
+        var rb: [MAX_NFA]u16 = undefined;
+        var rhit = false;
+        const rlen = self.closureRev(&seed, &rb, &rhit);
+        var rsid = try m.rintern(rb[0..rlen], rhit);
+        var out = RevScan{ .exists = m.rhas_start.items[rsid], .start = end }; // empty/nullable match at `end`
+        var pos: usize = end;
+        while (pos > lo) {
+            const next = try self.rStep(m, rsid, self.class_of[input[pos - 1]]) orelse break;
+            rsid = next;
+            pos -= 1;
+            if (m.rhas_start.items[rsid]) {
+                out.exists = true;
+                out.start = pos; // descending pos => last write is the leftmost
+            }
+        }
+        return out;
+    }
+
+    fn findAnchoredEndFrom(self: *const LazyProg, m: *LazyMemo, input: []const u8, from: usize) !?Span {
+        const r = try self.reverseScan(m, input, input.len, from);
+        if (!r.exists) return null;
+        return .{ .start = r.start, .end = input.len };
+    }
+
     /// Memoized single-pass existence check (stops at the first accept; no
-    /// greedy extend, no reverse pass).
+    /// greedy extend, no reverse pass). With `$`/`\z` only an accept *at*
+    /// `input.len` counts, so existence reduces to the reverse-reachability
+    /// pass (`findAnchoredEndFrom`) — still one O(n) pass.
     pub fn isMatchFast(self: *const LazyProg, m: *LazyMemo, input: []const u8) !bool {
-        if (self.a_start or self.a_end or self.has_cond)
+        if (self.a_start or self.has_cond)
             return (try self.restartFrom(m, input, 0)) != null;
+        if (self.a_end)
+            return (try self.findAnchoredEndFrom(m, input, 0)) != null;
         var flushes: usize = 0;
         restart: while (true) {
             if (flushes > 8) return (try self.restartFrom(m, input, 0)) != null;
@@ -542,21 +608,9 @@ pub const LazyProg = struct {
     /// Recover the leftmost start of the match ending at `end`, not earlier
     /// than `lo`, via the memoized reverse DFA.
     fn reverseStart(self: *const LazyProg, m: *LazyMemo, input: []const u8, end: usize, lo: usize) !usize {
-        var seed = [_]u16{@intCast(self.nfa.accept)};
-        var rb: [MAX_NFA]u16 = undefined;
-        var rhit = false;
-        const rlen = self.closureRev(&seed, &rb, &rhit);
-        var rsid = try m.rintern(rb[0..rlen], rhit);
-        var start: usize = end;
-        var pos: usize = end;
-        while (pos > lo) {
-            const cls = self.class_of[input[pos - 1]];
-            const next = try self.rStep(m, rsid, cls) orelse break;
-            rsid = next;
-            pos -= 1;
-            if (m.rhas_start.items[rsid]) start = pos;
-        }
-        return start;
+        // The caller (`findLeftmostFrom`) already proved a match ends at `end`,
+        // so only the leftmost start is needed — `reverseScan`'s `exists` is moot.
+        return (try self.reverseScan(m, input, end, lo)).start;
     }
 
     /// Materialise the *entire* memoised automaton (forward unanchored
@@ -576,7 +630,7 @@ pub const LazyProg = struct {
     pub const MAX_DENSE_STATES: usize = 4096;
 
     pub fn freezeDense(self: *LazyProg, allocator: std.mem.Allocator) !?*DenseSearch {
-        if (self.a_start or self.a_end or self.has_cond) return null;
+        if (self.a_start or self.has_cond) return null;
         const nc = self.n_classes;
 
         var m = LazyMemo.init(allocator);
@@ -584,20 +638,28 @@ pub const LazyProg = struct {
         m.cap = std.math.maxInt(usize); // never flush during materialisation
 
         // --- forward state space (uStep ++ aStep to fixpoint) ---
-        var sbuf: [MAX_NFA]u16 = undefined;
-        var sacc = false;
-        const slen = self.closure(&[_]u16{@intCast(self.nfa.start)}, &sbuf, &sacc);
-        const start_fwd = try m.intern(sbuf[0..slen], sacc);
-        var head: usize = 0;
-        while (head < m.states.items.len) : (head += 1) {
-            if (m.states.items.len > MAX_DENSE_STATES) return null;
-            var cls: usize = 0;
-            while (cls < nc) : (cls += 1) {
-                _ = try self.uStep(&m, @intCast(head), cls);
-                _ = try self.aStep(&m, @intCast(head), cls);
+        // `$`-anchored patterns use a pure reverse pass (`DenseSearch.findFrom`
+        // with `a_end`), so the forward tables are dead — skip the fixpoint
+        // (it can explode where the reverse is tiny, e.g. `[a-z]*z[a-z]{10}$`)
+        // and bake a 1-state dummy.
+        var nf: usize = 1;
+        var start_fwd: u32 = 0;
+        if (!self.a_end) {
+            var sbuf: [MAX_NFA]u16 = undefined;
+            var sacc = false;
+            const slen = self.closure(&[_]u16{@intCast(self.nfa.start)}, &sbuf, &sacc);
+            start_fwd = try m.intern(sbuf[0..slen], sacc);
+            var head: usize = 0;
+            while (head < m.states.items.len) : (head += 1) {
+                if (m.states.items.len > MAX_DENSE_STATES) return null;
+                var cls: usize = 0;
+                while (cls < nc) : (cls += 1) {
+                    _ = try self.uStep(&m, @intCast(head), cls);
+                    _ = try self.aStep(&m, @intCast(head), cls);
+                }
             }
+            nf = m.states.items.len;
         }
-        const nf = m.states.items.len;
 
         // --- reverse state space (rStep to fixpoint) ---
         var rbuf: [MAX_NFA]u16 = undefined;
@@ -627,6 +689,7 @@ pub const LazyProg = struct {
             .n_rev = nr,
             .start_fwd = @intCast(start_fwd),
             .start_rev = @intCast(start_rev),
+            .a_end = self.a_end,
             .utrans = try allocator.alloc(u16, nf * nc),
             .atrans = try allocator.alloc(u16, nf * nc),
             .accept = try allocator.alloc(bool, nf),
@@ -634,24 +697,32 @@ pub const LazyProg = struct {
             .rhas_start = try allocator.alloc(bool, nr),
         };
         errdefer ds.freeArrays();
-        var i: usize = 0;
-        while (i < nf) : (i += 1) {
-            ds.accept[i] = m.accept.items[i];
-            var c: usize = 0;
-            while (c < nc) : (c += 1) {
-                const u = m.utrans.items[i * nc + c]; // ≥0 (uStep never DEAD)
-                ds.utrans[i * nc + c] = @intCast(u);
-                const a = m.atrans.items[i * nc + c];
-                ds.atrans[i * nc + c] = if (a == TDEAD) DenseSearch.DEAD else @intCast(a);
+        if (self.a_end) {
+            // Forward tables are dead for the reverse-only `$` path; bake a
+            // benign 1-state dummy (DEAD self-loop, non-accepting).
+            @memset(ds.utrans, 0);
+            @memset(ds.atrans, DenseSearch.DEAD);
+            @memset(ds.accept, false);
+        } else {
+            var i: usize = 0;
+            while (i < nf) : (i += 1) {
+                ds.accept[i] = m.accept.items[i];
+                var c: usize = 0;
+                while (c < nc) : (c += 1) {
+                    const u = m.utrans.items[i * nc + c]; // ≥0 (uStep never DEAD)
+                    ds.utrans[i * nc + c] = @intCast(u);
+                    const a = m.atrans.items[i * nc + c];
+                    ds.atrans[i * nc + c] = if (a == TDEAD) DenseSearch.DEAD else @intCast(a);
+                }
             }
         }
-        i = 0;
-        while (i < nr) : (i += 1) {
-            ds.rhas_start[i] = m.rhas_start.items[i];
+        var ri: usize = 0;
+        while (ri < nr) : (ri += 1) {
+            ds.rhas_start[ri] = m.rhas_start.items[ri];
             var c: usize = 0;
             while (c < nc) : (c += 1) {
-                const r = m.rtrans.items[i * nc + c];
-                ds.rtrans[i * nc + c] = if (r == TDEAD) DenseSearch.DEAD else @intCast(r);
+                const r = m.rtrans.items[ri * nc + c];
+                ds.rtrans[ri * nc + c] = if (r == TDEAD) DenseSearch.DEAD else @intCast(r);
             }
         }
         return ds;

@@ -87,3 +87,38 @@ pub fn litPrefixFind(d: anytype, t: *const pf.Teddy, input: []const u8) ?Span {
 pub fn litPrefixIsMatch(d: anytype, t: *const pf.Teddy, input: []const u8) bool {
     return litPrefixFind(d, t, input) != null;
 }
+
+/// Single reverse-reachability pass — the shared core of the `$`/`\z`-anchored
+/// single-pass search (the anti-ReDoS dual of `runFrom`). `d` is a REVERSE DFA
+/// (built by `full_dfa.computeReverse`) read BACKWARD over `input[from..end]`:
+/// `d.accepting[s]` is redefined to mean "the FORWARD start is reachable", i.e.
+/// the pattern matches the suffix `input[start..end]`. The leftmost such `start`
+/// in `[from, end]` is returned with `.end = end`; `null` if no suffix ending at
+/// `end` matches. A forward `Σ*?` pass cannot serve this — its leftmost-first
+/// accept-cut drops a later-starting thread once an earlier one accepts
+/// mid-string (`ab$` on `"ababab"`) — so the reverse pass is the only sound
+/// single-pass form.
+///
+/// `d` is any DFA exposing `start` / `class_of` / `step(state, cls)` /
+/// `accepting[state]` (both the runtime `Dfa256` and the comptime
+/// `comptime_dfa.Dfa(ns,nk)`); state 0 is the DEAD sink. Parameterising `end`
+/// (not hardcoding `input.len`) lets multiline `(?m)…$` drive one pass per line
+/// end and lets resumable enumeration bound the scan — same primitive, O(n).
+pub fn reverseSearch(d: anytype, input: []const u8, from: usize, end: usize) ?Span {
+    var rsid: u16 = @intCast(d.start);
+    var exists = d.accepting[rsid]; // nullable/empty match ending exactly at `end`
+    var start: usize = end;
+    var pos: usize = end;
+    while (pos > from) {
+        const next = d.step(rsid, d.class_of[input[pos - 1]]);
+        if (next == 0) break; // DEAD sink: no reverse predecessor
+        rsid = next;
+        pos -= 1;
+        if (d.accepting[rsid]) {
+            exists = true;
+            start = pos; // descending pos ⇒ last write is the leftmost start
+        }
+    }
+    if (!exists) return null;
+    return .{ .start = start, .end = end };
+}

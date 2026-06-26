@@ -205,6 +205,14 @@ const Built = struct {
     /// in `Pattern` (it takes precedence when present, exactly as runtime does).
     seek_dfa: full_dfa.Dfa256 = undefined,
     seek_ok: bool = false,
+    /// `.dfa` arm, unanchored + `$`-anchored only: the REVERSE DFA
+    /// (`full_dfa.computeReverse`) that powers the single-pass
+    /// `comptime_dfa.Dfa.findAnchoredEnd` — the comptime peer of the runtime
+    /// reroute that fixes the unanchored `class+$` O(n²) leftmost search. `rev_ok`
+    /// gates it: false ⇒ not this class, or the reverse DFA exceeded `MAX_DFA`
+    /// (then the arm keeps the forward per-offset path — correct, just not sped up).
+    rev_dfa: full_dfa.Dfa256 = undefined,
+    rev_ok: bool = false,
     /// `.line_dfa` arm: `dfa` holds the looks-stripped body DFA of a
     /// `(?m)^body$` / `(?m)^body` line validator. `line_has_dollar` ⇒ verify the
     /// body end lands on the line terminator; `line_first` is the body's
@@ -229,9 +237,35 @@ const Built = struct {
 ///   * nullable approximation (start state accepts) — matches everywhere ⇒
 ///     can never skip;
 ///   * build failure / DFA blow-up.
+/// Does the subtree contain a `backref`? A `\1`→ε relaxation is the ONE
+/// over-approximation that *shortens* the match (it drops the consumed copy),
+/// which makes the `$`-anchored seek LOCATE unsound: the relaxation is then a
+/// strict prefix, so its leftmost match *ending at* `input.len` starts LATER
+/// than the real match (`(ab+)\1$` on "abab": approx `ab+$` matches only the
+/// trailing "ab" at 2, skipping the real start 0). Look/atomic relaxations are
+/// zero-width / length-preserving, so they stay sound. (The runtime seek is
+/// already safe — it uses a reject-only reverse fast-negative, not a locate.)
+fn containsBackref(comptime cap: ?usize, h: *const hir.Hir(cap), ref: hir.NodeRef) bool {
+    if (ref == hir.none) return false;
+    const nd = h.node(ref);
+    return switch (nd.tag) {
+        .backref => true,
+        .empty, .set, .look => false,
+        .concat, .alt => containsBackref(cap, h, nd.a) or containsBackref(cap, h, nd.b),
+        .star, .plus, .opt, .cap, .atomic, .look_around => containsBackref(cap, h, nd.a),
+    };
+}
+
 fn overApproxDfa(h: *const hir.Hir(HIR_CAP)) ?full_dfa.Dfa256 {
     @setEvalBranchQuota(8_000_000); // deep alternations recurse clone/build
     if (h.saw_lazy and h.anchored_end) return null;
+    // `$`-anchored + backref: the forward a_end locate would skip past real
+    // match starts (see `containsBackref`). No sound forward seek exists for
+    // this shape; the comptime tree backtracker scans from 0 (correct, budget-
+    // bounded). The runtime peer instead installs a reject-only reverse
+    // fast-negative (`seek.rejectsAnchoredEnd`) — a comptime reverse Cdfa
+    // fast-negative is the natural follow-up for parity.
+    if (h.anchored_end and containsBackref(HIR_CAP, h, h.root)) return null;
     var oh = hir.Hir(HIR_CAP).initComptime();
     oh.anchored_start = h.anchored_start;
     oh.anchored_end = h.anchored_end;
@@ -511,13 +545,31 @@ fn buildAll(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) 
             seek_ok = true;
         }
     }
-    return switch (planner.resolve(strat, h.anchored_start)) {
+    // Anti-ReDoS (comptime peer of the runtime `regex.zig` reroute): for an
+    // unanchored `$`-anchored bare-DFA pattern, bake the reverse DFA so the arm
+    // serves `find`/`isMatch` with one O(n) `findAnchoredEnd` reverse pass
+    // instead of the O(n²) per-offset `findLeftmost` restart.
+    const route0 = planner.resolve(strat, h.anchored_start);
+    var rev_dfa: full_dfa.Dfa256 = undefined;
+    var rev_ok = false;
+    // `.lit_prefix` is included alongside `.dfa` (see the runtime mirror in
+    // `regex.zig`): a literal-prefixed `$` pattern (`abc.*x$`) otherwise stays on
+    // the per-Teddy-hit `litPrefixFind` verify, which is O(n²) when the prefix
+    // recurs. Both route the same single reverse pass.
+    if ((route0 == .dfa or route0 == .lit_prefix) and h.anchored_end and !h.anchored_start) {
+        const rd = full_dfa.computeReverse(HIR_CAP, &nfa);
+        if (rd.outcome == .ok) {
+            rev_dfa = rd;
+            rev_ok = true;
+        }
+    }
+    return switch (route0) {
         .literal => |seq| .{ .dfa = d, .outcome = .ok, .strat = .literal, .seq = seq, .hir = h, .n_groups = ng, .gnames = gnames, .seek_dfa = seek_dfa, .seek_ok = seek_ok },
         .reverse_suffix => |sfx| .{ .dfa = d, .outcome = .ok, .strat = .reverse_suffix, .seq = sfx, .hir = h, .n_groups = ng, .gnames = gnames, .seek_dfa = seek_dfa, .seek_ok = seek_ok },
-        .lit_prefix => |pp| .{ .dfa = d, .outcome = .ok, .strat = .lit_prefix, .seq = pp, .hir = h, .n_groups = ng, .gnames = gnames, .seek_dfa = seek_dfa, .seek_ok = seek_ok },
+        .lit_prefix => |pp| .{ .dfa = d, .outcome = .ok, .strat = .lit_prefix, .seq = pp, .hir = h, .n_groups = ng, .gnames = gnames, .seek_dfa = seek_dfa, .seek_ok = seek_ok, .rev_dfa = rev_dfa, .rev_ok = rev_ok },
         // `.core`, plus the `.backtrack` sentinel (never reached — non-regular
         // patterns `@compileError` upstream): plain baked DFA.
-        .dfa, .backtrack => .{ .dfa = d, .outcome = .ok, .strat = .dfa, .hir = h, .n_groups = ng, .gnames = gnames, .seek_dfa = seek_dfa, .seek_ok = seek_ok },
+        .dfa, .backtrack => .{ .dfa = d, .outcome = .ok, .strat = .dfa, .hir = h, .n_groups = ng, .gnames = gnames, .seek_dfa = seek_dfa, .seek_ok = seek_ok, .rev_dfa = rev_dfa, .rev_ok = rev_ok },
     };
 }
 
@@ -730,6 +782,12 @@ fn CaptureSupport(comptime built: Built) type {
         /// is comptime-dead). Its `findLeftmost` is differential-pinned to the
         /// `core.findLeftmost(&Dfa256, …)` it replaces (exact-fit compression).
         const cdfa = if (op_dfa_usable) compress(op_dfa) else {};
+        /// Reverse DFA (`computeReverse`) for the unanchored `$` class: the O(n)
+        /// span source that replaces `cdfa.findLeftmost`'s per-offset restart on
+        /// the capture path (the comptime peer of the runtime `nextSpanFrom`
+        /// span used by `capturesFrom`). `void` otherwise. Baked here independent
+        /// of the main arm's `rev_table` (the two structs can't share a const).
+        const rev_cdfa = if (built.rev_ok) compress(built.rev_dfa) else {};
 
         /// `.line_dfa` capture path: the looks-stripped body DFA (baked
         /// COMPRESSED) locates each line match via `line_dfa.nextFrom`; the
@@ -805,6 +863,29 @@ fn CaptureSupport(comptime built: Built) type {
                 _ = (bt.runFrom(input, sp.start, slots[0..nslots]) catch return null) orelse return null;
                 slots[0] = @intCast(sp.start);
                 slots[1] = @intCast(sp.end);
+                return slotsToCaps(input, slots[0..nslots]);
+            }
+            if (comptime built.rev_ok) {
+                // Unanchored `$` class: the O(n) reverse pass locates the span
+                // (the comptime peer of the runtime captures span fix), so the
+                // capture path never runs `cdfa.findLeftmost`'s O(n²) per-offset
+                // restart. No match ⇒ return in O(n); otherwise reconstruct slots
+                // over JUST that span — `onepass.fill` when one-pass, else the
+                // budget-bounded tree backtracker anchored at the known start
+                // (which matches immediately there, so it cannot run away).
+                const r = rev_cdfa.findAnchoredEnd(input[from..]) orelse return null;
+                const span: onepass.Span = .{ .start = from + r.start, .end = from + r.end };
+                if (comptime op_dfa_usable) {
+                    @memset(slots[0..nslots], -1);
+                    slots[0] = @intCast(span.start);
+                    slots[1] = @intCast(span.end);
+                    if (onepass.fill(NN, &nfa, input, span, slots[0..nslots]))
+                        return slotsToCaps(input, slots[0..nslots]);
+                }
+                var bt = BT.init(&cap_h, cap_h.anchored_start, cap_h.anchored_end, NG, null, null);
+                _ = (bt.runFrom(input, span.start, slots[0..nslots]) catch return null) orelse return null;
+                slots[0] = @intCast(span.start);
+                slots[1] = @intCast(span.end);
                 return slotsToCaps(input, slots[0..nslots]);
             }
             if (comptime op_dfa_usable) {
@@ -1315,19 +1396,29 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
         // seek / delegate / edge-look prefilters use), so the necessary-condition
         // prefilters (`required`/`req_lit`) and start-byte filter ride along and
         // the comptime walk consults them just like the runtime `Dfa256`.
-        const baked = compress(m);
+        // When `rev_ok` (unanchored `$`-anchored class) the forward table is
+        // dead — `nextSpanFrom`/`isMatch` route to `rev_table.findAnchoredEnd`
+        // — so skip baking it: `void` keeps that ~`[ns][nk]` cells out of
+        // `.rodata` (one DFA baked, the reverse, not two) on the embedded path.
+        const baked = if (built.rev_ok) {} else compress(m);
         // (c): bake the planner's literal prefilter. `.reverse_suffix` uses the
         // trailing literal as a Teddy fast-negative before the forward DFA;
         // `.lit_prefix` Teddy-locates the leading literal then verifies anchored
         // with `runFrom` (via the shared `search.litPrefixFind`). Either falls
         // back to the plain DFA when the literal can't be Teddy-compiled — same
         // as the runtime `regex.zig`. The Teddy is built once, at comptime.
-        const want_teddy = built.strat == .reverse_suffix or built.strat == .lit_prefix;
+        // `rev_ok` (unanchored `$`) forces the reverse single pass regardless of
+        // strat, so a `.lit_prefix` `$` pattern skips the Teddy verify entirely
+        // and flows through `mode == .dfa` → `rev_table.findAnchoredEnd`.
+        const want_teddy = !built.rev_ok and (built.strat == .reverse_suffix or built.strat == .lit_prefix);
         const maybe_teddy: ?pf.Teddy = if (want_teddy) comptime core.buildLiteral(&built.seq) else null;
         const mode: Mode = if (maybe_teddy != null)
             (if (built.strat == .reverse_suffix) Mode.reverse_suffix else Mode.lit_prefix)
         else
             Mode.dfa;
+        // Anti-ReDoS reverse DFA (`computeReverse`), baked COMPRESSED, for the
+        // unanchored `$`-anchored class only; `void` otherwise (comptime-dead).
+        const rev_table = if (built.rev_ok) compress(built.rev_dfa) else {};
         return struct {
             pub const has_dfa = true;
             const table = baked;
@@ -1342,6 +1433,13 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             pub fn nextSpanFrom(input: []const u8, from: usize) ?search.Span {
                 return switch (mode) {
                     .dfa => blk: {
+                        // Unanchored `$`-anchored: one O(n) reverse pass instead
+                        // of the O(n²) per-offset forward restart (`rev_ok` is
+                        // comptime-known, so the other branch folds away).
+                        if (built.rev_ok) {
+                            const r = rev_table.findAnchoredEnd(input[from..]) orelse break :blk null;
+                            break :blk .{ .start = from + r.start, .end = from + r.end };
+                        }
                         const r = table.findLeftmost(input[from..]) orelse break :blk null;
                         break :blk .{ .start = from + r.start, .end = from + r.end };
                     },
@@ -1365,7 +1463,10 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             // `WholeMatchVerbs`).
             pub fn isMatch(input: []const u8) bool {
                 return switch (mode) {
-                    .dfa => table.isMatch(input),
+                    // Unanchored `$`-anchored: the forward `table.isMatch` is the
+                    // O(n²) per-offset restart; the reverse pass is O(n). (`rev_ok`
+                    // comptime-known ⇒ the other branch folds away.)
+                    .dfa => if (built.rev_ok) rev_table.findAnchoredEnd(input) != null else table.isMatch(input),
                     .reverse_suffix => core.literalIsMatchT(&t, input) and table.isMatch(input),
                     .lit_prefix => search.litPrefixIsMatch(&table, &t, input),
                 };

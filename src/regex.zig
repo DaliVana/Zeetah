@@ -345,6 +345,14 @@ pub const Regex = struct {
         };
         errdefer if (nheap == null) allocator.destroy(nh);
 
+        // Preserve the one-pass capture fast path (mirrors the eager `.dfa`
+        // build's `op_ok`): a one-pass capture pattern reconstructs slots with a
+        // single allocation-free `onepass.fill` over the span `nextSpanFrom`
+        // returns — here the O(n) dense/lazy single pass. Without this, the
+        // `$`-reroute would silently demote `([0-9]+)$` / `(cat|dog)$` / `(\w+)$`
+        // captures to the slower bounded backtracker. `capturesFrom` gates on it.
+        const op_onepass = ng > 0 and onepass.isOnePassNfa(null, nh);
+
         // Materialise via a temporary LazyProg (only its CSR/oracle is
         // needed to freeze; the DenseSearch is self-contained afterwards).
         var tmp = try lazy_dfa.LazyProg.init(allocator, nh, a_start, a_end);
@@ -370,6 +378,7 @@ pub const Regex = struct {
                 .bt_a_end = a_end,
                 .n_groups = ng,
                 .gnames = gnames,
+                .op_onepass = op_onepass,
             };
         }
 
@@ -393,6 +402,7 @@ pub const Regex = struct {
             .bt_a_end = a_end,
             .n_groups = ng,
             .gnames = gnames,
+            .op_onepass = op_onepass,
         };
     }
 
@@ -741,6 +751,30 @@ pub const Regex = struct {
             d.n_start_bytes <= 16 and
             d.req_lit == null)
         {
+            return try buildDenseRegex(allocator, &nfa, nheap, owned, flags, h.anchored_start, h.anchored_end, ng, gnames);
+        }
+
+        // --- Lever A (anti-ReDoS): the unanchored `$`-anchored bare-DFA class.
+        //
+        // An *unanchored* pattern with a trailing `$`/`\z` and no usable literal
+        // prefilter re-runs the eager `core.findLeftmost` from O(n) start
+        // offsets — each scanning the whole class-run before the `a_end` accept
+        // check fails — so it is O(n²) on non-matching `class+$` input (`a+$`,
+        // `\s+$`, `\d+$`, `(a+)+$`, `a*a*$`, `.*a$`, …; the polynomial ReDoS the
+        // `tests/security.zig` marker tracks). The `required`/`req_lit`
+        // prefilters cannot gate this out: `a+$` *has* required byte `a`, but
+        // it is present in the adversarial input, so the negative filter never
+        // fires. The lazy engine's single forward `Σ*?` pass + reverse start
+        // (now `a_end`-capable, `lazy_dfa.findAnchoredEndFrom`) is O(n) for the
+        // whole class. Route it there; eager keeps every other shape.
+        //
+        // `.lit_prefix` is included too: a literal-prefixed `$` pattern
+        // (`abc.*x$`, `abc[0-9]+$`) otherwise stays on `search.litPrefixFind`,
+        // which loops over every Teddy hit of the prefix and `runFrom`s — O(n²)
+        // when the prefix recurs (`abcabc…`). The reverse engine is O(n); we give
+        // up the prefix Teddy locate (the reverse pass dies on its own at the
+        // first non-suffix byte) for the linearity guarantee.
+        if ((bare_dfa or route == .lit_prefix) and !h.anchored_start and h.anchored_end) {
             return try buildDenseRegex(allocator, &nfa, nheap, owned, flags, h.anchored_start, h.anchored_end, ng, gnames);
         }
         // Everything else with an eager dense table stays on the O(1)/byte
@@ -1097,6 +1131,27 @@ pub const Regex = struct {
                         span = sp;
                         break :done;
                     }
+                }
+                // Reverse-pass engines (`.dense_search`/`.lazy_dfa` — the
+                // unanchored `$` class + the floor cluster): `nextSpanFrom`
+                // already finds the whole-match span in ONE O(n) pass (the
+                // reverse `findAnchoredEnd` for `$`), so reconstruct slots over
+                // JUST that span — like the line-DFA path above. Without this a
+                // non-one-pass `(a+)+$`-with-groups capture would drop to the
+                // whole-input bounded backtracker below and stay O(n²) (worse,
+                // catastrophic) on adversarial input, even though `find`/`isMatch`
+                // are O(n). The span is the exact match, so both-anchoring the
+                // backtracker over the slice reproduces the leftmost-first slots.
+                if (self.kind == .dense_search or self.kind == .lazy_dfa) {
+                    const sp = (try self.nextSpanFrom(input, pos)) orelse return null; // absolute
+                    var bt = try bounded_bt.BoundedBt.init(allocator, self.nfa.?, true, true, sp.end - sp.start);
+                    defer bt.deinit();
+                    _ = (try bt.captures(input[sp.start..sp.end], slots[0..nslots])) orelse return null;
+                    shiftSlots(slots[0..nslots], sp.start);
+                    slots[0] = @intCast(sp.start);
+                    slots[1] = @intCast(sp.end);
+                    span = sp;
+                    break :done;
                 }
                 var bt = try bounded_bt.BoundedBt.init(allocator, self.nfa.?, self.bt_a_start, self.bt_a_end, input.len);
                 defer bt.deinit();

@@ -104,6 +104,171 @@ pub const Dfa256 = struct {
     }
 };
 
+/// Subset-construction state interner shared by `compute` and `computeReverse`:
+/// the id of the NFA-set `want[0..want_len]` (DEAD sink `0` for the empty set),
+/// added if new. `E.TooComplex` once the `MAX_DFA` ceiling is reached. Both
+/// callers key by the raw `want` slice, so each must hand it in a canonical
+/// order (the cut for `compute`, a sort for `computeReverse`).
+fn findOrAdd(lists: *[MAX_DFA][MAX_NFA]u16, lens: *[MAX_DFA]usize, n: *usize, want: *const [MAX_NFA]u16, want_len: usize) E!usize {
+    if (want_len == 0) return 0; // DEAD
+    var k: usize = 0;
+    while (k < n.*) : (k += 1) {
+        if (lens[k] != want_len) continue;
+        if (std.mem.eql(u16, lists[k][0..want_len], want[0..want_len])) return k;
+    }
+    if (n.* >= MAX_DFA) return E.TooComplex;
+    const id = n.*;
+    var j: usize = 0;
+    while (j < want_len) : (j += 1) lists[id][j] = want[j];
+    lens[id] = want_len;
+    n.* += 1;
+    return id;
+}
+
+/// Build the **reverse** DFA for the comptime `$`/`\z`-anchored single-pass
+/// search (`comptime_dfa.Dfa.findAnchoredEnd`), the compile-time peer of the
+/// runtime `lazy_dfa.findAnchoredEndFrom` / `DenseSearch`(a_end) reverse pass.
+///
+/// A `$`-anchored match must end at `input.len`, so the search reads the input
+/// BACKWARD from `input.len`: the pattern matches a suffix ending there iff the
+/// reverse automaton (the subset construction of the *reversed* NFA — every
+/// edge flipped, `start`↔`accept` swapped) reaches the forward start, with the
+/// leftmost such position as the match start. Two deviations from `compute`:
+///   1. **No leftmost-first accept-cut.** `closure` is called with a sentinel
+///      accept so it never truncates: the reverse pass needs *pure* reachability
+///      (the cut would drop a lower-priority thread that leads to an earlier
+///      start — the very bug the forward `Σ*?` pass hits on `ab$` over "ababab").
+///   2. **`accepting[s]` is redefined** as "this NFA set contains the FORWARD
+///      start" (i.e. a match starts here), not "contains the forward accept".
+///
+/// No minimization (the reverse DFA of a `$`-validator is tiny; an oversized one
+/// returns `.exploded` and the caller keeps the forward per-offset path — no
+/// regression, just no speed-up). Patterns with conditional `look` edges
+/// (`e_kind == 2`) are rejected here (they never reach the regular `.dfa` arm
+/// anyway). The prefilter / start-byte fields are left empty: the reverse walk
+/// uses only `transitions` / `accepting` / `start` / `class_of`.
+pub fn computeReverse(comptime cap: ?usize, nfa: *const thompson.Nfa(cap)) Dfa256 {
+    @setEvalBranchQuota(4_000_000);
+
+    // Reversed NFA: flip every edge and swap start↔accept. A conditional `look`
+    // edge has no meaningful reverse here — bail (caller keeps the forward path).
+    var rev = nfa.*;
+    {
+        var ei: usize = 0;
+        while (ei < rev.n_edges) : (ei += 1) {
+            if (rev.e_kind[ei] == 2) return emptyDfa256(.exploded);
+            const f = rev.e_from[ei];
+            rev.e_from[ei] = rev.e_to[ei];
+            rev.e_to[ei] = f;
+        }
+        const t = rev.start;
+        rev.start = rev.accept;
+        rev.accept = t;
+    }
+    const fwd_start: u16 = @intCast(rev.accept); // == original nfa.start
+
+    const cls = dfa_build.classify(cap, &rev);
+    const class_of = cls.class_of;
+    const n_classes = cls.n_classes;
+    const rep = cls.rep;
+
+    var eps_to = [_]u16{0} ** MAX_EDGES;
+    var eps_off = [_]usize{0} ** (MAX_NFA + 1);
+    var cnt_to = [_]u16{0} ** MAX_EDGES;
+    var cnt_set = [_]u16{0} ** MAX_EDGES;
+    var cnt_off = [_]usize{0} ** (MAX_NFA + 1);
+    dfa_build.buildForwardCsr(cap, &rev, &eps_to, &eps_off, &cnt_to, &cnt_set, &cnt_off);
+
+    var dfa_list: [MAX_DFA][MAX_NFA]u16 = undefined;
+    var dfa_len = [_]usize{0} ** MAX_DFA;
+    var trans = [_][256]usize{[_]usize{0} ** 256} ** MAX_DFA;
+    var accepting = [_]bool{false} ** MAX_DFA;
+    dfa_len[0] = 0; // state 0 = DEAD sink
+    var dfa_n: usize = 1;
+
+    const SENTINEL: u16 = std.math.maxInt(u16); // never a real state ⇒ no cut
+
+    const containsStart = struct {
+        fn run(list: []const u16, target: u16) bool {
+            for (list) |s| if (s == target) return true;
+            return false;
+        }
+    }.run;
+
+    // `findOrAdd` is the shared file-level interner (above).
+
+    var start_buf: [MAX_NFA]u16 = undefined;
+    var dummy_acc = false;
+    const start_seeds = [_]u16{@intCast(rev.start)};
+    const start_len = dfa_build.closure(&eps_to, &eps_off, SENTINEL, &start_seeds, &start_buf, &dummy_acc);
+    // Canonical key for `findOrAdd`: the no-cut closure is pure reachability, so
+    // the same NFA-set can arrive in different DFS orders — sort to dedup it to
+    // ONE reverse-DFA state (mirrors `lazy_memo.rintern`). Without this, spurious
+    // distinct-but-equivalent states inflate the count and can trip `MAX_DFA`
+    // (→ `.exploded` → the caller keeps the O(n²) forward path) needlessly.
+    std.mem.sort(u16, start_buf[0..start_len], {}, std.sort.asc(u16));
+    const start_id = findOrAdd(&dfa_list, &dfa_len, &dfa_n, &start_buf, start_len) catch {
+        return emptyDfa256(.exploded);
+    };
+    accepting[start_id] = containsStart(start_buf[0..start_len], fwd_start);
+
+    var work_head: usize = 1;
+    while (work_head < dfa_n) : (work_head += 1) {
+        const cur_len = dfa_len[work_head];
+        var cl: usize = 0;
+        while (cl < n_classes) : (cl += 1) {
+            const sym = rep[cl];
+            var seeds: [MAX_EDGES]u16 = undefined;
+            var n_seeds: usize = 0;
+            var li: usize = 0;
+            while (li < cur_len) : (li += 1) {
+                const nstate = dfa_list[work_head][li];
+                var cj: usize = cnt_off[nstate];
+                while (cj < cnt_off[nstate + 1]) : (cj += 1) {
+                    if (hasBit(&rev.sets[cnt_set[cj]], sym)) {
+                        seeds[n_seeds] = cnt_to[cj];
+                        n_seeds += 1;
+                    }
+                }
+            }
+            if (n_seeds == 0) {
+                trans[work_head][cl] = 0; // DEAD
+                continue;
+            }
+            var tgt_buf: [MAX_NFA]u16 = undefined;
+            var tacc = false;
+            const tgt_len = dfa_build.closure(&eps_to, &eps_off, SENTINEL, seeds[0..n_seeds], &tgt_buf, &tacc);
+            std.mem.sort(u16, tgt_buf[0..tgt_len], {}, std.sort.asc(u16)); // canonical key (see start)
+            const id = findOrAdd(&dfa_list, &dfa_len, &dfa_n, &tgt_buf, tgt_len) catch {
+                return emptyDfa256(.exploded);
+            };
+            trans[work_head][cl] = id;
+            if (id != 0) accepting[id] = containsStart(tgt_buf[0..tgt_len], fwd_start);
+        }
+    }
+    accepting[0] = false; // DEAD never accepts
+
+    if (dfa_n > MAX_DFA) return emptyDfa256(.exploded);
+
+    var out = emptyDfa256(.ok);
+    out.class_of = class_of;
+    out.n_classes = n_classes;
+    out.n_states = dfa_n;
+    out.start = start_id;
+    out.a_start = false;
+    out.a_end = false;
+    {
+        var s: usize = 0;
+        while (s < dfa_n) : (s += 1) {
+            out.accepting[s] = accepting[s];
+            var cl: usize = 0;
+            while (cl < n_classes) : (cl += 1) out.trans[s][cl] = @intCast(trans[s][cl]);
+        }
+    }
+    out.accepting[0] = false;
+    return out;
+}
+
 pub fn emptyDfa256(outcome: Outcome) Dfa256 {
     return .{
         .class_of = [_]u8{0} ** 256,
@@ -169,23 +334,7 @@ pub fn compute(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), a_start: boo
         }
     };
 
-    const findOrAdd = struct {
-        fn run(lists: *[MAX_DFA][MAX_NFA]u16, lens: *[MAX_DFA]usize, n: *usize, want: *const [MAX_NFA]u16, want_len: usize) E!usize {
-            if (want_len == 0) return 0; // DEAD
-            var k: usize = 0;
-            while (k < n.*) : (k += 1) {
-                if (lens[k] != want_len) continue;
-                if (std.mem.eql(u16, lists[k][0..want_len], want[0..want_len])) return k;
-            }
-            if (n.* >= MAX_DFA) return E.TooComplex;
-            const id = n.*;
-            var j: usize = 0;
-            while (j < want_len) : (j += 1) lists[id][j] = want[j];
-            lens[id] = want_len;
-            n.* += 1;
-            return id;
-        }
-    }.run;
+    // `findOrAdd` is the shared file-level interner (above).
 
     var start_buf: [MAX_NFA]u16 = undefined;
     var start_acc = false;
@@ -336,4 +485,56 @@ pub fn compute(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), a_start: boo
 
     if (n_min > MAX_DFA) return emptyDfa256(.exploded);
     return out;
+}
+
+test "computeReverse + reverseSearch == forward core.findLeftmost ($-anchored oracle)" {
+    const parser = @import("../parser.zig");
+    const hir = @import("../hir.zig");
+    const core = @import("core.zig");
+    const search = @import("search.zig");
+    const a = std.testing.allocator;
+
+    // Independent oracle: the forward eager DFA (`core.findLeftmost`, a_end-aware,
+    // O(n²) but correct) vs the reverse single pass. The `Pattern`⇄`Regex`
+    // differential only compares reverse-vs-reverse; this pins the reverse
+    // ALGORITHM against the pre-existing forward semantics.
+    const pats = [_][]const u8{
+        "a+$",        "[a-z]+$",  "\\s+$",       "a*a*$",
+        "(a+)+$",     ".*a$",     "ab$",         "(cat|dog)$",
+        "[0-9]{2,4}$", "abc.*x$", "a*$",         "[ab]+c?$",
+    };
+    const ins = [_][]const u8{
+        "",       "a",        "aaa",      "aaa!",     "  ",       "  x",
+        "xyz",    "ababab",   "cat",      "dog cat",  "12",       "1234",
+        "12345",  "abczzx",   "abcabcx",  "no",       " a a a ",  "ababx",
+        "cc",     "abcabc",
+    };
+    for (pats) |p| {
+        var h = hir.Hir(null).initRuntime();
+        defer h.deinit(a);
+        parser.parse(null, &h, a, p, .{}) catch continue;
+        var nfa = thompson.build(null, &h) catch continue;
+        const fd = compute(null, &nfa, h.anchored_start, h.anchored_end);
+        if (fd.outcome != .ok) continue;
+        const rd = computeReverse(null, &nfa);
+        if (rd.outcome != .ok) continue;
+        for (ins) |in| {
+            const want = core.findLeftmost(&fd, in); // forward oracle (handles a_end)
+            const got = search.reverseSearch(&rd, in, 0, in.len);
+            std.testing.expectEqual(want == null, got == null) catch |e| {
+                std.debug.print("MISMATCH exists pat=\"{s}\" in=\"{s}\"\n", .{ p, in });
+                return e;
+            };
+            if (want) |w| {
+                std.testing.expectEqual(w.start, got.?.start) catch |e| {
+                    std.debug.print("MISMATCH start pat=\"{s}\" in=\"{s}\" fwd={d} rev={d}\n", .{ p, in, w.start, got.?.start });
+                    return e;
+                };
+                std.testing.expectEqual(w.end, got.?.end) catch |e| {
+                    std.debug.print("MISMATCH end pat=\"{s}\" in=\"{s}\" fwd={d} rev={d}\n", .{ p, in, w.end, got.?.end });
+                    return e;
+                };
+            }
+        }
+    }
 }

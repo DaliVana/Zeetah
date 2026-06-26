@@ -35,6 +35,7 @@ const thompson = @import("../thompson.zig");
 const full_dfa = @import("full_dfa.zig");
 const lazy_dfa = @import("lazy_dfa.zig");
 const core = @import("core.zig");
+const search = @import("search.zig");
 const seq_extract = @import("seq_extract.zig");
 const properties = @import("../properties.zig");
 const class_span = @import("class_span.zig");
@@ -89,6 +90,24 @@ pub const Seek = struct {
     /// (`Ranges.firstMember`). Same precedence rationale as `lb_byte` (it is the
     /// exact dropped constraint); only one of `lb_byte`/`lb_set` is ever set.
     lb_set: ?class_span.Ranges = null,
+    /// `$`/`\z`-anchored over-approximation only: the REVERSE DFA
+    /// (`full_dfa.computeReverse`) of the relaxation. Drives `rejectsAnchoredEnd`
+    /// — ONE O(n) reverse pass that proves "no suffix of the over-approx ends at
+    /// `input.len`", hence (by `L(true) ⊆ L(approx)`) no real `$`-match anywhere
+    /// ⇒ the tree backtracker returns null without the per-offset scan. Replaces
+    /// the per-offset `Dfa256` locate, which for `a_end` is O(n²)/call. Only set
+    /// for a NON-nullable approximation (a nullable one matches the empty suffix
+    /// at end, so it could never reject). When set, the other locators are not.
+    rev_neg: ?*full_dfa.Dfa256 = null,
+
+    /// `$`-anchored fast-negative: true ⇒ no suffix of the regular
+    /// over-approximation ends at `input.len` at/after `from`, so the real
+    /// `$`-anchored backref/lookaround pattern cannot match — the caller returns
+    /// null in this one O(n) pass instead of burning the step budget (`(a+)\1$`).
+    pub fn rejectsAnchoredEnd(self: *const Seek, input: []const u8, from: usize) bool {
+        const rev = self.rev_neg orelse return false;
+        return search.reverseSearch(rev, input, from, input.len) == null;
+    }
 
     /// Smallest absolute position `≥ from` where a match can begin, or
     /// `null` (⇒ no candidate ahead ⇒ no real match either; every branch
@@ -113,7 +132,11 @@ pub const Seek = struct {
             return sp.start;
         }
         if (self.cdfa) |c| return c.locate(input, from);
-        const sp = core.findLeftmost(self.dfa.?, input[from..]) orelse return null;
+        // `rev_neg`-only Seek (the `$`-anchored fast-negative): no per-offset
+        // locator, so don't skip — the caller already ran `rejectsAnchoredEnd`
+        // once; here just hand back `from` (a sound, no-skip candidate).
+        const d = self.dfa orelse return from;
+        const sp = core.findLeftmost(d, input[from..]) orelse return null;
         return from + sp.start;
     }
 
@@ -123,6 +146,7 @@ pub const Seek = struct {
             self.allocator.destroy(p);
         }
         if (self.dfa) |p| self.allocator.destroy(p);
+        if (self.rev_neg) |p| self.allocator.destroy(p);
     }
 };
 
@@ -184,6 +208,29 @@ pub fn build(allocator: std.mem.Allocator, h: *const H) ?*Seek {
     if (properties.nonSelectiveApprox(null, &oh, oh.root)) return null;
 
     var nfa = thompson.build(null, &oh) catch return null;
+
+    // `$`/`\z`-anchored over-approximation: every real match must end at
+    // `input.len`, so a single O(n) REVERSE pass over the relaxation is a sound
+    // fast-negative — "no suffix of the over-approx ends at `input.len` ⇒ no real
+    // `$`-match anywhere". This replaces the per-offset `Dfa256` locate (which
+    // for `a_end` is O(n²)/call — the very thing that made `(a*)\1$`/`(a+)\1$`
+    // pay un-ticked quadratic seek work). Only a NON-nullable approximation can
+    // ever reject (a nullable one matches the empty suffix at end), so a nullable
+    // / exploded reverse build yields no prefilter — the backtracker's
+    // step-budgeted scan is then the only (correct) bound. Mutually exclusive
+    // with the dense/Dfa256 locators below (which never run for `a_end`).
+    if (oh.anchored_end) {
+        const rd = full_dfa.computeReverse(null, &nfa);
+        if (rd.outcome != .ok or rd.start >= rd.n_states or rd.accepting[rd.start]) return null;
+        const heap = allocator.create(full_dfa.Dfa256) catch return null;
+        heap.* = rd;
+        const sk = allocator.create(Seek) catch {
+            allocator.destroy(heap);
+            return null;
+        };
+        sk.* = .{ .allocator = allocator, .rev_neg = heap };
+        return sk;
+    }
 
     // --- preferred: frozen DenseSearch (lever A, O(n) single pass) --------
     // freezeDense returns null for anchored / conditional / state-cap; that

@@ -28,6 +28,10 @@ pub const DenseSearch = struct {
     n_rev: usize,
     start_fwd: u16,
     start_rev: u16,
+    /// `$`/`\z`-anchored: a match must end at `input.len`, so `findFrom` is a
+    /// pure reverse-reachability pass (the forward `utrans`/`atrans`/`accept`
+    /// tables are unused). See `lazy_dfa.LazyProg.findAnchoredEndFrom`.
+    a_end: bool = false,
     utrans: []u16, // [sid*nc + cls]; never DEAD (the `.*?` re-injection)
     atrans: []u16, // [sid*nc + cls]; DEAD ⇒ leftmost-first lineage died
     accept: []bool, // [sid]
@@ -53,6 +57,31 @@ pub const DenseSearch = struct {
     /// `reverseStart` exactly (`lo == from`), as raw table indexing.
     pub fn findFrom(self: *const DenseSearch, input: []const u8, from: usize) ?Span {
         const nc = self.n_classes;
+        // `$`/`\z`-anchored: a match ends exactly at `input.len`, so this is a
+        // pure reverse-reachability pass from `input.len` back toward `from`
+        // (the forward leftmost-first accept-cut would wrongly drop a
+        // later-starting thread — see `LazyProg.findAnchoredEndFrom`). The
+        // forward `Σ*?` walk that the `O(n²)` eager restart degenerates into is
+        // replaced by this single O(n) reverse pass.
+        if (self.a_end) {
+            var rsid: u16 = self.start_rev;
+            var exists = self.rhas_start[rsid]; // nullable/empty match at end
+            var start: usize = input.len;
+            var pos: usize = input.len;
+            while (pos > from) {
+                const cls = self.class_of[input[pos - 1]];
+                const n = self.rtrans[@as(usize, rsid) * nc + cls];
+                if (n == DEAD) break;
+                rsid = n;
+                pos -= 1;
+                if (self.rhas_start[rsid]) {
+                    exists = true;
+                    start = pos; // descending pos ⇒ last write is the leftmost
+                }
+            }
+            if (!exists) return null;
+            return .{ .start = start, .end = input.len };
+        }
         var sid: u16 = self.start_fwd;
         var have = self.accept[sid];
         var end: usize = from;

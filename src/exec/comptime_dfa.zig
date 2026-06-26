@@ -235,6 +235,18 @@ pub fn Dfa(comptime n_states: usize, comptime n_classes: usize) type {
             return null;
         }
 
+        /// `$`/`\z`-anchored single-pass leftmost match over a REVERSE DFA baked
+        /// by `full_dfa.computeReverse` — the comptime peer of the runtime
+        /// `lazy_dfa.findAnchoredEndFrom` / `DenseSearch`(a_end) reverse pass.
+        /// `self` is the reverse automaton: read `input` BACKWARD from
+        /// `input.len`, where `isAccepting(state)` means "the forward start is
+        /// reachable", i.e. the pattern matches a suffix ending at `input.len`;
+        /// the leftmost such position is the match start. One O(n) reverse pass,
+        /// replacing the per-offset restart that made unanchored `class+$` O(n²).
+        pub fn findAnchoredEnd(self: *const Self, input: []const u8) ?Span {
+            return search.reverseSearch(self, input, 0, input.len);
+        }
+
         /// Does *some* accepting state become reachable from `start_pos`?
         /// Unlike `runFrom`, this returns at the first accept (no need to
         /// find the longest end), so `isMatch` is a true early-out.

@@ -368,6 +368,14 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
         pub fn runFrom(self: *Self, input: []const u8, from: usize, slots_out: []i32) Error!?Span {
             self.input = input;
             self.budget = 8000 + @as(u64, input.len + 1) * 4000; // O(n) work bound
+            // `$`-anchored fast-negative: one O(n) reverse pass over the regular
+            // over-approximation. If no suffix of it ends at `input.len`, no real
+            // `$`-anchored backref/lookaround match exists (`L(true) ⊆ L(approx)`)
+            // — return null here instead of burning the whole step budget on the
+            // tree walk (`(a+)\1$` on adversarial input: seconds → O(n)).
+            if (self.seek) |sd| {
+                if (sd.rejectsAnchoredEnd(input, from)) return null;
+            }
             var start: usize = from;
             while (start <= input.len) : (start += 1) {
                 // Seek: skip the proven-dead prefix where the regular

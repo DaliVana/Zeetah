@@ -247,6 +247,21 @@ fn crAgree(comptime p: []const u8) !void {
             try std.testing.expectEqual(pmm.start, rm.?.start);
             try std.testing.expectEqual(pmm.end, rm.?.end);
         }
+        // Enumeration parity: `count`/`findAll` exercise the `nextSpanFrom`
+        // RESUME convention (comptime re-slices `input[from..]`, runtime resumes
+        // at absolute `pos`) and the empty-match-at-end advance for nullable `$`
+        // patterns — the surface the reverse single-pass touches that `find`
+        // alone does not. (This closes the coverage gap the review flagged.)
+        try std.testing.expectEqual(P.count(in), try rx.count(in));
+        const pall = try P.findAll(a, in);
+        defer a.free(pall);
+        const rall = try rx.findAll(a, in);
+        defer a.free(rall);
+        try std.testing.expectEqual(pall.len, rall.len);
+        for (pall, rall) |pa, ra| {
+            try std.testing.expectEqual(pa.start, ra.start);
+            try std.testing.expectEqual(pa.end, ra.end);
+        }
     }
 }
 
@@ -273,6 +288,29 @@ test "comptime Pattern <-> runtime Regex agree across the supported subset" {
     try crAgree("abc[0-9]+z");
     try crAgree("hello.*world");
     try crAgree("[A-Z].*foobar");
+    // Unanchored `$`-anchored class repeats: the single-pass reverse-DFA path
+    // (`full_dfa.computeReverse` / `comptime_dfa.Dfa.findAnchoredEnd`) that
+    // fixes the comptime O(n²) leftmost search. These route to `.dfa` + a_end
+    // (no literal prefix), so they exercise the reverse arm — not Teddy — and
+    // pin its spans bit-for-bit to the runtime `Regex` (which uses the lazy/dense
+    // reverse pass). `abc$`/`^\d+$` above do NOT cover it (literal / anchored).
+    try crAgree("[a-z]+$");
+    try crAgree("\\d+$");
+    try crAgree("a+$");
+    try crAgree("a*a*$");
+    try crAgree("(a+)+$");
+    try crAgree(".*a$");
+    try crAgree("\\s*$");
+    try crAgree("[0-9]{2,4}$");
+    try crAgree("(cat|dog)$");
+    // Literal-prefixed `$` (route `.lit_prefix`): also driven by the reverse
+    // single pass (the runtime reroute + comptime `rev_ok` both include
+    // `.lit_prefix`), so the prefix-Teddy verify is bypassed. Pins those spans
+    // bit-for-bit too — `abc.*x$` was the CONFIRMED O(n²) residual.
+    try crAgree("abc.*x$");
+    try crAgree("abc[0-9]+$");
+    try crAgree("hello.*world$");
+    try crAgree("abc.*$");
 }
 
 // Non-regular tier differential: backref / lookaround / atomic / possessive /
