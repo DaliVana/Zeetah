@@ -20,6 +20,23 @@ const MAX_NFA = thompson.MAX_NFA;
 const MAX_EDGES = thompson.MAX_EDGES;
 const MAX_DFA: usize = 256; // internal array ceiling (explosion sentinel)
 
+// --- Adaptive SIMD self-loop "spin-skip" (see `Dfa256.runFromSpin`) ---------
+// A DFA state that self-loops over a wide byte class (`.*`, `[^"]*`, base64)
+// is invariant across the run, so it is sound to SIMD-scan (`pf.runEnd`) to the
+// first byte that leaves the state and resume the scalar walk. Two gates make
+// this purely additive (no regression on the data that lacks long runs):
+//   * SPIN_TRIGGER — engage only after this many *consecutive* self-loop bytes,
+//     so short runs stay 100% scalar and never pay vector setup.
+//   * SPIN_MIN_WIDTH — only track states whose self-loop class is at least this
+//     many bytes wide. Narrow classes (`\d`=10, `\w`=63, hex=22) have short runs
+//     in the text this engine targets, so gating them out keeps those patterns
+//     on the zero-overhead `runFromPlain`. 64 admits `.*`/`[^x]` (≈255) and
+//     base64 (64) — the shapes where long machine-generated runs actually occur.
+const SPIN_TRIGGER: usize = 64;
+const SPIN_MIN_WIDTH: usize = 64;
+const SPIN_MAX: usize = 16; // max distinct wide-self-loop states tracked per DFA
+const SPIN_NONE: u8 = 0xFF; // `stay_idx` sentinel: state has no skip set
+
 const E = error{TooComplex};
 
 pub const Outcome = enum { ok, exploded };
@@ -62,6 +79,16 @@ pub const Dfa256 = struct {
     /// broad-first-byte per-position restart. `null` ⇒ not applicable.
     req_lit: ?seq_extract.ReqLit = null,
 
+    /// Adaptive spin-skip acceleration (populated only by `compute`;
+    /// `computeReverse` and the comptime placeholder leave it disabled).
+    /// `has_spin` gates the whole feature: false ⇒ `runFrom` takes the
+    /// untouched `runFromPlain` with zero added per-byte cost. For a tracked
+    /// wide-self-loop state `s`, `stay_idx[s]` indexes `stay_sets` (the set of
+    /// bytes that keep the walk in `s`); otherwise it is `SPIN_NONE`.
+    has_spin: bool = false,
+    stay_idx: [MAX_DFA]u8 = [_]u8{SPIN_NONE} ** MAX_DFA,
+    stay_sets: [SPIN_MAX][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** SPIN_MAX,
+
     /// Anchored leftmost-first run from `start_pos`: walk the table consuming
     /// input until the DEAD sink (state 0) or end of input, tracking the last
     /// accepting position reached (the leftmost-first end for the surviving
@@ -85,6 +112,14 @@ pub const Dfa256 = struct {
     }
 
     pub inline fn runFrom(self: *const Dfa256, input: []const u8, start_pos: usize) ?usize {
+        // One predicted branch on a `*const` bool: patterns with no wide
+        // self-loop state inline the untouched scalar loop; only those that can
+        // actually benefit take the spin variant.
+        if (self.has_spin) return self.runFromSpin(input, start_pos);
+        return self.runFromPlain(input, start_pos);
+    }
+
+    inline fn runFromPlain(self: *const Dfa256, input: []const u8, start_pos: usize) ?usize {
         var state: u16 = @intCast(self.start);
         var last_accept: ?usize = if (self.accepting[state]) start_pos else null;
         var i: usize = start_pos;
@@ -93,6 +128,62 @@ pub const Dfa256 = struct {
             state = self.trans[state][cls];
             if (state == 0) break; // DEAD sink
             if (self.accepting[state]) last_accept = i + 1;
+        }
+        if (self.a_end) {
+            if (last_accept) |e| {
+                if (e == input.len) return e;
+            }
+            return null;
+        }
+        return last_accept;
+    }
+
+    /// `runFromPlain` plus an adaptive SIMD self-loop skip. When the walk
+    /// self-loops on one state for SPIN_TRIGGER consecutive bytes and that state
+    /// has a wide stay set, `pf.runEnd` bulk-consumes the maximal run of stay
+    /// bytes in one vector scan instead of one table lookup per byte. Short runs
+    /// (< the trigger) never touch SIMD, so the result is byte-identical to
+    /// `runFromPlain` and the cost on long self-loop inputs (minified JSON `.*`,
+    /// quoted bodies `[^"]*`, base64) is one memory-bandwidth scan, not O(run).
+    /// Deliberately NOT `inline`: inlining it bloats every `runFrom` call site
+    /// and measurably regresses unrelated no-spin, many-short-call patterns
+    /// (ssn/time_hms/uuid −20–30%) for zero benefit. Keeping it out-of-line
+    /// confines any cost to the wide-self-loop patterns that opt in.
+    fn runFromSpin(self: *const Dfa256, input: []const u8, start_pos: usize) ?usize {
+        var state: u16 = @intCast(self.start);
+        var last_accept: ?usize = if (self.accepting[state]) start_pos else null;
+        var i: usize = start_pos;
+        var spin: usize = 0;
+        while (i < input.len) {
+            const cls = self.class_of[input[i]];
+            const next = self.trans[state][cls];
+            if (next == 0) break; // DEAD sink
+            if (next == state) {
+                spin += 1;
+                if (spin == SPIN_TRIGGER) {
+                    const si = self.stay_idx[state];
+                    if (si != SPIN_NONE) {
+                        // input[i] is a stay byte ⇒ runEnd ≥ i+1; every byte of
+                        // the run keeps `state`, so if `state` is accepting the
+                        // (greedy) match end advances to the run end.
+                        const re = pf.runEnd(&self.stay_sets[si], input, i);
+                        if (self.accepting[state]) last_accept = re;
+                        i = re;
+                        spin = 0;
+                        continue;
+                    }
+                    // No skip set for this state: let `spin` grow past the
+                    // trigger so `== SPIN_TRIGGER` never re-fires for this run
+                    // (hot path stays one add + one compare per byte).
+                }
+                if (self.accepting[state]) last_accept = i + 1;
+                i += 1;
+            } else {
+                spin = 0;
+                state = next;
+                if (self.accepting[state]) last_accept = i + 1;
+                i += 1;
+            }
         }
         if (self.a_end) {
             if (last_accept) |e| {
@@ -484,7 +575,104 @@ pub fn compute(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), a_start: boo
     }
 
     if (n_min > MAX_DFA) return emptyDfa256(.exploded);
+
+    // --- Adaptive spin-skip: precompute per-state stay sets ----------------
+    // For each non-DEAD state, the set of bytes that keep the walk in that same
+    // state (its self-loop class). Track only states at least SPIN_MIN_WIDTH
+    // wide, at most SPIN_MAX of them; `runFromSpin` SIMD-skips their long runs.
+    // Leaving `has_spin` false (the common case) keeps `runFrom` on the
+    // zero-overhead scalar loop. Transitions are keyed by equivalence class, so
+    // a state's stay set is the union of the classes it self-loops on — width
+    // is summed first (O(n_classes)) and the bitmap is OR-ed from per-class
+    // member maps only for the states that qualify. Build-time only.
+    {
+        // Per-class member bitmap + popcount, computed once over 256 bytes.
+        var class_bm = [_][32]u8{[_]u8{0} ** 32} ** MAX_DFA;
+        var class_pop = [_]u16{0} ** MAX_DFA;
+        {
+            var b: usize = 0;
+            while (b < 256) : (b += 1) {
+                const cl = class_of[b];
+                pf.setBit(&class_bm[cl], @intCast(b));
+                class_pop[cl] += 1;
+            }
+        }
+        var slot: usize = 0;
+        var s: usize = 1; // state 0 is the DEAD sink — never a spin state
+        while (s < n_min and slot < SPIN_MAX) : (s += 1) {
+            const sid: u16 = @intCast(s);
+            // Self-loop class width first; only build the bitmap if it qualifies.
+            var width: usize = 0;
+            var cl: usize = 0;
+            while (cl < n_classes) : (cl += 1) {
+                if (out.trans[s][cl] == sid) width += class_pop[cl];
+            }
+            if (width < SPIN_MIN_WIDTH) continue;
+            var stay = [_]u8{0} ** 32;
+            cl = 0;
+            while (cl < n_classes) : (cl += 1) {
+                if (out.trans[s][cl] == sid) {
+                    var w: usize = 0;
+                    while (w < 32) : (w += 1) stay[w] |= class_bm[cl][w];
+                }
+            }
+            out.stay_sets[slot] = stay;
+            out.stay_idx[s] = @intCast(slot);
+            slot += 1;
+            out.has_spin = true;
+        }
+    }
+
     return out;
+}
+
+test "runFromSpin == runFromPlain (differential, long self-loop runs)" {
+    const parser = @import("../parser.zig");
+    const hir = @import("../hir.zig");
+    const a = std.testing.allocator;
+
+    // Each pattern has a wide self-loop state, so `compute` enables the skip.
+    const pats = [_][]const u8{
+        ".*x", ".*", "a.*9", "<[^>]+>", "[A-Za-z0-9+/]+=*", "\"[^\"]*\"", ".*=.*",
+    };
+    var prng = std.Random.DefaultPrng.init(0x5217);
+    const rnd = prng.random();
+    // Lengths straddle the SPIN_TRIGGER boundary (63/64/65) and run well past it.
+    const lengths = [_]usize{ 0, 1, 63, 64, 65, 100, 128, 300, 1000 };
+    const alpha = "aXb9<> \"/+=zQ\n"; // mix of self-loop and run-ending bytes
+
+    var saw_spin = false;
+    for (pats) |p| {
+        var h = hir.Hir(null).initRuntime();
+        defer h.deinit(a);
+        parser.parse(null, &h, a, p, .{}) catch continue;
+        var nfa = thompson.build(null, &h) catch continue;
+        const d = compute(null, &nfa, h.anchored_start, h.anchored_end);
+        if (d.outcome != .ok) continue;
+        if (d.has_spin) saw_spin = true;
+
+        for (lengths) |len| {
+            const buf = try a.alloc(u8, len);
+            defer a.free(buf);
+
+            // (1) random biased buffer — varied run lengths around the trigger.
+            for (buf) |*c| c.* = alpha[rnd.int(usize) % alpha.len];
+            for (0..len + 1) |sp| {
+                try std.testing.expectEqual(d.runFromPlain(buf, sp), d.runFromSpin(buf, sp));
+            }
+
+            // (2) one long pure self-loop run + a terminator — guarantees the
+            // SIMD `runEnd` skip actually fires (run ≫ SPIN_TRIGGER).
+            if (len >= 2) {
+                @memset(buf, 'a');
+                buf[len - 1] = 'x';
+                for (0..len + 1) |sp| {
+                    try std.testing.expectEqual(d.runFromPlain(buf, sp), d.runFromSpin(buf, sp));
+                }
+            }
+        }
+    }
+    try std.testing.expect(saw_spin); // the test must exercise real spin DFAs
 }
 
 test "computeReverse + reverseSearch == forward core.findLeftmost ($-anchored oracle)" {

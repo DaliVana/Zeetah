@@ -77,21 +77,20 @@ naturally with the existing `@Vector` usage in `src/prefilter.zig`. Big win on
 short-to-medium patterns where a full DFA table is overkill.
 
 ### 2.5 SIMD self-loop / "spin-state" skip in the DFA hot loop
-**Impact: high · Effort: medium · Risk: medium · Status: DEFERRED — needs a gate (ReleaseFast re-eval; see `docs/VECTOR_SKIP_FINDINGS.md`)**
+**Impact: high · Effort: medium · Risk: medium · Status: SHIPPED (gated; see `docs/SIMD.md` §7)**
 
-> **Outcome (revised after ReleaseFast re-eval):** The adaptive
-> **trigger-on-self-loop + compact index + `SPIN_TRIGGER`** redesign works — in
-> ReleaseFast it is **+~5× on long self-loop runs** (`<[^>]+>` over a long body).
-> But it is **not free**: it costs **−5–12% on short-run `full_dfa` workloads**
-> (path_unix, k8s_fluentd, json_string), corpus geomean 0.968. The earlier
-> "neutral at 1 MB" was a Debug-build artifact. So it was **removed from this
-> branch and deferred** until it is *gated* — engage only when the DFA has a
-> wide self-loop class and long runs are expected — so the long-run win does not
-> tax typical short-run matching. `dense_search.findFrom` was left scalar for
-> the same reason (its Debug "−1.5×" was inflated, but the real machinery still
-> carries the short-run cost). Upside is long-run inputs (large base64 / quoted
-> bodies / minified data). The original proposal text
-> below is kept for context.
+> **Outcome (shipped):** Implemented in `full_dfa.Dfa256.runFromSpin`, gated by
+> a per-DFA `has_spin` flag (`SPIN_MIN_WIDTH = 64`: only states self-looping over
+> a ≥64-byte class opt in) and `SPIN_TRIGGER = 64` (engage `prefilter.runEnd`
+> only after 64 consecutive self-loop bytes). ReleaseFast, best-of-5, 1 MiB:
+> `log_parse` **3.5×**, `html_tag`/`path_unix` 1.26×, `json_string` 1.21×,
+> `email`/`href` ~1.2–1.3×; corpus **geomean +3.5%**. It remains a *trade* — a
+> few patterns with a wide self-loop state but short runs (`xml_attr` 0.71×,
+> `grok_named` 0.85×) pay the loop restructure for no skip; the per-DFA gate keeps
+> the cost off every pattern without a wide self-loop. `dense_search.findFrom`
+> was left scalar (its non-inlined two-branch loop tolerates no per-byte add), and
+> inlining `runFromSpin` was rejected (it bloated unrelated no-spin call sites).
+> The original proposal text below is kept for context.
 
 IDEAS.md "stable local neighborhood … SIMD scan for a delimiter." The hot DFA
 walk (`src/exec/full_dfa.zig`, `lazy_dfa.zig`, `dense_search.zig`, `core.zig`,
@@ -177,7 +176,7 @@ linear-time parsing.
 > here — words are never ≥16 bytes, so vectorization cannot win. The scalar
 > path is optimal. (A standalone microbench of `findCap` mislead­ingly showed
 > "neutral" because it folded away the runtime `?Ranges` unwrap + heap deref
-> that the engine pays — see `docs/VECTOR_SKIP_FINDINGS.md`.)
+> that the engine pays — measure inside the real engine; see `docs/SIMD.md` §9.)
 
 The adjacent-duplicate-word backref fast-path (`src/exec/dupword.zig`, the
 `(\bCLASS+\b)SEP\1` shape) still walks its maximal CLASS run one byte at a time
@@ -192,14 +191,14 @@ gate-tested primitive, no new SIMD code.
 
 ## Suggested ordering
 
-Resolved by the `@Vector` experiment + ReleaseFast re-eval
-(`docs/VECTOR_SKIP_FINDINGS.md`): **3.3 SHIPPED** (this branch — a clear ci win),
-**2.5 DEFERRED** (full_dfa spin-skip: +~5× long runs but −5–12% short runs;
-needs a gate), **4.4 REVERTED** (net-negative). The big takeaway: inside the
-automaton/scan hot loops the scalar baseline is already near-optimal for the
-short runs that survive the prefilter, so unconditional `@Vector` work there does
-not pay — SIMD only helps *before* the automaton (the shipped prefilter / Teddy /
-`class_span` scanners) or *behind a long-run gate* (2.5) where runs are long.
+Resolved by the `@Vector` experiment + ReleaseFast re-eval (now folded into
+`docs/SIMD.md` §7–§9): **3.3 SHIPPED** (ci literal routing), **2.5 SHIPPED**
+(full_dfa spin-skip, gated — geomean +3.5%), **4.4 REVERTED** (net-negative). The
+big takeaway: inside the automaton/scan hot loops the scalar baseline is already
+near-optimal for the short runs that survive the prefilter, so unconditional
+`@Vector` work there does not pay — SIMD only helps *before* the automaton (the
+shipped prefilter / Teddy / `class_span` scanners) or *behind a long-run gate*
+(2.5) where runs are long.
 
 Remaining, roughly in priority:
 

@@ -286,15 +286,33 @@ fn scanRequired(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, best
 /// of restarting the DFA at every position (the broad-first-byte O(n²) case
 /// — e.g. `…@…`, `…://…`, `\d{3}-\d{2}-\d{4}`). Necessary condition only;
 /// the engine always re-verifies, so this never changes an outcome.
+pub const MAX_REQLIT = 32;
+
+/// How to recover a match START from an anchor-literal occurrence.
+pub const ReqLitBack = union(enum) {
+    /// Match start is exactly `L_pos - k` (fixed-width mandatory prefix).
+    fixed: usize,
+    /// Match start = walk back from `L` over bytes in this set (the pattern
+    /// opens with a single `set`+/`set`* run, `L[0] ∉ set`).
+    class: [32]u8,
+};
+
 pub const ReqLit = struct {
-    byte: u8,
-    back: union(enum) {
-        /// Match start is exactly `R_pos - k` (fixed-width mandatory prefix).
-        fixed: usize,
-        /// Match start = walk back from `R` over bytes in this set (the
-        /// pattern opens with a single `set`+/`set`* run, `R ∉ set`).
-        class: [32]u8,
-    },
+    /// The anchor literal `lit[0..len]`. `len == 1` is the original single rare
+    /// byte (located by `memchr`); `len >= 2` is a selective *inner* literal
+    /// (reverse-inner anchoring). A multi-byte anchor occurs far less often than
+    /// any single byte, so far fewer candidate positions reach the `runFrom`
+    /// verifier (e.g. `[a-z]+/api/v2/[a-z]+` keys on `/api/v2/`, not on `/`).
+    lit: [MAX_REQLIT]u8 = [_]u8{0} ** MAX_REQLIT,
+    len: u8 = 1,
+    /// The byte `prefilter.findLiteralOcc` locates the literal by (`memchr`, or
+    /// the first byte of its two-byte SIMD filter), at offset `probe_off`. Picked
+    /// by `pickProbe`. Substring search (`std.mem.indexOfPos`) is deliberately
+    /// NOT used — it is much slower than `memchr` when the literal is frequent
+    /// (e.g. `://` in a URL-dense corpus).
+    probe: u8 = 0,
+    probe_off: u8 = 0,
+    back: ReqLitBack,
 };
 
 const MAXI = 64;
@@ -335,10 +353,61 @@ fn flatten(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, out: *[MA
     }
 }
 
-/// Pick the rarest mandatory single byte whose match-start is recoverable
-/// (fixed-width prefix, or a leading single `set`-run), or null. Sound for
-/// *leftmost* search: `R` cannot occur inside its own preceding prefix, so
-/// `R`-occurrence order equals match-start order.
+/// Per-byte "rarity": higher = occurs less often in text, so a more selective
+/// anchor. Monotone-decreasing in `pf.FREQ`, so for a single byte picking the
+/// max rarity is exactly the old "rarest byte by FREQ". Summed over a literal's
+/// bytes it rewards both length and rare bytes, so a multi-byte literal beats a
+/// single byte unless that byte is genuinely rarer than the whole run.
+inline fn rarity(b: u8) u32 {
+    return @as(u32, 1024) / (@as(u32, pf.FREQ[b]) + 1);
+}
+
+/// Pick the byte `prefilter.findLiteralOcc` should locate `lit` by. Prefer the
+/// rarest **robustly-rare** byte (low-frequency letter / non-ASCII) at its first
+/// offset — `memchr` on it is selective regardless of corpus. If the literal is
+/// all-common (`://`, `-FOO-`, structural punctuation), pick the rarest byte at
+/// offset ≥ 1 so `findLiteralOcc`'s two-byte SIMD filter ANDs `lit[0]` with a
+/// *decorrelated* second byte (larger offset breaks FREQ ties — the same
+/// decorrelation `prefilter.Teddy.build` seeks for its `b2`). Mirrors that
+/// heuristic but stays separate: this prefers robust-rarity for `memchr`
+/// selectivity, where Teddy optimises a fixed two-byte AND.
+fn pickProbe(lit: []const u8) struct { byte: u8, off: u8 } {
+    var byte: u8 = lit[0];
+    var off: u8 = 0;
+    // pass 1: rarest robustly-rare byte (first offset wins on tie).
+    var bestf: u16 = std.math.maxInt(u16);
+    var found = false;
+    for (lit, 0..) |b, m| {
+        if (pf.robustlyRareProbe(b) and pf.FREQ[b] < bestf) {
+            found = true;
+            bestf = pf.FREQ[b];
+            byte = b;
+            off = @intCast(m);
+        }
+    }
+    if (found or lit.len < 2) return .{ .byte = byte, .off = off };
+    // pass 2: all-common literal — rarest byte at offset ≥ 1 (larger offset wins
+    // on tie, to decorrelate the two-byte filter's second probe from `lit[0]`).
+    bestf = std.math.maxInt(u16);
+    var m: usize = 1;
+    while (m < lit.len) : (m += 1) {
+        if (pf.FREQ[lit[m]] <= bestf) {
+            bestf = pf.FREQ[lit[m]];
+            byte = lit[m];
+            off = @intCast(m);
+        }
+    }
+    return .{ .byte = byte, .off = off };
+}
+
+/// Pick the most selective mandatory literal whose match-start is recoverable
+/// (fixed-width prefix, or a leading single `set`-run), or null. Generalises the
+/// single-rare-byte anchor to the **longest/rarest consecutive mandatory literal
+/// run** (reverse-inner): the anchor `lit[0..len]` is necessary at a recoverable
+/// offset, so locating it and recovering the start yields candidate matches that
+/// `runFrom` verifies. Sound for *leftmost* search: the anchor cannot occur
+/// inside its own preceding prefix, so anchor-occurrence order equals
+/// match-start order. A length-1 result is byte-identical to the old behaviour.
 pub fn requiredLiteralBack(comptime cap: ?usize, h: *const hir.Hir(cap)) ?ReqLit {
     @setEvalBranchQuota(1_000_000);
     var items: [MAXI]SpItem = undefined;
@@ -346,34 +415,53 @@ pub fn requiredLiteralBack(comptime cap: ?usize, h: *const hir.Hir(cap)) ?ReqLit
     flatten(cap, h, h.root, &items, &n);
 
     var best: ?ReqLit = null;
-    var bestf: u16 = std.math.maxInt(u16);
+    var best_score: u32 = 0;
+
     var i: usize = 0;
     while (i < n) : (i += 1) {
         if (items[i].kind != .lit1) continue;
-        const r = items[i].byte;
-        if (pf.FREQ[r] >= bestf) continue;
+        // Maximal run of consecutive mandatory literal bytes at `i` (capped).
+        var j = i;
+        while (j < n and items[j].kind == .lit1 and (j - i) < MAX_REQLIT) : (j += 1) {}
+        const lo = i;
+        const hi = j;
+        const r = items[lo].byte; // anchor's first byte — drives recoverability
 
-        // fixed: every item before `i` is a fixed-width-1 element that
-        // cannot itself match `r` (so `R`-order == start-order).
+        // Recoverability of the anchor START at index `lo` (mirrors the
+        // single-byte rule; the run's bytes are width-1 so a recoverable middle
+        // byte implies a recoverable `lo`, and anchoring the whole run dominates).
+        var back: ?ReqLitBack = null;
+        // fixed: every item before `lo` is a width-1 element that cannot match `r`.
         var all_fixed = true;
-        var j: usize = 0;
-        while (j < i) : (j += 1) {
-            const it = items[j];
+        var k: usize = 0;
+        while (k < lo) : (k += 1) {
+            const it = items[k];
             if (it.kind == .lit1 and it.byte != r) continue;
             if (it.kind == .cls1 and !hasBit(&it.set, r)) continue;
             all_fixed = false;
             break;
         }
         if (all_fixed) {
-            best = .{ .byte = r, .back = .{ .fixed = i } };
-            bestf = pf.FREQ[r];
-            continue;
+            back = .{ .fixed = lo };
+        } else if (lo == 1 and items[0].kind == .run and !hasBit(&items[0].set, r)) {
+            back = .{ .class = items[0].set }; // one `set`-run immediately before `L`
         }
-        // class: pattern opens with one `set`-run immediately before `r`.
-        if (i == 1 and items[0].kind == .run and !hasBit(&items[0].set, r)) {
-            best = .{ .byte = r, .back = .{ .class = items[0].set } };
-            bestf = pf.FREQ[r];
+
+        if (back) |bk| {
+            var score: u32 = 0;
+            var m: usize = lo;
+            while (m < hi) : (m += 1) score += rarity(items[m].byte);
+            if (score > best_score) {
+                best_score = score;
+                var lit: [MAX_REQLIT]u8 = [_]u8{0} ** MAX_REQLIT;
+                var m2: usize = lo;
+                while (m2 < hi) : (m2 += 1) lit[m2 - lo] = items[m2].byte;
+                const len: u8 = @intCast(hi - lo);
+                const p = pickProbe(lit[0..len]);
+                best = .{ .lit = lit, .len = len, .probe = p.byte, .probe_off = p.off, .back = bk };
+            }
         }
+        i = hi - 1; // skip the rest of this run (loop `i += 1` resumes at `hi`)
     }
     return best;
 }
@@ -670,6 +758,23 @@ test "seq_extract: requiredByte picks rarest mandatory spine literal" {
         var h = H.initComptime();
         try parser.parse(256, &h, undefined, case[0], .{});
         try std.testing.expectEqual(case[1], requiredByte(256, &h));
+    }
+}
+
+test "seq_extract: requiredLiteralBack picks most selective literal (reverse-inner)" {
+    const parser = @import("../parser.zig");
+    const H = hir.Hir(256);
+    inline for (.{
+        .{ "[a-z]+/api/v2/[a-z]+", "/api/v2/" }, // inner literal, class-back
+        .{ "[a-z]+://[a-z]+", "://" }, // uri-shaped: anchor on "://", not ":"
+        .{ "[a-z]+CONNECT[a-z]+", "CONNECT" }, // rarer whole run beats any 1 byte
+        .{ "abcdef", "abcdef" }, // leading whole literal, fixed-back
+        .{ "\\d{3}-\\d{2}-\\d{4}", "-" }, // no consecutive lit run ⇒ single byte
+    }) |case| {
+        var h = H.initComptime();
+        try parser.parse(256, &h, undefined, case[0], .{});
+        const rl = requiredLiteralBack(256, &h) orelse return error.NoReqLit;
+        try std.testing.expectEqualStrings(case[1], rl.lit[0..rl.len]);
     }
 }
 

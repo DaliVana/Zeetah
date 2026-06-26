@@ -80,7 +80,7 @@ pub fn findLeftmost(d: *const Dfa, input: []const u8) ?Span {
     // Necessary-literal-anywhere: memchr a rare mandatory byte and recover
     // the match start from it (fixed offset, or a leading set-run), instead
     // of restarting the DFA at every position behind a broad first-byte set.
-    if (d.req_lit) |rl| return search.findViaReqLit(d, input, rl);
+    if (d.req_lit) |*rl| return search.findViaReqLit(d, input, rl);
     const can_skip = !isAccepting(d, @intCast(d.start));
     var sp: usize = 0;
     while (sp <= input.len) : (sp += 1) {
@@ -107,7 +107,7 @@ pub fn isMatch(d: *const Dfa, input: []const u8) bool {
     if (d.a_end) return findLeftmost(d, input) != null;
     if (isAccepting(d, @intCast(d.start))) return true;
     if (d.a_start) return acceptsFrom(d, input, 0);
-    if (d.req_lit) |rl| return search.findViaReqLit(d, input, rl) != null;
+    if (d.req_lit) |*rl| return search.findViaReqLit(d, input, rl) != null;
     const can_skip = !isAccepting(d, @intCast(d.start));
     var sp: usize = 0;
     while (sp <= input.len) : (sp += 1) {
@@ -173,6 +173,65 @@ test "core: DFA bounds equal a hand-checked example" {
     const sp = findLeftmost(&d, "xxabbcyy").?;
     try std.testing.expectEqual(@as(usize, 2), sp.start);
     try std.testing.expectEqual(@as(usize, 6), sp.end);
+}
+
+test "core: reverse-inner req_lit on/off agree on findAll (differential)" {
+    const hir = @import("../hir.zig");
+    const parser = @import("../parser.zig");
+    const thompson = @import("../thompson.zig");
+    const a = std.testing.allocator;
+
+    // Patterns whose only selective literal is INNER (no usable prefix/suffix),
+    // so `requiredLiteralBack` returns a multi-byte anchor located via class-back.
+    const pats = [_][]const u8{
+        "[a-z]+/api/v2/[a-z]+",
+        "[a-z]+://[a-z]+",
+        "[a-z]+CONNECT[a-z]+",
+        "[a-z]*MIDDLE[a-z]*",
+    };
+    var prng = std.Random.DefaultPrng.init(0xABCDEF1234);
+    const rnd = prng.random();
+    var saw_multi = false;
+
+    for (pats) |p| {
+        var h = hir.Hir(null).initRuntime();
+        defer h.deinit(a);
+        parser.parse(null, &h, a, p, .{}) catch continue;
+        var nfa = thompson.build(null, &h) catch continue;
+        var d = full_dfa.compute(null, &nfa, h.anchored_start, h.anchored_end);
+        if (d.outcome != .ok) continue;
+        const rl = seq_extract.requiredLiteralBack(null, &h) orelse continue;
+        if (rl.len >= 2) saw_multi = true;
+        const lit = rl.lit[0..rl.len];
+
+        var iter: usize = 0;
+        while (iter < 80) : (iter += 1) {
+            const len = rnd.intRangeAtMost(usize, 0, 160);
+            const buf = try a.alloc(u8, len);
+            defer a.free(buf);
+            for (buf) |*c| c.* = 'a' + @as(u8, @intCast(rnd.uintLessThan(u8, 8))); // a..h
+            // Inject the anchor a few times to force real matches and near-misses.
+            var inj: usize = 0;
+            while (inj < 3 and len >= lit.len + 2) : (inj += 1) {
+                if (rnd.boolean()) {
+                    const at = rnd.uintLessThan(usize, len - lit.len);
+                    @memcpy(buf[at..][0..lit.len], lit);
+                }
+            }
+            // anchor ON (findViaReqLit) vs OFF (brute-force skipToStart) must match.
+            d.req_lit = rl;
+            const wa = try findAll(&d, a, buf);
+            defer a.free(wa);
+            d.req_lit = null;
+            const wo = try findAll(&d, a, buf);
+            defer a.free(wo);
+            std.testing.expectEqualSlices(Span, wo, wa) catch |e| {
+                std.debug.print("MISMATCH pat=\"{s}\" buf=\"{s}\"\n", .{ p, buf });
+                return e;
+            };
+        }
+    }
+    try std.testing.expect(saw_multi); // the test must exercise the multi-byte path
 }
 
 test "core: literal strategy via prebuilt Teddy" {

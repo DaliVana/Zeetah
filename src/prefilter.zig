@@ -55,7 +55,7 @@ const MEMCHR_FREQ_MAX: u16 = 20;
 /// For those, the two-byte SIMD filter (`findOneSimd`) stays selective. `FREQ`
 /// itself is left as the generic English model (perturbing it globally just
 /// relocates the slow workload).
-inline fn robustlyRareProbe(b: u8) bool {
+pub inline fn robustlyRareProbe(b: u8) bool {
     if (b >= 0x80) return true; // non-ASCII: rare in text ⇒ excellent probe
     const is_alpha = (b >= 'A' and b <= 'Z') or (b >= 'a' and b <= 'z');
     return is_alpha and FREQ[b] <= MEMCHR_FREQ_MAX;
@@ -493,6 +493,62 @@ test "runEnd matches reference (differential, no overshoot)" {
             }
         }
     }
+}
+
+/// Leftmost start index `>= from` of literal `lit` in `input`, or null — the
+/// param-based single-literal finder used by the reverse-inner anchor
+/// (`exec/search.findViaReqLit`). It is the lightweight sibling of `Teddy`'s
+/// single-needle path: `memchr` a robustly-rare `probe` byte, or — when the
+/// literal is all-common so no byte is robustly rare — a two-byte SIMD AND
+/// filter (`lit[0]` at offset 0 AND `probe` at `probe_off`); then verify the
+/// full literal. `probe`/`probe_off` are chosen by `seq_extract.pickProbe`.
+/// Unlike `Teddy` it takes the literal by slice (no baked struct), so callers
+/// that already store the literal pay no extra space.
+///
+/// Leftmost-correct: a real occurrence at `s` has `lit[0]` at `s` and `probe` at
+/// `s + probe_off`, so both the memchr scan and the lane scan (both ascending)
+/// reach the smallest verifying `s >= from` first. The filter has no false
+/// negatives (every real occurrence is flagged), so none is skipped; false
+/// positives are dropped by the `eql` verify.
+pub fn findLiteralOcc(input: []const u8, from: usize, lit: []const u8, probe: u8, probe_off: usize) ?usize {
+    if (lit.len <= 1) return std.mem.indexOfScalarPos(u8, input, from, lit[0]);
+
+    if (robustlyRareProbe(probe)) {
+        // Rare probe ⇒ memchr is already selective; verify the full literal.
+        var pp = from + probe_off; // earliest probe position for a start >= from
+        if (pp > input.len) return null;
+        while (std.mem.indexOfScalarPos(u8, input, pp, probe)) |hp| {
+            const start = hp - probe_off; // hp >= from+probe_off ⇒ start >= from
+            if (start + lit.len <= input.len and
+                std.mem.eql(u8, input[start .. start + lit.len], lit)) return start;
+            pp = hp + 1;
+        }
+        return null;
+    }
+
+    // Common probe ⇒ two-byte SIMD filter (lit[0] at 0 AND probe at probe_off,
+    // probe_off >= 1 by construction so the two bytes are decorrelated).
+    const b1v: V = @splat(lit[0]);
+    const b2v: V = @splat(probe);
+    var i = from;
+    while (i + probe_off + VLEN <= input.len) : (i += VLEN) {
+        const c0: V = input[i..][0..VLEN].*;
+        const c1: V = input[i + probe_off ..][0..VLEN].*;
+        const cand: V = maskOf(c0 == b1v) & maskOf(c1 == b2v);
+        if (@reduce(.Or, cand) != 0) {
+            const lanes: [VLEN]u8 = cand;
+            var lane: usize = 0;
+            while (lane < VLEN) : (lane += 1) {
+                if (lanes[lane] != 0) {
+                    const start = i + lane;
+                    if (start + lit.len <= input.len and
+                        std.mem.eql(u8, input[start .. start + lit.len], lit)) return start;
+                }
+            }
+        }
+    }
+    // Scalar tail (< VLEN + probe_off bytes left): plain substring search.
+    return std.mem.indexOfPos(u8, input, i, lit);
 }
 
 // --- Teddy multi-substring prefilter ---------------------------------------

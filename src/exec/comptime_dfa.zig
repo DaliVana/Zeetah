@@ -225,7 +225,7 @@ pub fn Dfa(comptime n_states: usize, comptime n_classes: usize) type {
                 if (self.runFrom(input, 0)) |e| return .{ .start = 0, .end = e };
                 return null;
             }
-            if (self.req_lit) |rl| return search.findViaReqLit(self, input, rl);
+            if (self.req_lit) |*rl| return search.findViaReqLit(self, input, rl);
             const can_skip = !self.isAccepting(self.start);
             var sp: usize = 0;
             while (sp <= input.len) : (sp += 1) {
@@ -271,7 +271,7 @@ pub fn Dfa(comptime n_states: usize, comptime n_classes: usize) type {
             // not pinned.
             if (self.isAccepting(self.start)) return true;
             if (self.anchored_start) return self.acceptsFrom(input, 0);
-            if (self.req_lit) |rl| return search.findViaReqLit(self, input, rl) != null;
+            if (self.req_lit) |*rl| return search.findViaReqLit(self, input, rl) != null;
             var sp: usize = 0;
             while (sp <= input.len) : (sp += 1) {
                 sp = self.skipToStart(input, sp) orelse return false;

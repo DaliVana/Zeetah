@@ -34,18 +34,21 @@ pub inline fn requiredAbsent(required: ?u8, input: []const u8) bool {
     return false;
 }
 
-/// Necessary-literal-driven leftmost search. `R` (`rl.byte`) is a rare byte
-/// every match must contain; `rl.back` recovers the start from `R`'s position.
-/// `R` cannot occur inside its own preceding prefix, so scanning `R`-occurrences
-/// left-to-right and taking the first that verifies yields the leftmost match.
-/// `d.runFrom` re-verifies, so this never changes an outcome.
+/// Necessary-literal-driven leftmost search. The anchor `L` (`rl.lit[0..len]`)
+/// is a mandatory literal every match must contain; `rl.back` recovers the start
+/// from `L`'s position. `L` cannot occur inside its own preceding prefix, so
+/// scanning `L`-occurrences left-to-right and taking the first that verifies
+/// yields the leftmost match. `d.runFrom` re-verifies, so this never changes an
+/// outcome. The literal is located by `prefilter.findLiteralOcc` — `memchr` on a
+/// robustly-rare probe, or a two-byte SIMD filter when the literal is all-common
+/// — far more selective than the single rarest byte alone.
 ///
 /// `d` is any DFA exposing `runFrom(input, pos) ?usize` (the runtime `Dfa256`
 /// or the comptime `comptime_dfa.Dfa(ns,nk)`).
-pub fn findViaReqLit(d: anytype, input: []const u8, rl: ReqLit) ?Span {
+pub fn findViaReqLit(d: anytype, input: []const u8, rl: *const ReqLit) ?Span {
     var lower: usize = 0;
     while (lower <= input.len) {
-        const q = std.mem.indexOfScalarPos(u8, input, lower, rl.byte) orelse return null;
+        const q = pf.findLiteralOcc(input, lower, rl.lit[0..rl.len], rl.probe, rl.probe_off) orelse return null;
         var s: usize = undefined;
         switch (rl.back) {
             .fixed => |k| {
