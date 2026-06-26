@@ -1021,7 +1021,7 @@ defer allocator.free(matches);
 ## Version
 
 ```zig
-pub const version: std.SemanticVersion; // 0.16.0 (matches build.zig.zon)
+pub const version: std.SemanticVersion; // 0.16.1 (matches build.zig.zon)
 ```
 
 ```zig

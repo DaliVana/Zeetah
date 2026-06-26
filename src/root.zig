@@ -89,7 +89,7 @@ pub const Patterns = @import("builder.zig").Patterns;
 pub const version = std.SemanticVersion{
     .major = 0,
     .minor = 16,
-    .patch = 0,
+    .patch = 1,
 };
 
 test {

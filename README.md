@@ -52,7 +52,7 @@ The recommended way — `zig fetch --save` resolves the release tag and writes t
 dependency, with its content hash, into your `build.zig.zon`:
 
 ```bash
-zig fetch --save git+https://github.com/DaliVana/Zeetah.git#v0.16.0
+zig fetch --save git+https://github.com/DaliVana/Zeetah.git#v0.16.1
 ```
 
 Or add the entry to `build.zig.zon` by hand:
@@ -268,6 +268,36 @@ The **ReDoS contract** is precise about which patterns get linear time:
 
 Full details — the executor table, the planner, the prefilters, and the
 compile-time path — live in **[Architecture](docs/ARCHITECTURE.md)**.
+
+## Performance
+
+Zeetah is a **top-tier engine**: in a [13-engine cross-language
+benchmark](docs/BENCHMARKS.md#the-comparison-harness) (Zig 0.16.0,
+`-OReleaseFast`, `count` model, 1 MiB corpus) it **splits the workload set with
+PCRE2-JIT** — the de-facto C JIT backtracker — and **beats every other engine
+measured outright**. Geometric mean of zeetah's throughput relative to each
+engine, over the workloads each pair shares:
+
+| vs. engine | geomean | zeetah faster on |
+|---|---:|---:|
+| **PCRE2-JIT** (C JIT backtracker) | 0.82× | 27 / 55 |
+| **Rust `regex`** | 1.51× | 35 / 49 |
+| **`fancy-regex`** (tiktoken's engine) | 2.59× | 49 / 55 |
+| **CTRE** (C++ compile-time) | 2.82× | 32 / 43 |
+| **RE2** (Google) | 3.32× | 41 / 49 |
+| **.NET `Regex`** | 4.22× | 49 / 55 |
+| **PCRE2** (interpreted) | 5.26× | 50 / 55 |
+| **Oniguruma** (Ruby/Perl) | 7.32× | 51 / 55 |
+| **PyPI `regex`** (tokenizer-grade) | 18.6× | 53 / 55 |
+| C++ **`std::regex`** | 222× | 43 / 43 |
+
+Highlights: pure-literal search hits **31.5 GB/s** (fastest of any engine here);
+zeetah crushes PCRE2-JIT on DFA-eligible shapes (`email` 9.5×, `alternation`
+6.8×, `uri` 4.2×) while PCRE2-JIT leads on multi-lookahead validation and heavy
+capture/anchoring — the optimisation frontier. On the verbatim GPT-4
+`cl100k_base` pre-tokenizer regex, zeetah produces the **identical 322,106**
+match count as six other engines, gate-enforced. The harness is not vendored —
+reproduce it via the [comparison harness](docs/BENCHMARKS.md#the-comparison-harness).
 
 ## Feature support
 

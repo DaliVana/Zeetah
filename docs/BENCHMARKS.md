@@ -317,11 +317,20 @@ each engine's harness, then aggregates the results.
 | **Zeetah** | this library — runtime meta engine and the comptime DFA path |
 | **[mvzr](https://github.com/mnemnion/mvzr)** | a small zero-allocation Zig regex VM |
 | **RE2** (Google) | a linear-time DFA/automata engine |
+| **PCRE2** | the de-facto C backtracking engine (PHP, nginx, git, ripgrep `-P`), measured both **interpreted** and **JIT-compiled** |
+| **Oniguruma** | the C backtracking engine behind Ruby / PHP `mbstring` / many editor grammars |
+| **POSIX `regex.h`** | the libc baseline (`regcomp`/`regexec`); a different regex *language* (leftmost-longest), so **gate-exempt** |
+| **C++ `std::regex`** | the libc++ standard-library engine (the slow default) |
+| **[CTRE](https://github.com/hanickadot/compile-time-regular-expressions)** | Hana Dusíková's header-only **compile-time** C++ engine — the closest peer to Zeetah's comptime path |
 | **Rust `regex`** | the Rust standard regex crate (finite-automata, linear) |
 | **[fancy-regex](https://github.com/fancy-regex/fancy-regex)** | the Rust look-around/backreference engine used by OpenAI's `tiktoken` and BPE trainers |
 | **.NET `Regex`** | `System.Text.RegularExpressions`, the default backtracking engine |
 | **Python stdlib `re`** | CPython's built-in regex module |
 | **PyPI `regex`** | Python's de-facto Unicode-aware regex module (what tokenizer/BPE code actually uses) |
+
+The aggregated results table is regenerated into the harness's own `results.md`
+on every run (and is not committed). For a current snapshot of cross-engine
+geomeans, see the benchmark repo's `README.md` "Performance highlights".
 
 ### Methodology
 

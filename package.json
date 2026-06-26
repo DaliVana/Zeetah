@@ -1,6 +1,6 @@
 {
   "name": "zeetah",
-  "version": "0.16.0",
+  "version": "0.16.1",
   "scripts": {
     "release": "pantry release patch --yes",
     "release:minor": "pantry release minor --yes",
