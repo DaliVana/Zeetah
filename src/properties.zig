@@ -45,19 +45,28 @@ pub const Properties = struct {
     /// `(?m)` line anchors, mid `\A \z \Z`). Routes to the bounded
     /// backtracker (the DFA does not fold look-assertions yet).
     has_look: bool = false,
-    /// Every match is unconditionally prefixed by a multiline `^` (`start_line`)
-    /// look, so a match can only begin at a line start. Lets the `.bt_look`
-    /// engine enumerate line starts (via a `\n` memchr) instead of every
-    /// position — the difference between O(n) and O(n·lines) start attempts.
-    leading_line_anchor: bool = false,
-    /// The non-nullable body's leading-byte set, kept ONLY for a
-    /// `leading_line_anchor` pattern (`(?m)^body$`, body needs ≥1 byte). A
-    /// match at a line start `s` requires `input[s] ∈ line_first`, so the line
+    /// The non-nullable body's leading-byte set, kept ONLY for a line-anchored
+    /// pattern (`bounds.start == .line`, i.e. `(?m)^body$`; body needs ≥1 byte).
+    /// A match at a line start `s` requires `input[s] ∈ line_first`, so the line
     /// scan rejects non-matching lines with a single byte test before paying a
     /// full `matchAt` — the dominant per-line cost. Distinct from
     /// `first_byte_set` (which is `null` for look patterns so the literal/
     /// prefilter planner skips them); this one feeds only the line scan.
     line_first: ?[32]u8 = null,
+    /// The unified `(start, end)` boundary-anchor view (`analyzeBoundaries`) —
+    /// THE single source for the per-end anchor decision routing reads.
+    /// `bounds.start == .line` is what used to be the separate
+    /// `leading_line_anchor` flag (a multiline `^`: every match begins at a line
+    /// start, so `.bt_look` enumerates line starts via a `\n` memchr instead of
+    /// every position — O(n) vs O(n·lines) start attempts). `bounds.end` selects
+    /// the end driver (`.text`/`.before_nl`/`.line`; see `rev_end`).
+    bounds: Boundaries = .{},
+    /// Non-null ⇒ the pattern is the reverse end-anchored fast-path shape
+    /// (`(?m)<class>+$` / `<class>+\Z`, unanchored start, regular non-nullable
+    /// body, no other look): the look (`bt_look`) tier would scan it O(n²), so
+    /// route it to a single O(n) reverse pass seeded from the end boundaries.
+    /// Gated additionally on `min_len >= 1` and (at the call site) `ng == 0`.
+    rev_end: ?EndKind = null,
 };
 
 fn containsLook(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) bool {
@@ -182,6 +191,150 @@ pub fn lineAnchoredRegular(comptime cap: ?usize, h: *const hir.Hir(cap)) ?LineSh
     // lazy are fine there — this mirrors why `edge_look` rejects `.alt`.)
     if (has_dollar and w.prio) return null;
     return .{ .has_dollar = has_dollar };
+}
+
+// --- Boundary anchors: the unified (start, end) anchor model -----------------
+//
+// Every anchor decomposes into two orthogonal axes: which END of the match it
+// constrains (start vs end) and the SCOPE of the admissible boundary (the whole
+// text vs each line). `^ $ \A \z \Z (?m)^ (?m)$` are then just points in a
+// `start × end` grid, not seven ad-hoc cases. `analyzeBoundaries` reads the
+// prescan booleans (`^`/`\A`, `$`/`\z` already folded by `parser.prescan`) AND
+// the HIR's leading/trailing look factors into ONE descriptor, so a dispatch
+// site can read "pick the driver for (start, end)" instead of re-deriving each
+// anchor from scratch. The *execution* axes line up with it: a start anchor
+// constrains where a forward run may begin, an end anchor constrains where a
+// match may end (solved by a reverse pass seeded from those end boundaries).
+pub const StartKind = enum {
+    unanchored, // match may begin anywhere
+    text, //       `^` / `\A` — only at offset 0
+    line, //       `(?m)^` — only at a line start (offset 0 or just after a `\n`)
+};
+pub const EndKind = enum {
+    unanchored, // match may end anywhere
+    text, //       `$` / `\z` — only at `input.len`
+    before_nl, //  `\Z` — at `input.len`, or just before a single trailing `\n`
+    line, //       `(?m)$` — at `input.len` or any `\n`
+};
+pub const Boundaries = struct {
+    start: StartKind = .unanchored,
+    end: EndKind = .unanchored,
+};
+
+/// Last *meaningful* factor of `ref` — the mirror of `firstFactor` from the
+/// right: `concat`/`cap` are descended (right child first; the rightmost
+/// non-empty wins), zero-width `.empty` noise is skipped, anything else is
+/// returned as-is. `null` ⇒ the subtree is purely empty.
+fn lastFactor(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) ?NodeRef {
+    const nd = h.node(ref);
+    return switch (nd.tag) {
+        .cap => lastFactor(cap, h, nd.a), // transparent
+        .concat => lastFactor(cap, h, nd.b) orelse lastFactor(cap, h, nd.a),
+        .empty => null, // zero-width; skip to the previous factor
+        else => ref,
+    };
+}
+
+/// The `LookKind` of the trailing factor of the HIR root, or `null` when the
+/// pattern does not end in a zero-width look.
+fn trailingLook(comptime cap: ?usize, h: *const hir.Hir(cap)) ?hir.LookKind {
+    if (h.root == hir.none) return null;
+    const f = lastFactor(cap, h, h.root) orelse return null;
+    const nd = h.node(f);
+    if (nd.tag != .look) return null;
+    return @as(hir.LookKind, @enumFromInt(nd.set_idx));
+}
+
+/// The descriptive `(start, end)` boundary view of a pattern (item-1 abstraction).
+/// Reads the prescan booleans (whole-text `^`/`$`) and the leading/trailing look
+/// factors (`(?m)^`/`(?m)$`/`\Z`). Purely descriptive — routing uses the stricter
+/// `revEndAnchored` to decide the reverse fast path (it also vets the body).
+pub fn analyzeBoundaries(comptime cap: ?usize, h: *const hir.Hir(cap)) Boundaries {
+    var b = Boundaries{};
+    if (h.anchored_start)
+        b.start = .text
+    else if (leadingLineAnchor(cap, h))
+        b.start = .line;
+    if (h.anchored_end) {
+        b.end = .text;
+    } else if (trailingLook(cap, h)) |lk| b.end = switch (lk) {
+        .end_line => .line,
+        .end_text_before_nl => .before_nl,
+        .end_text => .text, // a branch/mid `$` left unfolded by the prescan
+        else => .unanchored, // \b, start anchors, … are not end boundaries
+    };
+    return b;
+}
+
+/// Routing recognizer for the reverse end-anchored fast path: a pattern whose
+/// ONLY assertion is a trailing line `$` (`(?m)…$`) or `\Z`, with an unanchored
+/// start and a regular body. Such a pattern is the unanchored `<class>+$` /
+/// `<class>+\Z` ReDoS shape on the look (`bt_look`) tier — the per-position
+/// restart is O(n²) on non-matching input. A single O(n) reverse pass seeded
+/// from the end-boundary set (line ends / `{len, len-1}`) defuses it, reusing
+/// the same `search.reverseSearch` + `full_dfa.computeReverse` machinery as the
+/// absolute `$` fix (see `redos-quadratic` history).
+///
+/// Returns the `EndKind` (`.line` / `.before_nl`) when the shape qualifies:
+///   * unanchored start (`!anchored_start`, not `(?m)^`) — start-anchored forms
+///     are already linear (the backtracker only tries offset 0 / line starts);
+///   * the trailing factor is exactly `end_line` or `end_text_before_nl`;
+///   * the body is regular (no backref/lookaround/atomic) and carries NO other
+///     look (so relaxing looks → ε leaves a faithful body to reverse-determinize);
+///   * for `.line`, the body is `\n`-free (so a match cannot cross a line — the
+///     soundness invariant the per-line decomposition needs; `.before_nl` is a
+///     whole-text scan and needs no such restriction).
+/// `null` ⇒ keep the existing `bt_look` engine. Caller additionally gates on a
+/// non-nullable body (`min_len >= 1`) and no capture groups (the reverse pass is
+/// span-only; captures keep the backtracker).
+const RevWalk = struct {
+    n_line: usize = 0,
+    n_znl: usize = 0,
+    other_look: bool = false,
+    nl_set: bool = false,
+    irregular: bool = false,
+};
+
+fn walkRevBody(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, w: *RevWalk) void {
+    const nd = h.node(ref);
+    switch (nd.tag) {
+        .backref, .look_around, .atomic => w.irregular = true,
+        .look => switch (@as(hir.LookKind, @enumFromInt(nd.set_idx))) {
+            .end_line => w.n_line += 1,
+            .end_text_before_nl => w.n_znl += 1,
+            else => w.other_look = true, // \b \B \A \z mid ^/$ … need real eval
+        },
+        .set => if (setHasNewline(cap, h, nd.set_idx)) {
+            w.nl_set = true;
+        },
+        .empty => {},
+        .star, .plus, .opt, .cap => walkRevBody(cap, h, nd.a, w),
+        .concat, .alt => {
+            walkRevBody(cap, h, nd.a, w);
+            walkRevBody(cap, h, nd.b, w);
+        },
+    }
+}
+
+pub fn revEndAnchored(comptime cap: ?usize, h: *const hir.Hir(cap)) ?EndKind {
+    if (h.root == hir.none) return null;
+    if (h.anchored_start) return null; // `^…$` already linear (offset 0 only)
+    if (leadingLineAnchor(cap, h)) return null; // `(?m)^…$` owned by the forward line-DFA
+    const lk = trailingLook(cap, h) orelse return null;
+    const kind: EndKind = switch (lk) {
+        .end_line => .line,
+        .end_text_before_nl => .before_nl,
+        else => return null,
+    };
+    var w: RevWalk = .{};
+    walkRevBody(cap, h, h.root, &w);
+    if (w.irregular or w.other_look) return null;
+    switch (kind) {
+        .line => if (!(w.n_line == 1 and w.n_znl == 0) or w.nl_set) return null,
+        .before_nl => if (!(w.n_znl == 1 and w.n_line == 0)) return null,
+        else => unreachable,
+    }
+    return kind;
 }
 
 fn containsCap(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) bool {
@@ -358,14 +511,21 @@ pub fn analyze(comptime cap: ?usize, h: *const hir.Hir(cap)) Properties {
         (p.saw_lazy and p.anchored_end);
     p.needs_captures = containsCap(cap, h, h.root);
     p.has_look = containsLook(cap, h, h.root);
+    // Unified anchor view: ONE recognizer for every (start, end) boundary. The
+    // per-end routing decisions read `p.bounds` directly (no separate flags).
+    p.bounds = analyzeBoundaries(cap, h);
     if (p.has_look) {
         // Look-bearing patterns route to the bounded backtracker; the
         // literal/prefilter strategies (and their Seqs) don't apply.
-        p.leading_line_anchor = leadingLineAnchor(cap, h);
-        // For `(?m)^body$` keep the body's leading-byte set (computed above
-        // into `first_byte_set`, valid since `start_line` is zero-width so
-        // `firstBytes` falls through to the body) as a per-line reject filter.
-        if (p.leading_line_anchor) p.line_first = p.first_byte_set;
+        // For `(?m)^body$` (`bounds.start == .line`) keep the body's leading-byte
+        // set (computed above into `first_byte_set`, valid since `start_line` is
+        // zero-width so `firstBytes` falls through to the body) as a per-line
+        // reject filter.
+        if (p.bounds.start == .line) p.line_first = p.first_byte_set;
+        // Reverse end-anchored fast path (`(?m)<class>+$` / `<class>+\Z`): a
+        // non-nullable body keeps the single reverse pass free of empty-match-
+        // at-every-line subtleties (those nullable shapes stay on `bt_look`).
+        if (p.min_len >= 1) p.rev_end = revEndAnchored(cap, h);
         p.first_byte_set = null;
         return p;
     }
@@ -421,16 +581,40 @@ fn analyzePatternRt(src: []const u8) Properties {
     return analyze(null, &h);
 }
 
-test "properties: leading_line_anchor recognizer" {
+test "properties: bounds.start == .line recognizer (was leading_line_anchor)" {
+    const isLine = struct {
+        fn f(src: []const u8) bool {
+            return analyzePatternRt(src).bounds.start == .line;
+        }
+    }.f;
     // Fully line-anchored: every match must begin at a line start.
-    try std.testing.expect(analyzePatternRt("(?m)^[0-9]{4}-[0-9]{2}-[0-9]{2}.*$").leading_line_anchor);
-    try std.testing.expect(analyzePatternRt("(?m)^foo").leading_line_anchor);
-    try std.testing.expect(analyzePatternRt("(?m)^(a|b)").leading_line_anchor); // anchor is the prefix of the whole pattern
-    // NOT fully anchored — the recogniser must reject these.
-    try std.testing.expect(!analyzePatternRt("(?m)^a|b").leading_line_anchor); // alt root; `b` matches anywhere
-    try std.testing.expect(!analyzePatternRt("(?m)(^a|b)").leading_line_anchor); // alt under a group
-    try std.testing.expect(!analyzePatternRt("(?m)foo$").leading_line_anchor); // trailing `$` only
-    try std.testing.expect(!analyzePatternRt("^abc").leading_line_anchor); // start_text, not start_line
+    try std.testing.expect(isLine("(?m)^[0-9]{4}-[0-9]{2}-[0-9]{2}.*$"));
+    try std.testing.expect(isLine("(?m)^foo"));
+    try std.testing.expect(isLine("(?m)^(a|b)")); // anchor is the prefix of the whole pattern
+    // NOT fully line-anchored — the recogniser must reject these.
+    try std.testing.expect(!isLine("(?m)^a|b")); // alt root; `b` matches anywhere
+    try std.testing.expect(!isLine("(?m)(^a|b)")); // alt under a group
+    try std.testing.expect(!isLine("(?m)foo$")); // trailing `$` only
+    try std.testing.expect(!isLine("^abc")); // start_text (.text), not start_line (.line)
+}
+
+test "properties: revEndAnchored recognizer (reverse end-anchored fast path)" {
+    // Qualifies: unanchored start, trailing line `$` / `\Z`, regular `\n`-free body.
+    try std.testing.expectEqual(EndKind.line, analyzePatternRt("(?m)[0-9]+$").rev_end.?);
+    try std.testing.expectEqual(EndKind.line, analyzePatternRt("(?m)[a-z]+$").rev_end.?);
+    try std.testing.expectEqual(EndKind.line, analyzePatternRt("(?m).+$").rev_end.?); // `.` excludes \n
+    try std.testing.expectEqual(EndKind.line, analyzePatternRt("(?m)(a|bb)+$").rev_end.?); // alt body is fine (reverse is no-cut)
+    try std.testing.expectEqual(EndKind.before_nl, analyzePatternRt("[0-9]+\\Z").rev_end.?);
+    try std.testing.expectEqual(EndKind.before_nl, analyzePatternRt("foo\\Z").rev_end.?);
+    // Rejected — must keep the bt_look / dense engines.
+    try std.testing.expect(analyzePatternRt("(?m)^[0-9]+$").rev_end == null); // leading ^ ⇒ forward line-DFA owns it
+    try std.testing.expect(analyzePatternRt("[0-9]+$").rev_end == null); // absolute $ ⇒ dense reverse path (anchored_end)
+    try std.testing.expect(analyzePatternRt("(?m)\\s+$").rev_end == null); // `\s` matches \n ⇒ body could cross lines (unsound)
+    try std.testing.expect(analyzePatternRt("(?m)\\b[0-9]+$").rev_end == null); // extra \b look needs real eval
+    try std.testing.expect(analyzePatternRt("(?m)foo$bar").rev_end == null); // mid $, not trailing
+    try std.testing.expect(analyzePatternRt("(?m).*$").rev_end == null); // nullable body (min_len 0)
+    try std.testing.expect(analyzePatternRt("(?m)[\\n0-9]+$").rev_end == null); // body can match \n ⇒ line decomposition unsound
+    try std.testing.expect(analyzePatternRt("[0-9]+").rev_end == null); // no end anchor at all
 }
 
 test "properties: first_byte_set for alternation of literals" {

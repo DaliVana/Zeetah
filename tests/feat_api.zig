@@ -546,12 +546,36 @@ test "comptime backtracker look-assertions: \\b / \\A\\z\\Z / (?m) anchors vs ru
     //   deep-alternation `\b(?:kw|kw|…)\b` — routes to the tree-walker, bypassing
     //   the MAX_NFA ceiling that rejects it on the DFA path:
     try seekParity("\\b(?:break|case|catch|class|const|continue|return|if|else|for|while)\\b", "if x then break; for y return; classify const cases while continue");
-    //   `\Z` (end-before-optional-final-`\n`) is a real look ⇒ backtrack arm.
-    //   (`\A`/`\z` are NOT here: the prescan folds them into the anchored-DFA
-    //   fast path — `has_dfa == true` — so they never needed the backtracker and
-    //   are covered by the anchored-DFA tests instead.)
-    try btAgree("baz\\Z", "foobaz\n");
-    try btAgree("baz\\Z", "foobaz");
+    //   `\Z` (end-before-optional-final-`\n`) is now folded into the reverse
+    //   end-anchored fast path (`.rev_end`, `has_dfa == true`): a regular body +
+    //   trailing `\Z` runs one O(n) reverse pass seeded from `{len, len-1}`
+    //   instead of the per-position backtracker. Covered by `revEndParity` below;
+    //   it is no longer a backtracker pattern. (`\A`/`\z` fold into the
+    //   anchored-DFA fast path via the prescan instead.)
+    try btAgree("\\bbaz\\Z", "say baz\n"); // extra `\b` look keeps `\Z` on the backtracker (match)
+    try btAgree("\\bbaz\\Z", "xbaz"); // no word boundary before baz ⇒ no match
+}
+
+// Reverse end-anchored fast path (`.rev_end`, `has_dfa == true`): `(?m)<class>+$`
+// and `<class>+\Z` with an unanchored start + regular non-nullable body run one
+// O(n) reverse pass per end boundary (`search.reverseLineEnd` / `reverseBeforeNl`),
+// the comptime peer of the runtime `bt_look` reverse driver. This closes the
+// `<class>+$` / `<class>+\Z` ReDoS (audit group E). Assert DFA-backed + that
+// comptime == runtime span-for-span (reuses `lineParity`'s checks).
+test "comptime reverse end-anchored (?m)$ / \\Z: DFA-backed, comptime == runtime" {
+    // multiline trailing `$` (no leading `^`): the ReDoS shapes + alternation
+    // bodies (sound here — the reverse pass is no-cut, unlike the forward line-DFA).
+    try lineParity("(?m)[0-9]+$", "ab12\ncd34\n9\nxx\n007");
+    try lineParity("(?m)[a-z]+$", "foo\nbar baz\n\nqux");
+    try lineParity("(?m)(?:a|bb)+$", "a\nbb\nabba\nbbab\nx");
+    try lineParity("(?m)[a-z]+@[a-z]+$", "a@b\nno at sign\nx@y\n");
+    try lineParity("(?m).+$", "one\ntwo\n\nthree");
+    // `\Z` (whole-text, before an optional final `\n`):
+    try lineParity("[0-9]+\\Z", "ab123");
+    try lineParity("[0-9]+\\Z", "ab123\n");
+    try lineParity("baz\\Z", "foobaz\n");
+    try lineParity("baz\\Z", "foobaz");
+    try lineParity("[a-z]+\\Z", "  hello\n");
 }
 
 // `(?m)^body$` / `(?m)^body` with a regular, \n-free body now routes to the

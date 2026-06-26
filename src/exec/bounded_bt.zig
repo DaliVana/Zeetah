@@ -246,7 +246,8 @@ pub const BoundedBt = struct {
     /// positions (`from` itself iff it is a line start, then every byte after a
     /// `\n`). Sound only when every match must begin at a line start — i.e. the
     /// pattern is unconditionally prefixed by a multiline `^` (`start_line`),
-    /// which `properties.leading_line_anchor` proves. `input` is the FULL
+    /// which `properties.analyzeBoundaries` proves (`bounds.start == .line`).
+    /// `input` is the FULL
     /// haystack (absolute coordinates) so `lookHolds(.start_line)` sees the true
     /// preceding byte; the result span is absolute. Line starts ascend, so the
     /// first hit is the leftmost match.

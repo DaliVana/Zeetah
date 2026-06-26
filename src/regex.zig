@@ -25,6 +25,7 @@ const full_dfa = @import("exec/full_dfa.zig");
 const core = @import("exec/core.zig");
 const cc = @import("exec/charclass.zig");
 const line_dfa_mod = @import("exec/line_dfa.zig");
+const search = @import("exec/search.zig");
 const planner = @import("planner.zig");
 const properties = @import("properties.zig");
 const prefilter = @import("prefilter.zig");
@@ -197,6 +198,15 @@ pub const Regex = struct {
     /// accept never crosses the line). See `properties.lineAnchoredRegular`.
     line_dfa: ?*full_dfa.Dfa256 = null,
     line_has_dollar: bool = false,
+    /// `.bt_look` only: the REVERSE DFA (`full_dfa.computeReverse`) of the body
+    /// of a reverse end-anchored pattern (`(?m)<class>+$` / `<class>+\Z`,
+    /// unanchored start, regular non-nullable body, no captures —
+    /// `properties.revEndAnchored`). When set, the `bt_look` dispatch serves
+    /// `find`/`isMatch`/`count` with ONE O(n) reverse pass seeded from the end
+    /// boundaries (`search.reverseLineEnd` / `reverseBeforeNl`) instead of the
+    /// O(n²) per-position NFA restart this `<class>+$` shape otherwise pays.
+    rev_end_dfa: ?*full_dfa.Dfa256 = null,
+    rev_end_kind: properties.EndKind = .unanchored,
     /// Capture metadata (set when the pattern has groups). `nfa` doubles as
     /// the capture engine's automaton. `gnames[g]` is group g's `(?<name>)`
     /// name (aliases `pattern`), or null.
@@ -616,13 +626,22 @@ pub const Regex = struct {
             var line_dfa: ?*full_dfa.Dfa256 = null;
             var line_has_dollar = false;
             errdefer if (line_dfa) |p| allocator.destroy(p);
-            if (props.leading_line_anchor) {
+            if (props.bounds.start == .line) {
                 if (properties.lineAnchoredRegular(null, &h)) |shape| {
                     if (buildLineDfa(allocator, &h)) |d| {
                         line_dfa = d;
                         line_has_dollar = shape.has_dollar;
                     }
                 }
+            }
+            // Reverse end-anchored fast path (`(?m)<class>+$` / `<class>+\Z`):
+            // the body's reverse DFA drives one O(n) pass per end boundary,
+            // defusing the `bt_look` O(n²) restart. Span-only ⇒ groups keep the
+            // backtracker (`ng == 0` gate; `revEndScan` is never reached then).
+            var rev_end_dfa: ?*full_dfa.Dfa256 = null;
+            errdefer if (rev_end_dfa) |p| allocator.destroy(p);
+            if (ng == 0) {
+                if (props.rev_end) |_| rev_end_dfa = buildRevEndDfa(allocator, &h);
             }
             return Regex{
                 .allocator = allocator,
@@ -632,10 +651,12 @@ pub const Regex = struct {
                 .nfa = nheap,
                 .bt_a_start = h.anchored_start,
                 .bt_a_end = h.anchored_end,
-                .bt_line_anchor = props.leading_line_anchor,
+                .bt_line_anchor = props.bounds.start == .line,
                 .bt_line_first = props.line_first,
                 .line_dfa = line_dfa,
                 .line_has_dollar = line_has_dollar,
+                .rev_end_dfa = rev_end_dfa,
+                .rev_end_kind = if (rev_end_dfa != null) props.rev_end.? else .unanchored,
                 .n_groups = ng,
                 .gnames = gnames,
                 .bt_pool = bt_pool,
@@ -863,6 +884,7 @@ pub const Regex = struct {
         self.allocator.free(self.pattern);
         if (self.dfa) |p| self.allocator.destroy(p);
         if (self.line_dfa) |p| self.allocator.destroy(p);
+        if (self.rev_end_dfa) |p| self.allocator.destroy(p);
         if (self.nfa) |p| self.allocator.destroy(p);
         if (self.bt_hir) |p| {
             p.deinit(self.allocator);
@@ -956,6 +978,35 @@ pub const Regex = struct {
         return heap;
     }
 
+    /// Build the REVERSE body DFA for a `revEndAnchored` pattern: clone the HIR
+    /// relaxing every look to `ε` (strips the trailing `$`/`\Z`; there are no
+    /// other looks), Thompson-build, and `computeReverse`. `null` on any
+    /// build/ceiling failure (or a reverse explosion) ⇒ caller keeps the NFA
+    /// `bt_look` scan. Mirror of `buildLineDfa`, but reversed for the end anchor.
+    fn buildRevEndDfa(allocator: std.mem.Allocator, h: *const hir.Hir(null)) ?*full_dfa.Dfa256 {
+        var oh = hir.Hir(null).initRuntime();
+        defer oh.deinit(allocator);
+        oh.root = hir.cloneSubtree(null, null, &oh, allocator, h, h.root, true) catch return null;
+        var nfa = thompson.build(null, &oh) catch return null;
+        const d = full_dfa.computeReverse(null, &nfa);
+        if (d.outcome != .ok) return null;
+        const heap = allocator.create(full_dfa.Dfa256) catch return null;
+        heap.* = d;
+        return heap;
+    }
+
+    /// Reverse end-anchored leftmost span at/after absolute `from` (`rev_end_dfa`
+    /// set): drive `search.reverseSearch` over the baked reverse body DFA, seeded
+    /// from the end-boundary set for this anchor (`(?m)$` line ends, or `\Z`'s
+    /// `{len, len-1}`). One O(n) pass; the shared peer of `lineDfaScan`.
+    fn revEndScan(self: *const Regex, rd: *const full_dfa.Dfa256, input: []const u8, from: usize) ?core.Span {
+        return switch (self.rev_end_kind) {
+            .line => search.reverseLineEnd(rd, input, from),
+            .before_nl => search.reverseBeforeNl(rd, input, from),
+            else => unreachable,
+        };
+    }
+
     /// `.backtrack` leftmost span (backref/lookaround tree backtracker). The
     /// step budget surfaces as `RegexError.MatchBudgetExceeded` (.NET model).
     fn btRun(self: *const Regex, input: []const u8) !?core.Span {
@@ -1021,7 +1072,9 @@ pub const Regex = struct {
             .lit_prefix => core.litPrefixIsMatch(self.dfa.?, &self.teddy.?, input),
             .reverse_suffix => core.literalIsMatchT(&self.teddy.?, input) and
                 core.isMatch(self.dfa.?, input),
-            .bt_look => if (self.bt_line_anchor)
+            .bt_look => if (self.rev_end_dfa) |rd|
+                self.revEndScan(rd, input, 0) != null
+            else if (self.bt_line_anchor)
                 (try self.btLookLineScan(input, 0)) != null
             else
                 (try self.btLook(input)) != null,
@@ -1209,6 +1262,10 @@ pub const Regex = struct {
                 break :blk core.Span{ .start = pos + r.start, .end = pos + r.end };
             },
             .bt_look => blk: {
+                // Reverse end-anchored (`(?m)<class>+$` / `<class>+\Z`): one O(n)
+                // reverse pass per end boundary (absolute coords) instead of the
+                // per-position NFA restart.
+                if (self.rev_end_dfa) |rd| break :blk self.revEndScan(rd, input, pos);
                 // Leading multiline `^`: enumerate line starts over the FULL
                 // input (absolute coords) instead of every position.
                 if (self.bt_line_anchor) break :blk try self.btLookLineScan(input, pos);

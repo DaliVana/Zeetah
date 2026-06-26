@@ -389,6 +389,51 @@ test "redos(polynomial): unanchored $-patterns are linear (single-pass reverse f
     try std.testing.expectEqual(@as(usize, 0), offenders);
 }
 
+// ============================================================================
+// REGRESSION GUARD — multiline `$` / `\Z` end anchors (audit group E).
+//
+// A trailing line `$` (`(?m)…$`) or `\Z` with an unanchored start routes to the
+// look (`bt_look`) tier, which scans from every start offset → O(n^2) on a long
+// non-matching line (the email shape `\w+@\w+` was ~3.5s @16k in the ReDoS
+// audit). The fix (`properties.revEndAnchored` + `search.reverseLineEnd` /
+// `reverseBeforeNl`): a regular `\n`-free body with a trailing `$`/`\Z` runs one
+// O(n) reverse pass per end boundary — the multiline/`\Z` peer of the absolute
+// `$` reverse-reachability fix above. Adversarial input is one long line of `a`
+// with NO `@`, so the reverse automaton must traverse the whole line before
+// reporting "no match": O(n) now, O(n^2) if the per-position restart returns.
+// Keep this guard linear. See docs/SECURITY_PROBLEMS.md.
+// ============================================================================
+test "redos(polynomial): multiline $ and \\Z end anchors are linear (reverse end-anchored fix)" {
+    const a = std.testing.allocator;
+    const patterns = [_][]const u8{
+        "(?m)[a-z]+@[a-z]+$", // multiline email (the audit group-E shape)
+        "(?m)[a-z]+=[a-z]+$", // key=value line validator
+        "[a-z]+@[a-z]+\\Z", // `\Z` email (before an optional final \n)
+        "(?m)[a-z]+:[a-z]+$",
+    };
+    var offenders: usize = 0;
+    for (patterns) |p| {
+        if (Regex.compile(a, p)) |r| {
+            var rx = r;
+            defer rx.deinit();
+            // All-`a` (no `@`/`=`/`:`): the reverse pass traverses the whole
+            // single line and never matches — the true O(n) vs O(n^2) signal.
+            const t1 = try timeIsMatch(a, &rx, 8_000);
+            const t4 = try timeIsMatch(a, &rx, 32_000); // 4x input
+            if (t4 >= t1 * 8 + 20_000_000) {
+                offenders += 1;
+                std.debug.print(
+                    "  REGRESSED to O(n^2) ReDoS: \"{s}\" — t(8k)={d}ns t(32k)={d}ns (ratio {d:.1}x for 4x input)\n",
+                    .{ p, t1, t4, @as(f64, @floatFromInt(t4)) / @as(f64, @floatFromInt(t1 + 1)) },
+                );
+            }
+        } else |e| {
+            try std.testing.expect(isContractError(e));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), offenders);
+}
+
 test "redos(enumeration): find-all / count / iterator over many matches is O(n), not O(n^2)" {
     const a = std.testing.allocator;
     // Even engines with a single-match linear guarantee (RE2, Go, Rust, .NET

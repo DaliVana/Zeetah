@@ -159,7 +159,7 @@ const Outcome = enum { ok, unsupported, exploded, invalid };
 /// §6/(c) monomorphization: which planner strategy the baked matcher emits.
 /// `.literal` skips the DFA table entirely (Teddy only); the other three bake
 /// the DFA and differ only in the per-position prefilter wrapped around it.
-const Strat = enum { literal, reverse_suffix, lit_prefix, dfa, backtrack, edge_look, boundary_lits, line_dfa };
+const Strat = enum { literal, reverse_suffix, lit_prefix, dfa, backtrack, edge_look, boundary_lits, line_dfa, rev_end };
 
 /// Search mode for the baked-DFA matcher (everything except `.literal`). A
 /// comptime constant, so the `switch (mode)` in each method folds to the one
@@ -219,6 +219,12 @@ const Built = struct {
     /// non-nullable leading-byte set (per-line reject filter), `null` if none.
     line_has_dollar: bool = false,
     line_first: ?[32]u8 = null,
+    /// `.rev_end` arm: `dfa` holds the REVERSE body DFA (`full_dfa.computeReverse`)
+    /// of an unanchored reverse end-anchored pattern (`(?m)<class>+$` /
+    /// `<class>+\Z`, no captures). `rev_end_kind` selects the end-boundary driver
+    /// (`search.reverseLineEnd` for `.line`, `reverseBeforeNl` for `.before_nl`).
+    /// The comptime peer of the runtime `Regex.rev_end_dfa`.
+    rev_end_kind: properties.EndKind = .unanchored,
 };
 
 /// Regular OVER-APPROXIMATION DFA for the `.backtrack` seek prefilter, or
@@ -297,6 +303,21 @@ fn lineDfaDfa(h: *const hir.Hir(HIR_CAP)) ?full_dfa.Dfa256 {
     oh.root = hir.cloneSubtree(HIR_CAP, HIR_CAP, &oh, undefined, h, h.root, true) catch return null;
     var onfa = thompson.build(HIR_CAP, &oh) catch return null;
     const od = full_dfa.compute(HIR_CAP, &onfa, false, false);
+    if (od.outcome != .ok) return null;
+    return od;
+}
+
+/// REVERSE body DFA for a `properties.revEndAnchored` pattern (comptime peer of
+/// runtime `regex.buildRevEndDfa`): clone the HIR relaxing every look to `ε`
+/// (strips the trailing `$`/`\Z`), Thompson-build, and `computeReverse`. `null`
+/// on any build/ceiling failure (or a reverse explosion) ⇒ caller keeps the
+/// backtracker. Mirror of `lineDfaDfa`, reversed for the end anchor.
+fn revEndDfa(h: *const hir.Hir(HIR_CAP)) ?full_dfa.Dfa256 {
+    @setEvalBranchQuota(8_000_000);
+    var oh = hir.Hir(HIR_CAP).initComptime();
+    oh.root = hir.cloneSubtree(HIR_CAP, HIR_CAP, &oh, undefined, h, h.root, true) catch return null;
+    var onfa = thompson.build(HIR_CAP, &oh) catch return null;
+    const od = full_dfa.computeReverse(HIR_CAP, &onfa);
     if (od.outcome != .ok) return null;
     return od;
 }
@@ -483,6 +504,29 @@ fn buildAll(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) 
                 .line_has_dollar = shape.has_dollar,
                 .line_first = props.line_first,
             };
+        }
+    }
+
+    // Reverse end-anchored fast path (comptime peer of the runtime `bt_look`
+    // reverse driver): `(?m)<class>+$` / `<class>+\Z` with an unanchored start,
+    // a regular non-nullable body (and `\n`-free for `.line`), no captures —
+    // one O(n) reverse pass per end boundary instead of the tree backtracker's
+    // O(n²) per-position restart. Checked BEFORE the backtracker fallback (the
+    // trailing `$`/`\Z` look would otherwise route there via `has_look`). Groups
+    // keep the backtracker (span-only fast path).
+    if (ng == 0) {
+        if (props.rev_end) |kind| {
+            if (revEndDfa(&h)) |d| {
+                return .{
+                    .dfa = d,
+                    .outcome = .ok,
+                    .strat = .rev_end,
+                    .hir = h,
+                    .n_groups = ng,
+                    .gnames = gnames,
+                    .rev_end_kind = kind,
+                };
+            }
         }
     }
 
@@ -1307,6 +1351,44 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             }
             pub fn isMatch(input: []const u8) bool {
                 return line_dfa.nextFrom(&body_dfa, has_dollar, if (first_const) |*fs| fs else null, input, 0) != null;
+            }
+            pub const find = V.find;
+            pub const count = V.count;
+            pub const findAll = V.findAll;
+            const V = WholeMatchVerbs(nextSpanFrom);
+            pub const Iterator = V.Iterator;
+            pub const iterator = V.iterator;
+            pub const startsWith = V.startsWith;
+            pub const SplitIterator = V.SplitIterator;
+            pub const splitIterator = V.splitIterator;
+            const C = CaptureSupport(built);
+            pub const Captures = C.Caps;
+            pub const captures = C.captures;
+            pub const capturesFrom = C.capturesFrom;
+            pub const capturesAll = C.capturesAll;
+            pub const CapturesIterator = C.CapturesIterator;
+            pub const capturesIterator = C.capturesIterator;
+        };
+    }
+
+    // Reverse end-anchored fast path (comptime peer of runtime `revEndScan`):
+    // bake the REVERSE body DFA COMPRESSED and drive the shared
+    // `search.reverseLineEnd` / `reverseBeforeNl` — one O(n) reverse pass per end
+    // boundary, no tree backtracker. `kind` is comptime-known so the switch folds.
+    if (built.strat == .rev_end) {
+        const rev_body = compress(built.dfa);
+        const kind = built.rev_end_kind;
+        return struct {
+            pub const has_dfa = true;
+            pub fn nextSpanFrom(input: []const u8, from: usize) ?search.Span {
+                return switch (kind) {
+                    .line => search.reverseLineEnd(&rev_body, input, from),
+                    .before_nl => search.reverseBeforeNl(&rev_body, input, from),
+                    else => unreachable,
+                };
+            }
+            pub fn isMatch(input: []const u8) bool {
+                return nextSpanFrom(input, 0) != null;
             }
             pub const find = V.find;
             pub const count = V.count;

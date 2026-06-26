@@ -122,3 +122,36 @@ pub fn reverseSearch(d: anytype, input: []const u8, from: usize, end: usize) ?Sp
     if (!exists) return null;
     return .{ .start = start, .end = end };
 }
+
+/// `\Z`-anchored leftmost match at/after `from` over the WHOLE text. The end
+/// boundary set is `{input.len} ∪ {input.len-1 if a single trailing '\n'}`, so
+/// at most two reverse passes; the smaller start wins (and on a start tie the
+/// `input.len` seed is kept — its larger end is the greedy whole match). `d` is
+/// the body's REVERSE DFA (`full_dfa.computeReverse`). One O(n) pass.
+pub fn reverseBeforeNl(d: anytype, input: []const u8, from: usize) ?Span {
+    var best = reverseSearch(d, input, from, input.len);
+    if (input.len > from and input[input.len - 1] == '\n') {
+        if (reverseSearch(d, input, from, input.len - 1)) |s2| {
+            if (best == null or s2.start < best.?.start) best = s2;
+        }
+    }
+    return best;
+}
+
+/// `(?m)…$`-anchored (trailing line `$`, no leading `^`) leftmost match at/after
+/// `from`: drive `reverseSearch` once per line end (`\n` / EOF). The body is
+/// `\n`-free (`properties.revEndAnchored` enforces it), so a match ending at a
+/// line end cannot cross into the previous line — each reverse pass dies on that
+/// line's leading `\n` (and is bounded at the line start), keeping the whole
+/// scan O(n). Lines are visited in increasing end order and every match-start
+/// lies within its own line, so the FIRST line that yields a match gives the
+/// globally leftmost start. The shared peer of the forward `line_dfa.nextFrom`.
+pub fn reverseLineEnd(d: anytype, input: []const u8, from: usize) ?Span {
+    var lo = from;
+    while (true) {
+        const e = std.mem.indexOfScalarPos(u8, input, lo, '\n') orelse input.len;
+        if (reverseSearch(d, input, lo, e)) |s| return s;
+        if (e == input.len) return null;
+        lo = e + 1;
+    }
+}
