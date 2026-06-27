@@ -58,6 +58,7 @@ pub fn build(b: *std.Build) void {
         "tests/feat_boundaries.zig",
         "tests/feat_captures.zig",
         "tests/captures_iter.zig",
+        "tests/capture_numbering.zig",
         "tests/feat_lookaround.zig",
         "tests/feat_backref.zig",
         "tests/replace_template.zig",

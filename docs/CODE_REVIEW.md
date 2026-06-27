@@ -20,6 +20,37 @@ rejected as a false positive. Two C-oriented conventions were adapted to Zig bef
 The known O(n²) `<class>+$` unanchored search and its intentional red-team test marker are a documented,
 tracked limitation and were treated as out of scope.
 
+## Status — work completed since this review (2026-06-27)
+
+Part of this review has been actioned in the working tree. Every change below was validated under **both**
+`zig build test` (Debug) and `zig build test -Doptimize=ReleaseSafe` (optimized codegen + safety checks +
+the new asserts active); the comptime⇄runtime differential and the security/ReDoS suite are the behavioral
+guard for the refactors.
+
+**Zero-risk hardening**
+- ✅ **#2 capacity assertions** on the fixed-size hot-construction buffers (`dfa_build.closure`,
+  `full_dfa.compute`/`computeReverse`, and `lazy_dfa` `closureRev`/`step`/`aStep`/`uStep`/`rStep`).
+- ✅ **`slotsToCaps` group-0 precondition assert** (pattern.zig detailed finding #5).
+- ✅ **#8 dead code deleted** — `profiling.zig` and `benchmark.zig` removed; `root.zig` comment updated.
+- ✅ **#9 ReleaseSafe CI job** added to `.github/workflows/ci.yml`.
+- ✅ **#10 doc drift fixed** — `thread_safety.zig` rewritten to the real pooled-scratch mechanism; the
+  `unicode_tables.zig` header prose moved into the generator's emit block; the stale `compress` "inline
+  bake" comment corrected (pattern.zig detailed finding #4).
+
+**Structural refactors**
+- ✅ **#1 cascades decomposed** — `regex.zig:compileWithFlags` 442→178 lines (8 named arm helpers) and
+  `pattern.zig:buildAll` 256→65 lines (7 named arm helpers), with matching helper names + order so the
+  comptime⇄runtime correspondence is diffable. Routing logic was moved verbatim (differential-tested
+  identical; only `&h`→`h`/`h.*` pointer adjustments and one `if`→early-return tidy in `tryClassSpan`).
+- ✅ **#5 capture-numbering cross-check** — `tests/capture_numbering.zig` pins `scanGroups`'s count + name
+  placement against the parser's real HIR `.cap` numbering over a divergence-prone corpus (catches the
+  `(?=(a)b)(a)(b)` phantom-slot bug class). This is the review's recommended minimum; the deeper
+  "eliminate `scanGroups`, have the parser emit names" unification remains open.
+
+**Still open:** #3 (dedup the 4× DFA run loops), #4 (shared `\p{}` spec parser), #6 (one canonical
+`hasBit`/`Span`), #7 (name the anti-ReDoS budget constants + dense-route predicate), and the deeper #5
+unification.
+
 ## Executive summary
 
 zeetah is a high-quality, two-front-end regex engine whose code is unusually well-documented — doc
@@ -78,7 +109,7 @@ changes.
 
 ## Top priorities
 
-1. **[High] Decompose the two engine-selection cascades and end their hand-synced coupling.**
+1. **[High · ✅ DONE] Decompose the two engine-selection cascades and end their hand-synced coupling.**
    `regex.zig:compileWithFlags` ([../src/regex.zig:451](../src/regex.zig#L451)–892, 442 lines) and
    `pattern.zig:buildAll` ([../src/pattern.zig:512](../src/pattern.zig#L512)–767, 256 lines) each thread
    ~13 engine arms with their own create/errdefer bookkeeping, and the two front-ends must stay
@@ -88,7 +119,7 @@ changes.
    ordered `if (try tryX(...)) |r| return r;`. This attacks Rule 4, the deep-nesting cognitive load, the
    errdefer/ownership footgun, and the doc/code drift simultaneously.
 
-2. **[High] Add capacity assertions to the fixed-size hot-construction buffers.** The subset-construction
+2. **[High · ✅ DONE] Add capacity assertions to the fixed-size hot-construction buffers.** The subset-construction
    `seeds[MAX_EDGES]` and closure DFS `stack[MAX_EDGES]`/`out[MAX_NFA]` are filled with no bounds check,
    guarded only by a non-local edge-count argument in thompson.zig comments — the silent-overflow class
    Rule 7 targets. Sites: [../src/exec/dfa_build.zig:139](../src/exec/dfa_build.zig#L139)–159 (closure
@@ -118,7 +149,7 @@ changes.
    `parseSpec(...) error{...}!struct{found, negated}` called by both, branching only on
    RangeList-vs-bitmap materialization — makes the identical error contract structural.
 
-5. **[High] Make capture-numbering a single recognizer instead of two hand-synced grammars.**
+5. **[High · ✅ Cross-check added] Make capture-numbering a single recognizer instead of two hand-synced grammars.**
    `scanGroups` ([../src/parser.zig:288](../src/parser.zig#L288)–367) re-implements the same
    paren/class/escape/lookaround grammar that `parsePrimary`/`openGroup`
    ([../src/parser.zig:898](../src/parser.zig#L898)–1018) implements; the comment notes a `(?=(a)b)(a)(b)`
@@ -144,20 +175,20 @@ changes.
    factor the lever-A decision into one `denseRoute(...)` predicate so the guard has one definition and
    one test point.
 
-8. **[Medium] Delete the dead `profiling.zig` and `benchmark.zig`.**
+8. **[Medium · ✅ DONE] Delete the dead `profiling.zig` and `benchmark.zig`.**
    [../src/profiling.zig:1](../src/profiling.zig#L1)–241 is never imported/built/tested and has already
    silently rotted (the `Instant` stub zeroes all timings; `format` uses the removed pre-0.16 4-arg
    signature). [../src/benchmark.zig:1](../src/benchmark.zig#L1)–52 is likewise orphaned with a latent
    divide-by-zero on `iterations==0`. *Fix:* delete both (and drop `profiling` from the root.zig:28 list),
    or wire them into `internal.zig` so `refAllDecls` compiles them — do not leave them half-attached.
 
-9. **[Medium] Add a ReleaseSafe CI test job.** CI runs `zig build test` in Debug only; the shipped
+9. **[Medium · ✅ DONE] Add a ReleaseSafe CI test job.** CI runs `zig build test` in Debug only; the shipped
    ReleaseFast artifact (212 `@intCast`, assert-free hot loops) is never executed under test
    ([../build.zig:11](../build.zig#L11), ci.yml:27/50). *Fix:* add `zig build test -Doptimize=ReleaseSafe`
    — keeps all bounds/overflow/cast checks active over the optimization-adjacent codegen, directly
    mitigating the Rule 5 and Rule 10 gaps with no source change.
 
-10. **[Medium] Fix the thread-safety doc and the generated-table header drift.** The 80-line
+10. **[Medium · ✅ DONE] Fix the thread-safety doc and the generated-table header drift.** The 80-line
     `ThreadSafety` doc ([../src/thread_safety.zig:3](../src/thread_safety.zig#L3)–82) claims "no shared
     mutable state / no internal caching," contradicted by the per-`Regex` `lazy_pool`/`bt_pool` scratch
     ([../src/regex.zig:238](../src/regex.zig#L238)–250) — the conclusion (safe) holds but the stated
@@ -252,7 +283,7 @@ parse→HIR→NFA→DFA pipeline at compile time and monomorphizes a baked match
 security-conscious comptime engineering; its weaknesses are all about duplication that must stay in
 lockstep, plus two latent correctness traps.
 
-1. **[High · Rule 4 / maintainability] `buildAll` is a 256-line leaf function.**
+1. **[High · ✅ DONE · Rule 4 / maintainability] `buildAll` is a 256-line leaf function.**
    [../src/pattern.zig:512](../src/pattern.zig#L512)–767. A flat sequence of eight strategy-routing gates,
    each hand-constructing a wide `Built` struct literal — the routing brain and the designated lockstep
    peer of `compileWithFlags` (see Top priority #1). *Fix:* extract each gate into a named `try*` helper
@@ -273,14 +304,14 @@ lockstep, plus two latent correctness traps.
    silently bakes a stale/`undefined` field into `.rodata`. *Fix:* extract `fn bakeExactHir(...)` and call
    it from both sites (mirroring how `compressTo` is the single source of truth for the DFA bake).
 
-4. **[Medium · readability/maintainability] Stale, self-contradictory `compress` doc comment.**
+4. **[Medium · ✅ DONE · readability/maintainability] Stale, self-contradictory `compress` doc comment.**
    [../src/pattern.zig:71](../src/pattern.zig#L71)–86. Claims "the main matcher table bakes the same shape
    **inline** in the `use_dfa` arm below. Field-for-field identical to that inline bake." Verified false:
    the `use_dfa` arm calls `compress(m)` (line 1745); the only field-by-field bake is in `compressTo`
    (102–137). A reader will hunt for a non-existent inline bake. *Fix:* replace with one accurate sentence
    naming `compressTo` as the single field-mapping source of truth.
 
-5. **[Medium · Rule 7] `slotsToCaps` unconditionally `@intCast`s the group-0 slots.**
+5. **[Medium · ✅ DONE · Rule 7] `slotsToCaps` unconditionally `@intCast`s the group-0 slots.**
    [../src/pattern.zig:1047](../src/pattern.zig#L1047)–1059. Groups `1..NG+1` are guarded
    (`if (s >= 0 and e >= 0 and s <= e)`) but group 0 is cast with no guard; the unset sentinel is `-1`, so
    `@intCast(-1)` to a `usize` index panics in safe builds. Safe today *only by caller discipline* (every

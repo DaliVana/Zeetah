@@ -448,6 +448,268 @@ pub const Regex = struct {
         return compileWithFlags(allocator, pattern, .{});
     }
 
+    // --- compileWithFlags arm helpers --------------------------------------
+    // Each helper is ONE engine-selection arm of `compileWithFlags` (and the
+    // runtime peer of one `*Built` arm in `pattern.zig` `buildAll`). A `try*`
+    // helper returns a fully-formed `Regex` when it applies, else `null`; the
+    // always-applicable arms return a `Regex`. Resources an arm allocates are
+    // owned by the `Regex` it returns (or freed by its own `errdefer` on an
+    // internal failure); `owned`/`nheap` stay owned by `compileWithFlags` until
+    // an arm succeeds, so a `null`/error return never leaks or double-frees.
+
+    /// `.dfa_edge_look`: peel `concat(regular_core, trailing_width1_look)`, run
+    /// `core` on a linear DFA + an O(1) edge verify instead of demoting the whole
+    /// pattern to the tree backtracker. Capture-free. Caller gates `ng == 0`.
+    fn tryEdgeLook(allocator: std.mem.Allocator, h: *hir.Hir(null), owned: []const u8, flags: common.CompileFlags, gnames: [hir.MAX_GROUPS + 1]?[]const u8) ?Regex {
+        if (edge_look.recognize(null, h)) |rec| {
+            if (buildEdgeLookDfa(allocator, h, rec.core)) |coredfa| {
+                return Regex{
+                    .allocator = allocator,
+                    .pattern = owned,
+                    .flags = flags,
+                    .kind = .dfa_edge_look,
+                    .dfa = coredfa,
+                    .el_spec = rec.spec,
+                    .n_groups = 0,
+                    .gnames = gnames,
+                };
+            }
+        }
+        return null;
+    }
+
+    /// `.split_alt`: a top-level alternation with no captures and a mix of
+    /// regular / non-regular branches runs each regular run on an anchored DFA
+    /// and only the non-regular branches on the tree backtracker (leftmost-first
+    /// preserved by source order). Caller gates `ng == 0`.
+    fn trySplitAlt(allocator: std.mem.Allocator, h: *hir.Hir(null), owned: []const u8, flags: common.CompileFlags, gnames: [hir.MAX_GROUPS + 1]?[]const u8) ?Regex {
+        if (split_alt.build(allocator, h, h.anchored_end)) |sa| {
+            return Regex{
+                .allocator = allocator,
+                .pattern = owned,
+                .flags = flags,
+                .kind = .split_alt,
+                .split_plan = sa,
+                .seek = seek_mod.build(allocator, h),
+                .bt_a_start = h.anchored_start,
+                .bt_a_end = h.anchored_end,
+                .n_groups = 0,
+                .gnames = gnames,
+            };
+        }
+        return null;
+    }
+
+    /// `.dup_word`: `(\b CLASS+ \b) SEP \1` adjacent-duplicate-token shape — one
+    /// O(n) forward scan instead of the per-position tree backtracker. Narrow
+    /// recogniser, differential-tested against that backtracker. Caller gates
+    /// `ng == 1`.
+    fn tryDupWord(allocator: std.mem.Allocator, h: *hir.Hir(null), owned: []const u8, flags: common.CompileFlags, gnames: [hir.MAX_GROUPS + 1]?[]const u8) !?Regex {
+        if (dupword.build(h)) |d| {
+            const e = try allocator.create(dupword.DupWord);
+            e.* = d;
+            return Regex{
+                .allocator = allocator,
+                .pattern = owned,
+                .flags = flags,
+                .kind = .dup_word,
+                .dw = e,
+                .n_groups = 1,
+                .gnames = gnames,
+            };
+        }
+        return null;
+    }
+
+    /// `.backtrack`: the non-regular tier fallback (backreferences / lookaround).
+    /// Transfers the HIR off the caller's stack into a heap copy `hh` (clearing
+    /// `h_owned` so the caller's deferred `deinit` is a no-op) and runs the tree
+    /// backtracker over it. Compiles + runs; step-budget → `MatchBudgetExceeded`.
+    fn buildBacktrack(allocator: std.mem.Allocator, h: *hir.Hir(null), h_owned: *bool, owned: []const u8, flags: common.CompileFlags, ng: usize, gnames: [hir.MAX_GROUPS + 1]?[]const u8) !Regex {
+        const hh = try allocator.create(hir.Hir(null));
+        hh.* = h.*;
+        h.nodes = .empty;
+        h.sets = .empty;
+        h_owned.* = false; // hh owns the buffers now
+        return Regex{
+            .allocator = allocator,
+            .pattern = owned,
+            .flags = flags,
+            .kind = .backtrack,
+            .bt_hir = hh,
+            .seek = seek_mod.build(allocator, hh),
+            .del = delegate.build(allocator, hh),
+            .bt_a_start = hh.anchored_start,
+            .bt_a_end = hh.anchored_end,
+            .n_groups = ng,
+            .gnames = gnames,
+        };
+    }
+
+    /// `.boundary_lits`: `\b(?:lit|…)\b` literal alternation — regular but a big
+    /// keyword list blows the naive NFA's `MAX_NFA`, so run Aho-Corasick locate +
+    /// O(1) `\b` verify (no NFA). Caller gates `ng == 0` (reports no submatches).
+    fn tryBoundaryLits(allocator: std.mem.Allocator, h: *hir.Hir(null), owned: []const u8, flags: common.CompileFlags, gnames: [hir.MAX_GROUPS + 1]?[]const u8) !?Regex {
+        if (seq_extract.boundaryLiterals(null, h)) |bl| {
+            var needles: [seq_extract.MAX_BL][]const u8 = undefined;
+            for (0..bl.n) |i| needles[i] = bl.alt(i);
+            if (prefilter.AhoCorasick.build(needles[0..bl.n])) |ac| {
+                const e = try allocator.create(BLits);
+                e.* = BLits.init(ac, bl);
+                return Regex{
+                    .allocator = allocator,
+                    .pattern = owned,
+                    .flags = flags,
+                    .kind = .boundary_lits,
+                    .blits = e,
+                    .n_groups = 0,
+                    .gnames = gnames,
+                };
+            }
+        }
+        return null;
+    }
+
+    /// `.bt_look`: look-assertion patterns (`\b \B`, mid `^ $`, `(?m)`, `\A \z
+    /// \Z`) run on the bounded backtracker (it evaluates conditional epsilons
+    /// with (prev,next) byte context; the DFA can't fold look-assertions). Bakes
+    /// two optional fast-path DFAs: a line-DFA for `(?m)^body$` and a reverse-end
+    /// DFA for `(?m)<class>+$` (defuses the `bt_look` O(n²) restart). Always
+    /// applies when `props.has_look`. Consumes `nheap` (the retained NFA).
+    fn buildBtLook(allocator: std.mem.Allocator, h: *hir.Hir(null), nheap: ?*thompson.Nfa(null), props: properties.Properties, owned: []const u8, flags: common.CompileFlags, ng: usize, gnames: [hir.MAX_GROUPS + 1]?[]const u8) !Regex {
+        const bt_pool = try allocator.create(cache_mod.Pool(bounded_bt.BtScratch));
+        errdefer allocator.destroy(bt_pool);
+        bt_pool.* = cache_mod.Pool(bounded_bt.BtScratch).init(allocator);
+        var line_dfa: ?*full_dfa.PackedDfa = null;
+        var line_has_dollar = false;
+        errdefer if (line_dfa) |p| {
+            p.deinit(allocator);
+            allocator.destroy(p);
+        };
+        if (props.bounds.start == .line) {
+            if (properties.lineAnchoredRegular(null, h)) |shape| {
+                if (buildLineDfa(allocator, h)) |d| {
+                    line_dfa = d;
+                    line_has_dollar = shape.has_dollar;
+                }
+            }
+        }
+        var rev_end_dfa: ?*full_dfa.PackedDfa = null;
+        errdefer if (rev_end_dfa) |p| {
+            p.deinit(allocator);
+            allocator.destroy(p);
+        };
+        if (ng == 0) {
+            if (props.rev_end) |_| rev_end_dfa = buildRevEndDfa(allocator, h);
+        }
+        return Regex{
+            .allocator = allocator,
+            .pattern = owned,
+            .flags = flags,
+            .kind = .bt_look,
+            .nfa = nheap,
+            .bt_a_start = h.anchored_start,
+            .bt_a_end = h.anchored_end,
+            .bt_line_anchor = props.bounds.start == .line,
+            .bt_line_first = props.line_first,
+            .line_dfa = line_dfa,
+            .line_has_dollar = line_has_dollar,
+            .rev_end_dfa = rev_end_dfa,
+            .rev_end_kind = if (rev_end_dfa != null) props.rev_end.? else .unanchored,
+            .n_groups = ng,
+            .gnames = gnames,
+            .bt_pool = bt_pool,
+        };
+    }
+
+    /// `.class_span`: a trivial whole-unanchored greedy `class+` / `class*` with
+    /// no groups — the match is just a maximal class run (a SIMD member scan, no
+    /// automaton). Single contiguous range only: a sparse class with long gaps
+    /// (`[0-9]+`) wins big; a dense/short-run class (`\w+`) loses to the DFA's
+    /// tight per-byte loop, so everything else keeps the DFA.
+    fn tryClassSpan(allocator: std.mem.Allocator, h: *hir.Hir(null), owned: []const u8, flags: common.CompileFlags, ng: usize, gnames: [hir.MAX_GROUPS + 1]?[]const u8) ?Regex {
+        if (h.anchored_start or h.anchored_end or ng != 0 or h.saw_lazy) return null;
+        const rootn = h.node(h.root);
+        if (!((rootn.tag == .plus or rootn.tag == .star) and rootn.greedy)) return null;
+        const child = h.node(rootn.a);
+        if (child.tag != .set) return null;
+        if (class_span.Ranges.fromBitmap(h.setBitmap(child.set_idx))) |rg| {
+            if (rg.n == 1) return Regex{
+                .allocator = allocator,
+                .pattern = owned,
+                .flags = flags,
+                .kind = .class_span,
+                .cs_ranges = rg,
+                .cs_star = rootn.tag == .star,
+                .n_groups = 0,
+                .gnames = gnames,
+            };
+        }
+        return null;
+    }
+
+    /// Regular DFA tier route: pack the eager DFA and emit a `.literal` (Teddy
+    /// only) / `.reverse_suffix` / `.lit_prefix` / plain `.dfa` `Regex` per the
+    /// shared `planner.resolve` route. `op_onepass` gates the zero-alloc one-pass
+    /// capture reconstruction. The dense `$`-anchored / floor-cluster reroutes
+    /// were already taken by the caller; this is the eager-table tail.
+    fn buildRegularDfa(allocator: std.mem.Allocator, d: *full_dfa.Dfa256, nfa: *const thompson.Nfa(null), nheap: ?*thompson.Nfa(null), owned: []const u8, flags: common.CompileFlags, ng: usize, gnames: [hir.MAX_GROUPS + 1]?[]const u8, route: planner.Route, props: properties.Properties, a_start: bool, a_end: bool) !Regex {
+        // One-pass capture gate: a one-pass pattern with groups reconstructs
+        // slots in a single allocation-free forward pass (`nfa` retained because
+        // `need_nfa = needs_captures or has_look`).
+        const op_ok = props.needs_captures and onepass.isOnePassNfa(null, nfa);
+        var self = Regex{
+            .allocator = allocator,
+            .pattern = owned,
+            .flags = flags,
+            .kind = .dfa,
+            .nfa = nheap,
+            .bt_a_start = a_start,
+            .bt_a_end = a_end,
+            .n_groups = ng,
+            .gnames = gnames,
+            .op_onepass = op_ok,
+        };
+        switch (route) {
+            .literal => |seq| {
+                self.kind = .literal;
+                self.teddy = core.buildLiteral(&seq) orelse {
+                    const heap = try full_dfa.packHeap(allocator, d);
+                    self.kind = .dfa;
+                    self.dfa = heap;
+                    return self;
+                };
+            },
+            .reverse_suffix => |seq| {
+                const td = core.buildLiteral(&seq) orelse {
+                    const heap = try full_dfa.packHeap(allocator, d);
+                    self.kind = .dfa;
+                    self.dfa = heap;
+                    return self;
+                };
+                const heap = try full_dfa.packHeap(allocator, d);
+                self.kind = .reverse_suffix;
+                self.dfa = heap;
+                self.teddy = td;
+            },
+            .backtrack => return RegexError.NotImplemented, // errdefers free owned/nheap
+            .lit_prefix => |seq| {
+                const heap = try full_dfa.packHeap(allocator, d);
+                self.dfa = heap;
+                if (core.buildLiteral(&seq)) |td| {
+                    self.kind = .lit_prefix;
+                    self.teddy = td;
+                } else self.kind = .dfa;
+            },
+            .dfa => {
+                const heap = try full_dfa.packHeap(allocator, d);
+                self.kind = .dfa;
+                self.dfa = heap;
+            },
+        }
+        return self;
+    }
+
     pub fn compileWithFlags(
         allocator: std.mem.Allocator,
         pattern: []const u8,
@@ -488,122 +750,20 @@ pub const Regex = struct {
         var gnames0 = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1);
         const ng0 = scanGroups(owned, &gnames0);
 
-        // Non-regular tier (backreferences / lookaround): the tree
-        // backtracker owns the HIR (transfer it off the local stack so the
-        // deferred deinit is a no-op). .NET model: compiles and runs,
-        // step-budget → MatchBudgetExceeded (never a hang).
+        // --- Non-regular tier (backreferences / lookaround): the tree
+        // backtracker + its narrow fast-path peels (edge-look / split-alt /
+        // dup-word). Each arm is a named helper above; this block always returns
+        // (the backtracker is the unconditional fallback). The arm order + names
+        // mirror the comptime `pattern.zig` `buildAll` cascade. .NET model:
+        // compiles and runs, step-budget → MatchBudgetExceeded (never a hang).
         if (props.requires_backtracking) {
-            // Edge-look peel: `concat(regular_greedy_core, trailing_width1_look)`
-            // runs `core` on the linear DFA + an O(1) edge verify, instead of
-            // demoting the whole pattern to the tree backtracker (the lookaround
-            // analogue of `bt_look`). Capture-free only. See `exec/edge_look.zig`.
-            if (ng0 == 0) {
-                if (edge_look.recognize(null, &h)) |rec| {
-                    if (buildEdgeLookDfa(allocator, &h, rec.core)) |coredfa| {
-                        return Regex{
-                            .allocator = allocator,
-                            .pattern = owned,
-                            .flags = flags,
-                            .kind = .dfa_edge_look,
-                            .dfa = coredfa,
-                            .el_spec = rec.spec,
-                            .n_groups = 0,
-                            .gnames = gnames0,
-                        };
-                    }
-                }
-            }
-
-            // Per-segment delegation: a top-level alternation with no capture
-            // groups and a mix of regular / non-regular branches runs each
-            // regular run on an anchored DFA and only the non-regular
-            // branches on the tree backtracker (leftmost-first preserved by
-            // source order). `build` returns null when not applicable/safe,
-            // and we fall through to the whole-pattern `.backtrack` path.
-            if (ng0 == 0) {
-                if (split_alt.build(allocator, &h, h.anchored_end)) |sa| {
-                    return Regex{
-                        .allocator = allocator,
-                        .pattern = owned,
-                        .flags = flags,
-                        .kind = .split_alt,
-                        .split_plan = sa,
-                        .seek = seek_mod.build(allocator, &h),
-                        .bt_a_start = h.anchored_start,
-                        .bt_a_end = h.anchored_end,
-                        .n_groups = 0,
-                        .gnames = gnames0,
-                    };
-                }
-            }
-
-            // `(\b CLASS+ \b) SEP \1` adjacent-duplicate-token shape: one
-            // O(n) forward scan instead of the per-position tree
-            // backtracker. Narrow recogniser; any miss falls through to the
-            // `.backtrack` path below unchanged (no regression, no semantic
-            // risk — it is differential-tested against that backtracker).
-            if (ng0 == 1) {
-                if (dupword.build(&h)) |d| {
-                    const e = try allocator.create(dupword.DupWord);
-                    e.* = d;
-                    return Regex{
-                        .allocator = allocator,
-                        .pattern = owned,
-                        .flags = flags,
-                        .kind = .dup_word,
-                        .dw = e,
-                        .n_groups = 1,
-                        .gnames = gnames0,
-                    };
-                }
-            }
-
-            const hh = try allocator.create(hir.Hir(null));
-            hh.* = h;
-            h.nodes = .empty;
-            h.sets = .empty;
-            h_owned = false; // hh owns the buffers now
-            return Regex{
-                .allocator = allocator,
-                .pattern = owned,
-                .flags = flags,
-                .kind = .backtrack,
-                .bt_hir = hh,
-                .seek = seek_mod.build(allocator, hh),
-                .del = delegate.build(allocator, hh),
-                .bt_a_start = hh.anchored_start,
-                .bt_a_end = hh.anchored_end,
-                .n_groups = ng0,
-                .gnames = gnames0,
-            };
+            if (ng0 == 0) if (tryEdgeLook(allocator, &h, owned, flags, gnames0)) |r| return r;
+            if (ng0 == 0) if (trySplitAlt(allocator, &h, owned, flags, gnames0)) |r| return r;
+            if (ng0 == 1) if (try tryDupWord(allocator, &h, owned, flags, gnames0)) |r| return r;
+            return try buildBacktrack(allocator, &h, &h_owned, owned, flags, ng0, gnames0);
         }
 
-        // `\b(?:lit|lit|…)\b`: a word-boundary-bracketed pure literal
-        // alternation. Regular, but a big keyword list blows the naive NFA's
-        // `MAX_NFA` ⇒ a typed `PatternTooComplex` for a trivial language.
-        // Run it as Aho-Corasick locate + O(1) `\b` verify instead (no NFA,
-        // no `bt_look` `visited` array). Tight recogniser + AC node budget;
-        // any miss falls through to the unchanged path below (no regression).
-        // `n_groups == 0` only (this engine reports no submatches).
-        if (ng0 == 0) {
-            if (seq_extract.boundaryLiterals(null, &h)) |bl| {
-                var needles: [seq_extract.MAX_BL][]const u8 = undefined;
-                for (0..bl.n) |i| needles[i] = bl.alt(i);
-                if (prefilter.AhoCorasick.build(needles[0..bl.n])) |ac| {
-                    const e = try allocator.create(BLits);
-                    e.* = BLits.init(ac, bl);
-                    return Regex{
-                        .allocator = allocator,
-                        .pattern = owned,
-                        .flags = flags,
-                        .kind = .boundary_lits,
-                        .blits = e,
-                        .n_groups = 0,
-                        .gnames = gnames0,
-                    };
-                }
-            }
-        }
+        if (ng0 == 0) if (try tryBoundaryLits(allocator, &h, owned, flags, gnames0)) |r| return r;
 
         var nfa = thompson.build(null, &h) catch return RegexError.PatternTooComplex;
 
@@ -620,101 +780,9 @@ pub const Regex = struct {
         errdefer if (nheap) |p| allocator.destroy(p);
         if (nheap) |p| p.* = nfa;
 
-        // Look-assertion patterns (\b \B, mid ^ $, (?m), mid \A \z \Z) run on
-        // the bounded backtracker (it evaluates conditional epsilons with
-        // (prev,next) byte context); the DFA does not fold look-assertions.
-        if (props.has_look) {
-            const bt_pool = try allocator.create(cache_mod.Pool(bounded_bt.BtScratch));
-            errdefer allocator.destroy(bt_pool);
-            bt_pool.* = cache_mod.Pool(bounded_bt.BtScratch).init(allocator);
-            // Line-anchored regular fast path: `(?m)^body$` with a regular,
-            // `\n`-free body matches each line with a single looks-stripped DFA
-            // pass instead of the per-line NFA `matchAt`. Captures are fine —
-            // the DFA locates the whole-match span (span-only models read it
-            // directly; the one-pass capture path fills group slots over that
-            // span via `onepass.fill`), so no `ng==0` restriction is needed.
-            var line_dfa: ?*full_dfa.PackedDfa = null;
-            var line_has_dollar = false;
-            errdefer if (line_dfa) |p| {
-                p.deinit(allocator);
-                allocator.destroy(p);
-            };
-            if (props.bounds.start == .line) {
-                if (properties.lineAnchoredRegular(null, &h)) |shape| {
-                    if (buildLineDfa(allocator, &h)) |d| {
-                        line_dfa = d;
-                        line_has_dollar = shape.has_dollar;
-                    }
-                }
-            }
-            // Reverse end-anchored fast path (`(?m)<class>+$` / `<class>+\Z`):
-            // the body's reverse DFA drives one O(n) pass per end boundary,
-            // defusing the `bt_look` O(n²) restart. Span-only ⇒ groups keep the
-            // backtracker (`ng == 0` gate; `revEndScan` is never reached then).
-            var rev_end_dfa: ?*full_dfa.PackedDfa = null;
-            errdefer if (rev_end_dfa) |p| {
-                p.deinit(allocator);
-                allocator.destroy(p);
-            };
-            if (ng == 0) {
-                if (props.rev_end) |_| rev_end_dfa = buildRevEndDfa(allocator, &h);
-            }
-            return Regex{
-                .allocator = allocator,
-                .pattern = owned,
-                .flags = flags,
-                .kind = .bt_look,
-                .nfa = nheap,
-                .bt_a_start = h.anchored_start,
-                .bt_a_end = h.anchored_end,
-                .bt_line_anchor = props.bounds.start == .line,
-                .bt_line_first = props.line_first,
-                .line_dfa = line_dfa,
-                .line_has_dollar = line_has_dollar,
-                .rev_end_dfa = rev_end_dfa,
-                .rev_end_kind = if (rev_end_dfa != null) props.rev_end.? else .unanchored,
-                .n_groups = ng,
-                .gnames = gnames,
-                .bt_pool = bt_pool,
-            };
-        }
+        if (props.has_look) return try buildBtLook(allocator, &h, nheap, props, owned, flags, ng, gnames);
 
-        // Trivial `class+` / `class*` (whole unanchored pattern, greedy, no
-        // groups): the match is just a maximal class run — a SIMD member
-        // scan, no automaton. Orders faster than the DFA + per-position
-        // restart for `[0-9]+`, `\w+`, `.+`, `[^…]+`.
-        if (!h.anchored_start and !h.anchored_end and ng == 0 and !h.saw_lazy) {
-            const rootn = h.node(h.root);
-            if ((rootn.tag == .plus or rootn.tag == .star) and rootn.greedy) {
-                const child = h.node(rootn.a);
-                if (child.tag == .set) {
-                    // Single contiguous range only. The chunk-skip scan wins
-                    // only when the class is *sparse with long gaps* (e.g.
-                    // `[0-9]+` — numbers amid prose: +118%, reproduced).
-                    // For a dense/short-run class (`\w+` — word chars are
-                    // most of the text, runs/gaps <16B) the per-chunk scalar
-                    // boundary fallback is pure overhead and it *loses* to
-                    // the DFA's tight per-byte loop (−51%). That is
-                    // structural, not a codegen bug — the NEON-correct
-                    // memberVec (`cmhs`+`bsl`+`orr`+`@reduce`) did not
-                    // change it. So gate to single-range and let everything
-                    // else keep the DFA. (multi-range = future: a tight
-                    // first-member memchr, not chunk-skip.)
-                    if (class_span.Ranges.fromBitmap(h.setBitmap(child.set_idx))) |rg| {
-                        if (rg.n == 1) return Regex{
-                            .allocator = allocator,
-                            .pattern = owned,
-                            .flags = flags,
-                            .kind = .class_span,
-                            .cs_ranges = rg,
-                            .cs_star = rootn.tag == .star,
-                            .n_groups = 0,
-                            .gnames = gnames,
-                        };
-                    }
-                }
-            }
-        }
+        if (tryClassSpan(allocator, &h, owned, flags, ng, gnames)) |r| return r;
 
         var d = full_dfa.compute(null, &nfa, h.anchored_start, h.anchored_end);
         if (d.outcome != .ok) {
@@ -815,80 +883,10 @@ pub const Regex = struct {
             return try buildDenseRegex(allocator, &nfa, nheap, owned, flags, h.anchored_start, h.anchored_end, ng, gnames);
         }
         // Everything else with an eager dense table stays on the O(1)/byte
-        // `core.findLeftmost` (the lazy single-pass is for `.lazy_dfa` —
-        // exploded patterns with no dense table — where it cannot regress).
-
-        // Captures one-pass gate (pure, comptime-evaluable for the `Pattern`
-        // path): a one-pass pattern with groups can reconstruct slots in a
-        // single allocation-free forward pass. No look/backref here (those
-        // returned to bt_look/backtrack above). `nfa` is retained because
-        // `need_nfa = needs_captures or has_look`.
-        const op_ok = props.needs_captures and onepass.isOnePassNfa(null, &nfa);
-
-        var self = Regex{
-            .allocator = allocator,
-            .pattern = owned,
-            .flags = flags,
-            .kind = .dfa,
-            .nfa = nheap,
-            .bt_a_start = h.anchored_start,
-            .bt_a_end = h.anchored_end,
-            .n_groups = ng,
-            .gnames = gnames,
-            .op_onepass = op_ok,
-        };
-        switch (route) {
-            .literal => |seq| {
-                self.kind = .literal;
-                self.teddy = core.buildLiteral(&seq) orelse {
-                    // Fall back to the DFA strategy (still correct).
-                    const heap = try full_dfa.packHeap(allocator, &d);
-                    self.kind = .dfa;
-                    self.dfa = heap;
-                    return self;
-                };
-            },
-            .reverse_suffix => |seq| {
-                const td = core.buildLiteral(&seq) orelse {
-                    const heap = try full_dfa.packHeap(allocator, &d);
-                    self.kind = .dfa;
-                    self.dfa = heap;
-                    return self;
-                };
-                const heap = try full_dfa.packHeap(allocator, &d);
-                self.kind = .reverse_suffix;
-                self.dfa = heap;
-                self.teddy = td;
-            },
-            .backtrack => return RegexError.NotImplemented, // errdefers free owned/nheap
-            // A selective multi-byte literal *prefix*: Teddy-locate the
-            // prefix, then anchored DFA `runFrom` verify there (exact
-            // symmetry with `.reverse_suffix`, which Teddy-locates a
-            // suffix). The ≥3-byte / unanchored gate already cleared in
-            // `planner.resolve`; only Teddy-compilability remains (a literal
-            // Teddy can't represent keeps the plain eager DFA). Measured
-            // tradeoff (kept by request): big wins where the prefix is rare
-            // (aws_eni +61%, href +18%, html +5%) at the cost of a corpus
-            // where it is frequent (apache_post −17%); net ≈ flat.
-            .lit_prefix => |seq| {
-                const heap = try full_dfa.packHeap(allocator, &d);
-                self.dfa = heap;
-                if (core.buildLiteral(&seq)) |td| {
-                    self.kind = .lit_prefix;
-                    self.teddy = td;
-                } else self.kind = .dfa;
-            },
-            // NOTE: routing `.core` to the single-pass lazy engine
-            // regressed those workloads ~100× / and again as a memoized
-            // dense single-pass (see `lazy-dfa-stage-status`). Eager DFA.
-            // (`.prefix_prefilter` that missed the gate resolves here too.)
-            .dfa => {
-                const heap = try full_dfa.packHeap(allocator, &d);
-                self.kind = .dfa;
-                self.dfa = heap;
-            },
-        }
-        return self;
+        // `core.findLeftmost` (the lazy single-pass is for `.lazy_dfa` — exploded
+        // patterns with no dense table). Pack it and route via the shared
+        // `planner.resolve` into a literal / reverse-suffix / lit-prefix / DFA.
+        return try buildRegularDfa(allocator, &d, &nfa, nheap, owned, flags, ng, gnames, route, props, h.anchored_start, h.anchored_end);
     }
 
     pub fn deinit(self: *Regex) void {

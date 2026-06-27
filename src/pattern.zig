@@ -506,6 +506,165 @@ fn delegateIslands(comptime cap: ?usize, h: *const hir.Hir(cap)) DelegateBake {
 /// Run the whole pipeline at comptime: parse -> Hir -> Thompson NFA ->
 /// subset construction + minimization. `unsupported` -> runtime fallback;
 /// `exploded` -> the explosion guard; `ok` -> bake the DFA.
+// --- buildAll arm helpers ---------------------------------------------------
+// Each `*Built` helper is ONE engine-selection arm of `buildAll` (and the peer
+// of one arm in the runtime `regex.zig` `compileWithFlags` cascade). A `try*`
+// helper returns a fully-formed `Built` when it applies, else `null`; the
+// always-applicable fallbacks return a `Built`. Keeping the arms named + ordered
+// makes the comptime⇄runtime correspondence diffable instead of buried in one
+// 250-line function.
+
+const GroupNames = [hir.MAX_GROUPS + 1]?[]const u8;
+
+/// `.edge_look`: `concat(regular_greedy_core, trailing_width1_look)` bakes the
+/// core's DFA + an O(1) edge verify instead of the comptime tree backtracker
+/// (comptime peer of the runtime `.dfa_edge_look`). Shares `edge_look.recognize`
+/// with the runtime path. Capture-free; restores `h.root` so the baked `.hir`
+/// stays the whole pattern. Caller gates `ng == 0`.
+fn tryEdgeLookBuilt(h: *hir.Hir(HIR_CAP), ng: usize, gnames: GroupNames) ?Built {
+    if (edge_look.recognize(HIR_CAP, h)) |rec| {
+        const saved_root = h.root;
+        h.root = rec.core;
+        if (thompson.build(HIR_CAP, h)) |nfa_core| {
+            var nfa_c = nfa_core;
+            var cd = full_dfa.compute(HIR_CAP, &nfa_c, h.anchored_start, false);
+            if (cd.outcome == .ok) {
+                cd.required = seq_extract.requiredByte(HIR_CAP, h);
+                h.root = saved_root;
+                return .{ .dfa = cd, .outcome = .ok, .strat = .edge_look, .el_spec = rec.spec, .hir = h.*, .n_groups = ng, .gnames = gnames };
+            }
+        } else |_| {}
+        h.root = saved_root;
+    }
+    return null;
+}
+
+/// `.boundary_lits`: `\b(?:lit|…)\b` keyword alternation — regular but blows
+/// `MAX_NFA`, so bake a node-trimmed Aho-Corasick (locate + O(1) `\b` verify)
+/// like the runtime `.boundary_lits` engine. Confirms the AC fits the build
+/// budget here so routing is decided now; `Pattern` rebuilds + trims it (kept
+/// out of `Built` to stay small). Caller gates `ng == 0`.
+fn tryBoundaryLitsBuilt(h: *hir.Hir(HIR_CAP), ng: usize, gnames: GroupNames) ?Built {
+    if (seq_extract.boundaryLiterals(HIR_CAP, h)) |bl| {
+        var needles: [seq_extract.MAX_BL][]const u8 = undefined;
+        for (0..bl.n) |i| needles[i] = bl.alt(i);
+        if (pf.AhoCorasick.build(needles[0..bl.n]) != null) {
+            return .{ .dfa = full_dfa.emptyDfa256(.ok), .outcome = .ok, .strat = .boundary_lits, .hir = h.*, .n_groups = ng, .gnames = gnames, .bl = bl };
+        }
+    }
+    return null;
+}
+
+/// `.line_dfa`: `(?m)^body$` / `(?m)^body` with a regular `\n`-free body matches
+/// each line with ONE looks-stripped DFA pass (comptime peer of the runtime
+/// `.bt_look` line-DFA). Captures are fine — the DFA locates the span. No `ng`
+/// gate (checked before the backtracker fallback so the `^`/`$` looks don't
+/// route there via `has_look`).
+fn tryLineDfaBuilt(h: *hir.Hir(HIR_CAP), props: properties.Properties, ng: usize, gnames: GroupNames) ?Built {
+    if (properties.lineAnchoredRegular(HIR_CAP, h)) |shape| {
+        if (lineDfaDfa(h)) |d| {
+            return .{ .dfa = d, .outcome = .ok, .strat = .line_dfa, .hir = h.*, .n_groups = ng, .gnames = gnames, .line_has_dollar = shape.has_dollar, .line_first = props.line_first };
+        }
+    }
+    return null;
+}
+
+/// `.rev_end`: unanchored `(?m)<class>+$` / `<class>+\Z` with a regular
+/// non-nullable body and no captures — one O(n) reverse pass per end boundary
+/// instead of the tree backtracker's O(n²) per-position restart (comptime peer
+/// of the runtime `bt_look` reverse driver). Caller gates `ng == 0`.
+fn tryRevEndBuilt(h: *hir.Hir(HIR_CAP), props: properties.Properties, ng: usize, gnames: GroupNames) ?Built {
+    if (props.rev_end) |kind| {
+        if (revEndDfa(h)) |d| {
+            return .{ .dfa = d, .outcome = .ok, .strat = .rev_end, .hir = h.*, .n_groups = ng, .gnames = gnames, .rev_end_kind = kind };
+        }
+    }
+    return null;
+}
+
+/// `.dup_word`: the `(\b CLASS+ \b) SEP \1` adjacent-duplicate-token backref
+/// shape reduces to ONE O(n) forward scan (comptime peer of runtime `.dup_word`).
+/// Zero-alloc, HIR-free descriptor; nothing of the HIR is baked. Caller gates
+/// `DUP_WORD_ENABLED and ng == 1`.
+fn tryDupWordBuilt(h: *hir.Hir(HIR_CAP), ng: usize, gnames: GroupNames) ?Built {
+    if (dupword.buildAt(HIR_CAP, h)) |dw| {
+        return .{ .dfa = full_dfa.emptyDfa256(.ok), .outcome = .ok, .strat = .dup_word, .hir = h.*, .n_groups = ng, .gnames = gnames, .dw = dw };
+    }
+    return null;
+}
+
+/// `.backtrack` fallback for `requires_backtracking or has_look` patterns the
+/// DFA path can't represent. Bakes a regular over-approximation seek DFA
+/// (`overApproxDfa`) when available so the backtracker `memchr`s/DFA-skips
+/// proven-dead prefixes; falls back to a plain per-byte scan otherwise (still
+/// correct). `line_anchor` enumerates line starts for a leading `(?m)^…` that
+/// did not qualify for the regular `.line_dfa` arm.
+fn buildBacktrackBuilt(h: *hir.Hir(HIR_CAP), props: properties.Properties, ng: usize, gnames: GroupNames) Built {
+    var built: Built = .{
+        .dfa = full_dfa.emptyDfa256(.ok),
+        .outcome = .ok,
+        .strat = .backtrack,
+        .hir = h.*,
+        .n_groups = ng,
+        .gnames = gnames,
+        .line_anchor = props.bounds.start == .line,
+        .line_first = props.line_first,
+    };
+    if (overApproxDfa(h)) |od| {
+        built.seek_dfa = od;
+        built.seek_ok = true;
+    }
+    return built;
+}
+
+/// Regular DFA tier: build the NFA + eager DFA, bake the necessary-condition
+/// prefilters (`d.required`/`d.req_lit`), and route via the shared
+/// `planner.plan`/`planner.resolve` to a literal / reverse-suffix / lit-prefix /
+/// plain-DFA `Built` — the same source of truth the runtime `regex.zig` uses, so
+/// the two front-ends pick the same strategy by construction. Bakes a capture
+/// seek DFA (`ng > 0`) and the anti-ReDoS reverse DFA (unanchored `$`) exactly as
+/// the runtime regular tail does.
+fn buildRegularBuilt(h: *hir.Hir(HIR_CAP), props: properties.Properties, ng: usize, gnames: GroupNames, ci: bool) Built {
+    var nfa = thompson.build(HIR_CAP, h) catch {
+        return .{ .dfa = full_dfa.emptyDfa256(.ok), .outcome = .exploded };
+    };
+    var d = full_dfa.compute(HIR_CAP, &nfa, h.anchored_start, h.anchored_end);
+    if (d.outcome == .exploded) return .{ .dfa = d, .outcome = .exploded };
+    d.required = seq_extract.requiredByte(HIR_CAP, h);
+    d.req_lit = seq_extract.requiredLiteralBack(HIR_CAP, h);
+    const strat = planner.plan(props, .{ .case_insensitive = ci });
+    // A capture-bearing DFA pattern bakes its own over-approximation seek DFA so
+    // the zero-alloc capture backtracker doesn't blow its anti-ReDoS step budget.
+    var seek_dfa: full_dfa.Dfa256 = undefined;
+    var seek_ok = false;
+    if (ng > 0) {
+        if (overApproxDfa(h)) |od| {
+            seek_dfa = od;
+            seek_ok = true;
+        }
+    }
+    // Anti-ReDoS: bake the reverse DFA for an unanchored `$`-anchored bare-DFA /
+    // lit-prefix pattern so `find` runs one O(n) reverse pass (runtime mirror).
+    const route0 = planner.resolve(strat, h.anchored_start);
+    var rev_dfa: full_dfa.Dfa256 = undefined;
+    var rev_ok = false;
+    if ((route0 == .dfa or route0 == .lit_prefix) and h.anchored_end and !h.anchored_start) {
+        const rd = full_dfa.computeReverse(HIR_CAP, &nfa);
+        if (rd.outcome == .ok) {
+            rev_dfa = rd;
+            rev_ok = true;
+        }
+    }
+    return switch (route0) {
+        .literal => |seq| .{ .dfa = d, .outcome = .ok, .strat = .literal, .seq = seq, .hir = h.*, .n_groups = ng, .gnames = gnames, .seek_dfa = seek_dfa, .seek_ok = seek_ok },
+        .reverse_suffix => |sfx| .{ .dfa = d, .outcome = .ok, .strat = .reverse_suffix, .seq = sfx, .hir = h.*, .n_groups = ng, .gnames = gnames, .seek_dfa = seek_dfa, .seek_ok = seek_ok },
+        .lit_prefix => |pp| .{ .dfa = d, .outcome = .ok, .strat = .lit_prefix, .seq = pp, .hir = h.*, .n_groups = ng, .gnames = gnames, .seek_dfa = seek_dfa, .seek_ok = seek_ok, .rev_dfa = rev_dfa, .rev_ok = rev_ok },
+        // `.core`, plus the `.backtrack` sentinel (never reached — non-regular
+        // patterns `@compileError` upstream): plain baked DFA.
+        .dfa, .backtrack => .{ .dfa = d, .outcome = .ok, .strat = .dfa, .hir = h.*, .n_groups = ng, .gnames = gnames, .seek_dfa = seek_dfa, .seek_ok = seek_ok, .rev_dfa = rev_dfa, .rev_ok = rev_ok },
+    };
+}
+
 fn buildAll(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) Built {
     @setEvalBranchQuota(8_000_000);
     var h = hir.Hir(HIR_CAP).initComptime();
@@ -551,216 +710,25 @@ fn buildAll(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) 
     var gnames = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1);
     const ng = parser.scanGroups(pattern, &gnames);
 
-    // Edge-look peel: `concat(regular_greedy_core, trailing_width1_look)` bakes
-    // the core's DFA + an O(1) edge verify instead of the comptime tree
-    // backtracker (the comptime peer of the runtime `.dfa_edge_look`). Shares
-    // `edge_look.recognize`/`nextFrom` with the runtime path ⇒ identical
-    // matches. Capture-free only (`ng == 0`); restore `h.root` before returning
-    // so the baked `.hir` is the whole pattern.
-    if (ng == 0) {
-        if (edge_look.recognize(HIR_CAP, &h)) |rec| {
-            const saved_root = h.root;
-            h.root = rec.core;
-            if (thompson.build(HIR_CAP, &h)) |nfa_core| {
-                var nfa_c = nfa_core;
-                var cd = full_dfa.compute(HIR_CAP, &nfa_c, h.anchored_start, false);
-                if (cd.outcome == .ok) {
-                    cd.required = seq_extract.requiredByte(HIR_CAP, &h);
-                    h.root = saved_root;
-                    return .{ .dfa = cd, .outcome = .ok, .strat = .edge_look, .el_spec = rec.spec, .hir = h, .n_groups = ng, .gnames = gnames };
-                }
-            } else |_| {}
-            h.root = saved_root;
-        }
-    }
+    // Engine-selection cascade. Each arm is a named `*Built` helper above; the
+    // first that applies returns. Order + names mirror the runtime `regex.zig`
+    // `compileWithFlags` cascade so the two front-ends stay diffable. (The
+    // comptime path folds line-DFA / rev-end / has-look into these ordered arms
+    // where the runtime keeps a separate `.bt_look` engine — see the `has_look`
+    // note on `buildBacktrackBuilt`.)
+    if (ng == 0) if (tryEdgeLookBuilt(&h, ng, gnames)) |b| return b;
 
-    // `\b(?:lit|lit|…)\b` keyword alternation: regular, but a big literal set
-    // blows `MAX_NFA` so the DFA path can't build it. The runtime routes this to
-    // its `.boundary_lits` engine (Aho-Corasick locate + O(1) `\b` verify); the
-    // comptime path does the same, baking a node-trimmed AC into `.rodata`. Both
-    // building blocks (`boundaryLiterals` + `AhoCorasick.build`) are zero-allocator
-    // and comptime-evaluable. `ng == 0` only (the engine reports no submatches,
-    // mirroring the runtime gate). Checked BEFORE the backtracker fallback — the
-    // bracketing `\b`s would otherwise route here via `has_look`.
-    if (ng == 0) {
-        if (seq_extract.boundaryLiterals(HIR_CAP, &h)) |bl| {
-            var needles: [seq_extract.MAX_BL][]const u8 = undefined;
-            for (0..bl.n) |i| needles[i] = bl.alt(i);
-            // Confirm the AC fits the build budget here so routing is decided now;
-            // `Pattern` rebuilds + trims it (kept out of `Built` to stay small).
-            if (pf.AhoCorasick.build(needles[0..bl.n]) != null) {
-                return .{
-                    .dfa = full_dfa.emptyDfa256(.ok),
-                    .outcome = .ok,
-                    .strat = .boundary_lits,
-                    .hir = h,
-                    .n_groups = ng,
-                    .gnames = gnames,
-                    .bl = bl,
-                };
-            }
-        }
-    }
+    if (ng == 0) if (tryBoundaryLitsBuilt(&h, ng, gnames)) |b| return b;
 
-    // Line-anchored regular fast path (comptime peer of the runtime `.bt_look`
-    // line-DFA): `(?m)^body$` / `(?m)^body` with a regular, `\n`-free body
-    // matches each line with ONE looks-stripped DFA pass instead of the tree
-    // backtracker. Checked BEFORE the backtracker fallback (the `^`/`$` looks
-    // would otherwise route there via `has_look`). Captures are handled too:
-    // the DFA locates the span (skipping non-matching lines) and the baked
-    // capture backtracker fills slots anchored at that line start (see
-    // `CaptureSupport`).
-    if (properties.lineAnchoredRegular(HIR_CAP, &h)) |shape| {
-        if (lineDfaDfa(&h)) |d| {
-            return .{
-                .dfa = d,
-                .outcome = .ok,
-                .strat = .line_dfa,
-                .hir = h,
-                .n_groups = ng,
-                .gnames = gnames,
-                .line_has_dollar = shape.has_dollar,
-                .line_first = props.line_first,
-            };
-        }
-    }
+    if (tryLineDfaBuilt(&h, props, ng, gnames)) |b| return b;
 
-    // Reverse end-anchored fast path (comptime peer of the runtime `bt_look`
-    // reverse driver): `(?m)<class>+$` / `<class>+\Z` with an unanchored start,
-    // a regular non-nullable body (and `\n`-free for `.line`), no captures —
-    // one O(n) reverse pass per end boundary instead of the tree backtracker's
-    // O(n²) per-position restart. Checked BEFORE the backtracker fallback (the
-    // trailing `$`/`\Z` look would otherwise route there via `has_look`). Groups
-    // keep the backtracker (span-only fast path).
-    if (ng == 0) {
-        if (props.rev_end) |kind| {
-            if (revEndDfa(&h)) |d| {
-                return .{
-                    .dfa = d,
-                    .outcome = .ok,
-                    .strat = .rev_end,
-                    .hir = h,
-                    .n_groups = ng,
-                    .gnames = gnames,
-                    .rev_end_kind = kind,
-                };
-            }
-        }
-    }
+    if (ng == 0) if (tryRevEndBuilt(&h, props, ng, gnames)) |b| return b;
 
-    // Adjacent-duplicate-word fast path (comptime peer of the runtime
-    // `.dup_word`): the `(\b CLASS+ \b) SEP \1` backref shape (the `backref_word`
-    // workload) reduces to ONE O(n) forward scan — find a maximal word-class run,
-    // then a separator + a byte-identical copy — instead of the tree backtracker's
-    // O(n·tokenlen) per-position restart. Checked BEFORE the backtracker fallback
-    // (the backref + `\b` looks would otherwise route there via `requires_backtracking`).
-    // `ng == 1` by construction (the one captured, back-referenced token);
-    // `dupword.buildAt` is zero-alloc + comptime-eval'able and returns a HIR-free
-    // descriptor, so nothing of the HIR is baked for this arm.
-    if (DUP_WORD_ENABLED and ng == 1) {
-        if (dupword.buildAt(HIR_CAP, &h)) |dw| {
-            return .{
-                .dfa = full_dfa.emptyDfa256(.ok),
-                .outcome = .ok,
-                .strat = .dup_word,
-                .hir = h,
-                .n_groups = ng,
-                .gnames = gnames,
-                .dw = dw,
-            };
-        }
-    }
+    if (DUP_WORD_ENABLED and ng == 1) if (tryDupWordBuilt(&h, ng, gnames)) |b| return b;
 
-    if (props.requires_backtracking or props.has_look) {
-        // Comptime seek prefilter: a regular OVER-APPROXIMATION DFA (built by
-        // `overApproxDfa` below — see its doc for the soundness/guards). When
-        // present it bakes into `.rodata` and the backtracker `memchr`s/DFA-skips
-        // proven-dead prefixes; when absent the backtracker's plain per-byte scan
-        // is used (still correct).
-        var built: Built = .{
-            .dfa = full_dfa.emptyDfa256(.ok),
-            .outcome = .ok,
-            .strat = .backtrack,
-            .hir = h,
-            .n_groups = ng,
-            .gnames = gnames,
-            // Leading-line-anchored `(?m)^…` that fell through to the backtracker
-            // (its body can match `\n`, or it has an alt+`$` priority-cut, so the
-            // regular `.line_dfa` arm above rejected it): enumerate line starts.
-            .line_anchor = props.bounds.start == .line,
-            .line_first = props.line_first,
-        };
-        if (overApproxDfa(&h)) |od| {
-            built.seek_dfa = od;
-            built.seek_ok = true;
-        }
-        return built;
-    }
+    if (props.requires_backtracking or props.has_look) return buildBacktrackBuilt(&h, props, ng, gnames);
 
-    var nfa = thompson.build(HIR_CAP, &h) catch {
-        return .{ .dfa = full_dfa.emptyDfa256(.ok), .outcome = .exploded };
-    };
-    var d = full_dfa.compute(HIR_CAP, &nfa, h.anchored_start, h.anchored_end);
-    if (d.outcome == .exploded) return .{ .dfa = d, .outcome = .exploded };
-
-    // (a) Bake the necessary-condition prefilters into the DFA, exactly as the
-    // runtime `regex.zig` does (`d.required` / `d.req_lit`). This is what keeps
-    // the comptime `Pattern`'s unanchored search linear instead of O(n²) — and
-    // gives the email/uri/ssn-style required-literal speedup at comptime too.
-    d.required = seq_extract.requiredByte(HIR_CAP, &h);
-    d.req_lit = seq_extract.requiredLiteralBack(HIR_CAP, &h);
-
-    // §6/(c): pure planner decision at comptime. A `.literal` strategy needs no
-    // DFA at all (Teddy only); `.reverse_suffix` / `.lit_prefix` bake the DFA
-    // plus a literal prefilter. The strategy → concrete-route mapping (incl. the
-    // ≥3-byte / unanchored `.lit_prefix` gate) is shared with the runtime
-    // `regex.zig` via `planner.resolve`, so the two front-ends pick the same
-    // strategy *by construction* (the `tests/feat_api.zig` differential is now a
-    // backstop on materialization, not the primary guard on routing).
-    const strat = planner.plan(props, .{ .case_insensitive = ci });
-    // Carry the HIR + capture metadata into every DFA-tier `Built` too, so the
-    // returned `Pattern` can bake a zero-alloc capture path (`captures`) over the
-    // SAME HIR when `ng > 0`. The DFA still serves `find`/`isMatch`/`count`;
-    // captures route through a baked `BacktrackerG`. That capture backtracker
-    // needs its OWN seek prefilter — without it, the unanchored capture scan over
-    // a `(.*)`-style pattern blows the per-call anti-ReDoS step budget hunting for
-    // the next match and bails early (e.g. `log_parse` stalled at 55 of ~600
-    // matches). So build the over-approximation seek here whenever the pattern
-    // has groups (cheap; gated on `ng > 0` so group-less patterns pay nothing).
-    var seek_dfa: full_dfa.Dfa256 = undefined;
-    var seek_ok = false;
-    if (ng > 0) {
-        if (overApproxDfa(&h)) |od| {
-            seek_dfa = od;
-            seek_ok = true;
-        }
-    }
-    // Anti-ReDoS (comptime peer of the runtime `regex.zig` reroute): for an
-    // unanchored `$`-anchored bare-DFA pattern, bake the reverse DFA so the arm
-    // serves `find`/`isMatch` with one O(n) `findAnchoredEnd` reverse pass
-    // instead of the O(n²) per-offset `findLeftmost` restart.
-    const route0 = planner.resolve(strat, h.anchored_start);
-    var rev_dfa: full_dfa.Dfa256 = undefined;
-    var rev_ok = false;
-    // `.lit_prefix` is included alongside `.dfa` (see the runtime mirror in
-    // `regex.zig`): a literal-prefixed `$` pattern (`abc.*x$`) otherwise stays on
-    // the per-Teddy-hit `litPrefixFind` verify, which is O(n²) when the prefix
-    // recurs. Both route the same single reverse pass.
-    if ((route0 == .dfa or route0 == .lit_prefix) and h.anchored_end and !h.anchored_start) {
-        const rd = full_dfa.computeReverse(HIR_CAP, &nfa);
-        if (rd.outcome == .ok) {
-            rev_dfa = rd;
-            rev_ok = true;
-        }
-    }
-    return switch (route0) {
-        .literal => |seq| .{ .dfa = d, .outcome = .ok, .strat = .literal, .seq = seq, .hir = h, .n_groups = ng, .gnames = gnames, .seek_dfa = seek_dfa, .seek_ok = seek_ok },
-        .reverse_suffix => |sfx| .{ .dfa = d, .outcome = .ok, .strat = .reverse_suffix, .seq = sfx, .hir = h, .n_groups = ng, .gnames = gnames, .seek_dfa = seek_dfa, .seek_ok = seek_ok },
-        .lit_prefix => |pp| .{ .dfa = d, .outcome = .ok, .strat = .lit_prefix, .seq = pp, .hir = h, .n_groups = ng, .gnames = gnames, .seek_dfa = seek_dfa, .seek_ok = seek_ok, .rev_dfa = rev_dfa, .rev_ok = rev_ok },
-        // `.core`, plus the `.backtrack` sentinel (never reached — non-regular
-        // patterns `@compileError` upstream): plain baked DFA.
-        .dfa, .backtrack => .{ .dfa = d, .outcome = .ok, .strat = .dfa, .hir = h, .n_groups = ng, .gnames = gnames, .seek_dfa = seek_dfa, .seek_ok = seek_ok, .rev_dfa = rev_dfa, .rev_ok = rev_ok },
-    };
+    return buildRegularBuilt(&h, props, ng, gnames, ci);
 }
 
 /// Comptime predicate: does `Pattern(pattern, …)` compile (vs. hit one of its
