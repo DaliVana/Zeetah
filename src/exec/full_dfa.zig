@@ -510,6 +510,7 @@ pub fn computeReverse(comptime cap: ?usize, nfa: *const thompson.Nfa(cap)) Dfa25
                 var cj: usize = cnt_off[nstate];
                 while (cj < cnt_off[nstate + 1]) : (cj += 1) {
                     if (hasBit(&rev.sets[cnt_set[cj]], sym)) {
+                        std.debug.assert(n_seeds < seeds.len); // ≤ MAX_EDGES
                         seeds[n_seeds] = cnt_to[cj];
                         n_seeds += 1;
                     }
@@ -643,6 +644,7 @@ pub fn compute(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), a_start: boo
                 var cj: usize = cnt_off[nstate];
                 while (cj < cnt_off[nstate + 1]) : (cj += 1) {
                     if (hasBit(&nfa.sets[cnt_set[cj]], sym)) {
+                        std.debug.assert(n_seeds < seeds.len); // ≤ MAX_EDGES
                         seeds[n_seeds] = cnt_to[cj];
                         n_seeds += 1;
                     }

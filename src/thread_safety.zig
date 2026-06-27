@@ -17,10 +17,15 @@ const std = @import("std");
 ///
 /// ## Matching Operations
 ///
-/// - **Thread-local VM state**: Each call to `isMatch()`, `find()`, or `findAll()`
-///   creates a new VM instance with its own thread-local state.
-/// - **No shared mutable state**: The VM allocates its own temporary data structures
-///   (thread lists, capture buffers) which are not shared between threads.
+/// - **Pooled per-search scratch**: Match calls (`isMatch()`/`find()`/`findAll()`/
+///   `captures()`/…) need mutable scratch — the lazy-DFA state memo and the
+///   bounded-backtracker visited bitset. This scratch is NOT part of the
+///   immutable program; each `Regex` owns thread-safe `Pool`s (`lazy_pool`,
+///   `bt_pool`) and every search borrows its own scratch instance from them.
+/// - **Shared mutable state is internally synchronized**: Those pools (and the
+///   lazy memo's retained-state amortization) are the only shared mutable state,
+///   and they are guarded by the pool's own lock-free-slot + spinlock protocol —
+///   so no user-side locking is required.
 /// - **Safe concurrent matching**: Multiple threads can call match operations on the
 ///   same `Regex` instance simultaneously without any synchronization.
 ///
@@ -30,8 +35,9 @@ const std = @import("std");
 ///   if using the same allocator across multiple threads. For concurrent usage,
 ///   consider using thread-local allocators or a thread-safe allocator like
 ///   `std.heap.ThreadSafeAllocator`.
-/// - **No internal caching**: The library does not maintain any match result caches
-///   or memoization that would require synchronization.
+/// - **Internal caching is pool-guarded**: The lazy DFA retains learned states
+///   across reuse (an amortization), but that memo lives in a per-`Regex`
+///   thread-safe pool — there is no unsynchronized shared cache.
 ///
 /// ## Example Usage
 ///
@@ -71,9 +77,9 @@ const std = @import("std");
 /// |-----------|---------------|-------|
 /// | `Regex.compile()` | Not thread-safe | Creates new instance |
 /// | `regex.deinit()` | Not thread-safe | Mutates and frees |
-/// | `regex.isMatch()` | Thread-safe | Read-only, thread-local VM |
-/// | `regex.find()` | Thread-safe | Read-only, thread-local VM |
-/// | `regex.findAll()` | Thread-safe | Read-only, thread-local VM |
+/// | `regex.isMatch()` | Thread-safe | Read-only program, pooled scratch |
+/// | `regex.find()` | Thread-safe | Read-only program, pooled scratch |
+/// | `regex.findAll()` | Thread-safe | Read-only program, pooled scratch |
 /// | `regex.replace()` | Thread-safe | Read-only regex, new output |
 /// | `regex.replaceAll()` | Thread-safe | Read-only regex, new output |
 ///

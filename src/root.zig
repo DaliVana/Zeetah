@@ -25,7 +25,7 @@
 //! and opt-in-only when added (so it will be additive, not a semantics change).
 //!
 //! Engine internals (parser, NFA/DFA compilers, planner, executors,
-//! prefilters, profiling) are deliberately NOT exported here. They are
+//! prefilters) are deliberately NOT exported here. They are
 //! implementation detail and carry no stability guarantee; depend only on the
 //! names below.
 

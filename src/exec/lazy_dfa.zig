@@ -251,12 +251,14 @@ pub const LazyProg = struct {
                 const n = stack[sp];
                 if (seen[n]) continue;
                 seen[n] = true;
+                std.debug.assert(len < out.len); // ≤ MAX_NFA distinct states
                 out[len] = n;
                 len += 1;
                 if (n == fwd_start) h = true;
                 var c = self.reps_off[n + 1];
                 while (c > self.reps_off[n]) {
                     c -= 1;
+                    std.debug.assert(sp < stack.len); // ≤ MAX_EDGES reverse edges
                     stack[sp] = self.reps_to[c];
                     sp += 1;
                 }
@@ -483,6 +485,7 @@ pub const LazyProg = struct {
             var cj = self.cnt_off[nst];
             while (cj < self.cnt_off[nst + 1]) : (cj += 1) {
                 if (hasBit(&self.nfa.sets[self.cnt_set[cj]], byte)) {
+                    std.debug.assert(ns < seeds.len); // ≤ MAX_EDGES consume edges
                     seeds[ns] = self.cnt_to[cj];
                     ns += 1;
                 }
@@ -510,6 +513,7 @@ pub const LazyProg = struct {
             var cj = self.cnt_off[nst];
             while (cj < self.cnt_off[nst + 1]) : (cj += 1) {
                 if (hasBit(&self.nfa.sets[self.cnt_set[cj]], sym)) {
+                    std.debug.assert(ns < seeds.len); // ≤ MAX_EDGES consume edges
                     seeds[ns] = self.cnt_to[cj];
                     ns += 1;
                 }
@@ -548,11 +552,13 @@ pub const LazyProg = struct {
             var cj = self.cnt_off[nst];
             while (cj < self.cnt_off[nst + 1]) : (cj += 1) {
                 if (hasBit(&self.nfa.sets[self.cnt_set[cj]], sym)) {
+                    std.debug.assert(ns < seeds.len); // ≤ MAX_EDGES consume edges
                     seeds[ns] = self.cnt_to[cj];
                     ns += 1;
                 }
             }
         }
+        std.debug.assert(ns < seeds.len); // + the lowest-priority start injection
         seeds[ns] = @intCast(self.nfa.start); // lowest priority (last)
         ns += 1;
         var buf: [MAX_NFA]u16 = undefined;
@@ -584,6 +590,7 @@ pub const LazyProg = struct {
             var cj = self.rcnt_off[nst];
             while (cj < self.rcnt_off[nst + 1]) : (cj += 1) {
                 if (hasBit(&self.nfa.sets[self.rcnt_set[cj]], sym)) {
+                    std.debug.assert(rs < seeds.len); // ≤ MAX_EDGES reverse edges
                     seeds[rs] = self.rcnt_from[cj];
                     rs += 1;
                 }

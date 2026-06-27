@@ -90,7 +90,17 @@ pub fn main() !void {
     try out.appendSlice(a, "//! GENERATED FILE — do not edit by hand.\n");
     try out.appendSlice(a, "//!\n//! Source: Unicode Character Database, DerivedGeneralCategory.txt\n");
     try out.appendSlice(a, try std.fmt.allocPrint(a, "//! Unicode version: {s}\n", .{unicode_version}));
-    try out.appendSlice(a, "//! Regenerate with: zig run tools/gen_unicode_tables.zig\n\n");
+    try out.appendSlice(a, "//! Regenerate with: zig run tools/gen_unicode_tables.zig\n");
+    // Hand-written module overview, emitted here so a regeneration preserves it
+    // (the committed header must round-trip through this generator unchanged).
+    try out.appendSlice(a,
+        "//!\n" ++
+        "//! Exports, per Unicode General_Category, a sorted slice of inclusive codepoint\n" ++
+        "//! `Range`s named `gc_<Category>` — the two-letter categories `gc_Lu`, `gc_Ll`,\n" ++
+        "//! `gc_Lt`, `gc_Lm`, `gc_Lo`, `gc_Mn`, … through `gc_Cn`. Consumed by\n" ++
+        "//! `unicode_class.zig` to resolve `\\p{…}` / `\\P{…}` property classes. (Byte-mode\n" ++
+        "//! matching uses only the Latin-1 slice of these — see the Unicode note in the\n" ++
+        "//! README.)\n\n");
     try out.appendSlice(a, try std.fmt.allocPrint(a, "pub const unicode_version = \"{s}\";\n\n", .{unicode_version}));
     try out.appendSlice(a, "/// Inclusive codepoint range.\npub const Range = struct { lo: u21, hi: u21 };\n\n");
 

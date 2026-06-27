@@ -11,6 +11,7 @@
 //! The comptime↔runtime DFA agreement is guarded by `tests/feat_api.zig`'s
 //! `Pattern`⇄`Regex` differential and the `lazy_dfa` differential test.
 
+const std = @import("std");
 const thompson = @import("../thompson.zig");
 
 const MAX_NFA = thompson.MAX_NFA;
@@ -148,11 +149,13 @@ pub fn closure(
             const n = stack[sp];
             if (seen[n]) continue;
             seen[n] = true;
+            std.debug.assert(len < out.len); // ≤ MAX_NFA distinct states
             out[len] = n;
             len += 1;
             var c = eps_off[n + 1];
             while (c > eps_off[n]) {
                 c -= 1;
+                std.debug.assert(sp < stack.len); // ≤ MAX_EDGES eps edges
                 stack[sp] = eps_to[c];
                 sp += 1;
             }

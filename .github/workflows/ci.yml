@@ -26,6 +26,13 @@ jobs:
       - name: Test
         run: zig build test
 
+      # The published artifact builds ReleaseFast (safety checks, asserts and
+      # @intCast bounds all elided). Re-run the suite under ReleaseSafe so the
+      # optimized codegen is exercised with bounds/overflow/cast checks and the
+      # hot-path capacity assertions still active.
+      - name: Test (ReleaseSafe — optimized codegen, safety checks on)
+        run: zig build test -Doptimize=ReleaseSafe
+
       - name: Doc examples (README / EXAMPLES snippets compile & run)
         run: zig build doctest
 

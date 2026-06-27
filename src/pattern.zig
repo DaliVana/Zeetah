@@ -68,19 +68,16 @@ fn Compressed(comptime m: full_dfa.Dfa256) type {
     return comptime_dfa.Dfa(m.n_states, m.n_classes);
 }
 
-/// Compress a comptime `full_dfa.Dfa256` into its `Compressed(m)` form for
-/// baking into `.rodata`. Used for the seek and delegate prefilter DFAs on the
-/// comptime path: each would otherwise bake a full 131 KB `Dfa256` (the
-/// dominant flash cost for backtracker-tier patterns — atomic groups, look-
-/// around, back-references — on embedded targets). The main matcher table bakes
-/// the same shape inline in the `use_dfa` arm below. Field-for-field identical
-/// to that inline bake; the padding columns `[nk..Stride)` are filled with
-/// `DEAD` so the baked `.rodata` is fully initialized.
-/// Exact-fit compression: bake `m` into `comptime_dfa.Dfa(m.n_states,
-/// m.n_classes)`. The single source of truth for turning a `full_dfa.Dfa256`
-/// into a baked comptime table — used for the main matcher DFA and (via
-/// `compressTo`) the seek / edge-look prefilter DFAs. Thin wrapper over
-/// `compressTo` so all bake sites share ONE field-mapping implementation.
+/// Compress a comptime `full_dfa.Dfa256` into its exact-fit `Compressed(m)` =
+/// `comptime_dfa.Dfa(m.n_states, m.n_classes)` form for baking into `.rodata`.
+/// Used for the main matcher DFA (the `use_dfa` arm below calls `compress(m)`)
+/// and the seek / delegate / edge-look prefilter DFAs on the comptime path —
+/// each would otherwise bake a full 131 KB `Dfa256` (the dominant flash cost for
+/// backtracker-tier patterns — atomic groups, lookaround, back-references — on
+/// embedded targets). Thin wrapper over `compressTo`, which is the single source
+/// of truth for the `Dfa256`→baked field mapping (surplus/padding columns
+/// `[nk..Stride)` filled with `DEAD` so the baked `.rodata` is fully
+/// initialized).
 fn compress(comptime m: full_dfa.Dfa256) Compressed(m) {
     return compressTo(Compressed(m), m);
 }
@@ -1045,6 +1042,11 @@ fn CaptureSupport(comptime built: Built) type {
 
         /// Materialize a `Caps` from filled `slots` (`slots[0..2]` = whole span).
         fn slotsToCaps(input: []const u8, slots: []const i32) Caps {
+            // Precondition: every caller fills slots[0..2] with the real whole-match
+            // span (start ≤ end, both ≥ 0) before calling. Group 0 is `@intCast` below
+            // with no per-group guard (unlike groups 1..NG), so assert it here — an
+            // unset (-1) span would otherwise panic on the slice bounds in safe builds.
+            std.debug.assert(slots[0] >= 0 and slots[1] >= 0 and slots[0] <= slots[1]);
             var caps: Caps = .{ .groups = undefined };
             caps.groups[0] = .{ .slice = input[@intCast(slots[0])..@intCast(slots[1])], .start = @intCast(slots[0]), .end = @intCast(slots[1]), .name = null };
             inline for (1..NG + 1) |g| {
