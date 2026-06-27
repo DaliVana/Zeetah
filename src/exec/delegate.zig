@@ -116,9 +116,9 @@ pub const Island = struct {
     }
 };
 
-/// Runtime island matcher: the erased pointer is a heap `full_dfa.Dfa256`.
-fn dfa256MatchEnd(p: *const anyopaque, input: []const u8, pos: usize) ?usize {
-    const d: *const full_dfa.Dfa256 = @ptrCast(@alignCast(p));
+/// Runtime island matcher: the erased pointer is a heap `full_dfa.PackedDfa`.
+fn packedDfaMatchEnd(p: *const anyopaque, input: []const u8, pos: usize) ?usize {
+    const d: *const full_dfa.PackedDfa = @ptrCast(@alignCast(p));
     return d.runFrom(input, pos);
 }
 
@@ -142,10 +142,13 @@ pub const Plan = struct {
 
     pub fn deinit(self: *Plan) void {
         var i: usize = 0;
-        // Runtime islands are heap `full_dfa.Dfa256` (the only builder that
+        // Runtime islands are heap `full_dfa.PackedDfa` (the only builder that
         // calls `deinit`); the comptime baked `Plan` is never `deinit`'d.
-        while (i < self.n) : (i += 1)
-            self.allocator.destroy(@as(*full_dfa.Dfa256, @constCast(@ptrCast(@alignCast(self.dfas[i])))));
+        while (i < self.n) : (i += 1) {
+            const pd = @as(*full_dfa.PackedDfa, @constCast(@ptrCast(@alignCast(self.dfas[i]))));
+            pd.deinit(self.allocator);
+            self.allocator.destroy(pd);
+        }
         self.allocator.destroy(self);
     }
 };
@@ -172,13 +175,14 @@ pub fn build(allocator: std.mem.Allocator, h: *const H) ?*Plan {
         defer oh.deinit(allocator);
         oh.root = copyReg(&oh, allocator, h, nd.a) catch continue;
         var nfa = thompson.build(null, &oh) catch continue;
-        const d = full_dfa.compute(null, &nfa, true, false); // anchored start
+        var d = full_dfa.compute(null, &nfa, true, false); // anchored start
         if (d.outcome != .ok) continue;
-        const heap = allocator.create(full_dfa.Dfa256) catch continue;
-        heap.* = d;
+        // Retain the island right-sized (packed) rather than the fat 128 KB
+        // `Dfa256`; the transient `d` is dropped after the copy.
+        const heap = full_dfa.packHeap(allocator, &d) catch continue;
         pl.refs[pl.n] = nd.a;
         pl.dfas[pl.n] = heap;
-        pl.match_fns[pl.n] = dfa256MatchEnd;
+        pl.match_fns[pl.n] = packedDfaMatchEnd;
         pl.n += 1;
     }
 

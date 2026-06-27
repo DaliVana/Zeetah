@@ -25,20 +25,20 @@ pub const Span = search.Span;
 
 const DEAD: u16 = 0;
 
-inline fn isAccepting(d: *const Dfa, state: u16) bool {
+inline fn isAccepting(d: anytype, state: u16) bool {
     return d.accepting[state];
 }
 
 /// Anchored leftmost-longest end of a match that begins **exactly** at
 /// `start_pos`, or null. Public accessor over `Dfa256.runFrom` for the
 /// backtracker's regular-island delegation (see `exec/delegate.zig`).
-pub fn matchEndFrom(d: *const Dfa, input: []const u8, start_pos: usize) ?usize {
+pub fn matchEndFrom(d: anytype, input: []const u8, start_pos: usize) ?usize {
     return d.runFrom(input, start_pos);
 }
 
 /// Verbatim port of `comptime_dfa.Dfa.skipToStart` (the unanchored leading-region
 /// prefilter). Only sound when `start` is non-accepting.
-inline fn skipToStart(d: *const Dfa, input: []const u8, from: usize) ?usize {
+inline fn skipToStart(d: anytype, input: []const u8, from: usize) ?usize {
     const n = d.n_start_bytes;
     if (n == 0) return null;
     if (n == 1) return std.mem.indexOfScalarPos(u8, input, from, d.start_bytes[0]);
@@ -58,16 +58,16 @@ inline fn skipToStart(d: *const Dfa, input: []const u8, from: usize) ?usize {
 /// `search.litPrefixFind` (which both this runtime `Dfa256` and the comptime
 /// `comptime_dfa.Dfa(ns,nk)` drive). Caller guarantees `!d.a_start` (`runFrom` does not
 /// enforce `^`).
-pub fn litPrefixFind(d: *const Dfa, t: *const pf.Teddy, input: []const u8) ?Span {
+pub fn litPrefixFind(d: anytype, t: *const pf.Teddy, input: []const u8) ?Span {
     return search.litPrefixFind(d, t, input);
 }
 
-pub fn litPrefixIsMatch(d: *const Dfa, t: *const pf.Teddy, input: []const u8) bool {
+pub fn litPrefixIsMatch(d: anytype, t: *const pf.Teddy, input: []const u8) bool {
     return search.litPrefixIsMatch(d, t, input);
 }
 
 /// Verbatim port of `comptime_dfa.Dfa.findLeftmost`.
-pub fn findLeftmost(d: *const Dfa, input: []const u8) ?Span {
+pub fn findLeftmost(d: anytype, input: []const u8) ?Span {
     // Necessary-condition prefilter: a byte every accepting path must consume.
     // Absent ⇒ no match, proved in one memchr — this is what collapses the
     // unanchored DFA-restart O(n²) (the required tail/inner literal of
@@ -90,19 +90,19 @@ pub fn findLeftmost(d: *const Dfa, input: []const u8) ?Span {
     return null;
 }
 
-inline fn acceptsFrom(d: *const Dfa, input: []const u8, start_pos: usize) bool {
+inline fn acceptsFrom(d: anytype, input: []const u8, start_pos: usize) bool {
     var state: u16 = @intCast(d.start);
     if (isAccepting(d, state)) return true;
     var i: usize = start_pos;
     while (i < input.len) : (i += 1) {
-        state = d.trans[state][d.class_of[input[i]]];
+        state = d.step(state, d.class_of[input[i]]);
         if (state == DEAD) return false;
         if (isAccepting(d, state)) return true;
     }
     return false;
 }
 
-pub fn isMatch(d: *const Dfa, input: []const u8) bool {
+pub fn isMatch(d: anytype, input: []const u8) bool {
     if (search.requiredAbsent(d.required, input)) return false;
     if (d.a_end) return findLeftmost(d, input) != null;
     if (isAccepting(d, @intCast(d.start))) return true;
@@ -119,7 +119,7 @@ pub fn isMatch(d: *const Dfa, input: []const u8) bool {
 
 /// Non-overlapping leftmost spans (zero-width advances by one byte) — mirrors
 /// the runtime `findAll` / comptime `Pattern.findAll` semantics.
-pub fn findAll(d: *const Dfa, allocator: std.mem.Allocator, input: []const u8) ![]Span {
+pub fn findAll(d: anytype, allocator: std.mem.Allocator, input: []const u8) ![]Span {
     var list: std.ArrayList(Span) = .empty;
     errdefer list.deinit(allocator);
     var pos: usize = 0;

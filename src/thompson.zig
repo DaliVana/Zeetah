@@ -23,8 +23,22 @@ const NodeRef = hir.NodeRef;
 // DenseSearch-locate + O(1) boundary-verify path), tracked as a finding —
 // not a ceiling bump. See memory `deep-alternation-reject-is-architectural`.
 pub const MAX_NFA: usize = 256;
-pub const MAX_EDGES: usize = 2048;
-pub const MAX_SETS: usize = MAX_EDGES;
+// Every node lowers to exactly 2 fresh states except `concat` (0 states, 1 eps),
+// and each emits ≤4 edges, so for `M` non-`concat` nodes: `n_states = 2M` and
+// edges ≤ `4M + (#concat)`. In a binary tree `#concat ≤ M-1`, giving the bound
+// `n_edges ≤ 2·n_states + n_states/2 = 2.5·n_states ≤ 640` at the `MAX_NFA`
+// ceiling (the dense limit is ~2 edges/state, e.g. nested `(?:…a*…)*`). 1024 sits
+// above that bound (never rejects a pattern `MAX_NFA` admits) while halving the
+// per-edge arrays from ~24 KB to ~12 KB on every NFA and the lazy-DFA CSR scratch.
+pub const MAX_EDGES: usize = 1024;
+// Each `.set` node lowers to 2 fresh states (`addState` ×2 in `lower`), so with
+// `MAX_NFA = 256` states an NFA can hold at most 128 set edges ⇒ `n_sets ≤ 128`:
+// the 129th set node's `addState` trips the `MAX_NFA` ceiling first. So the set
+// table never needs the full `MAX_EDGES` rows; 256 gives a 2× margin while
+// shrinking `sets` from 64 KB (`[2048][32]u8`) to 8 KB — on every NFA, the
+// transient build, the retained runtime heap copy, and the comptime `.rodata`
+// bake alike. (Decoupled from `MAX_EDGES`, which still bounds edges/`e_set`.)
+pub const MAX_SETS: usize = 256;
 
 pub const Frag = struct { start: usize, accept: usize };
 

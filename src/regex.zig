@@ -171,7 +171,7 @@ pub const Regex = struct {
     flags: common.CompileFlags,
 
     kind: MetaKind,
-    dfa: ?*full_dfa.Dfa256 = null,
+    dfa: ?*full_dfa.PackedDfa = null,
     teddy: ?prefilter.Teddy = null,
     /// Owned NFA for the `.bt_look` path (look-assertion patterns run on the
     /// bounded backtracker — the DFA does not fold look-assertions).
@@ -196,7 +196,7 @@ pub const Regex = struct {
     /// `matchAt` — the dominant per-line cost. `$` is verified by the longest
     /// body end landing on a line terminator (sound: a `\n`-free body's longest
     /// accept never crosses the line). See `properties.lineAnchoredRegular`.
-    line_dfa: ?*full_dfa.Dfa256 = null,
+    line_dfa: ?*full_dfa.PackedDfa = null,
     line_has_dollar: bool = false,
     /// `.bt_look` only: the REVERSE DFA (`full_dfa.computeReverse`) of the body
     /// of a reverse end-anchored pattern (`(?m)<class>+$` / `<class>+\Z`,
@@ -205,7 +205,7 @@ pub const Regex = struct {
     /// `find`/`isMatch`/`count` with ONE O(n) reverse pass seeded from the end
     /// boundaries (`search.reverseLineEnd` / `reverseBeforeNl`) instead of the
     /// O(n²) per-position NFA restart this `<class>+$` shape otherwise pays.
-    rev_end_dfa: ?*full_dfa.Dfa256 = null,
+    rev_end_dfa: ?*full_dfa.PackedDfa = null,
     rev_end_kind: properties.EndKind = .unanchored,
     /// Capture metadata (set when the pattern has groups). `nfa` doubles as
     /// the capture engine's automaton. `gnames[g]` is group g's `(?<name>)`
@@ -275,7 +275,7 @@ pub const Regex = struct {
     /// the trailing look is handled by the O(1) edge verify, not the DFA),
     /// then restore the root. Returns `null` (caller falls back) on any build
     /// failure. The `required`-byte prefilter is computed over the core.
-    fn buildEdgeLookDfa(allocator: std.mem.Allocator, h: *hir.Hir(null), core_ref: hir.NodeRef) ?*full_dfa.Dfa256 {
+    fn buildEdgeLookDfa(allocator: std.mem.Allocator, h: *hir.Hir(null), core_ref: hir.NodeRef) ?*full_dfa.PackedDfa {
         const saved = h.root;
         h.root = core_ref;
         defer h.root = saved;
@@ -283,8 +283,7 @@ pub const Regex = struct {
         var d = full_dfa.compute(null, &nfa, h.anchored_start, false);
         if (d.outcome != .ok) return null;
         d.required = seq_extract.requiredByte(null, h);
-        const heap = allocator.create(full_dfa.Dfa256) catch return null;
-        heap.* = d;
+        const heap = full_dfa.packHeap(allocator, &d) catch return null;
         return heap;
     }
 
@@ -634,9 +633,12 @@ pub const Regex = struct {
             // the DFA locates the whole-match span (span-only models read it
             // directly; the one-pass capture path fills group slots over that
             // span via `onepass.fill`), so no `ng==0` restriction is needed.
-            var line_dfa: ?*full_dfa.Dfa256 = null;
+            var line_dfa: ?*full_dfa.PackedDfa = null;
             var line_has_dollar = false;
-            errdefer if (line_dfa) |p| allocator.destroy(p);
+            errdefer if (line_dfa) |p| {
+                p.deinit(allocator);
+                allocator.destroy(p);
+            };
             if (props.bounds.start == .line) {
                 if (properties.lineAnchoredRegular(null, &h)) |shape| {
                     if (buildLineDfa(allocator, &h)) |d| {
@@ -649,8 +651,11 @@ pub const Regex = struct {
             // the body's reverse DFA drives one O(n) pass per end boundary,
             // defusing the `bt_look` O(n²) restart. Span-only ⇒ groups keep the
             // backtracker (`ng == 0` gate; `revEndScan` is never reached then).
-            var rev_end_dfa: ?*full_dfa.Dfa256 = null;
-            errdefer if (rev_end_dfa) |p| allocator.destroy(p);
+            var rev_end_dfa: ?*full_dfa.PackedDfa = null;
+            errdefer if (rev_end_dfa) |p| {
+                p.deinit(allocator);
+                allocator.destroy(p);
+            };
             if (ng == 0) {
                 if (props.rev_end) |_| rev_end_dfa = buildRevEndDfa(allocator, &h);
             }
@@ -837,8 +842,7 @@ pub const Regex = struct {
                 self.kind = .literal;
                 self.teddy = core.buildLiteral(&seq) orelse {
                     // Fall back to the DFA strategy (still correct).
-                    const heap = try allocator.create(full_dfa.Dfa256);
-                    heap.* = d;
+                    const heap = try full_dfa.packHeap(allocator, &d);
                     self.kind = .dfa;
                     self.dfa = heap;
                     return self;
@@ -846,14 +850,12 @@ pub const Regex = struct {
             },
             .reverse_suffix => |seq| {
                 const td = core.buildLiteral(&seq) orelse {
-                    const heap = try allocator.create(full_dfa.Dfa256);
-                    heap.* = d;
+                    const heap = try full_dfa.packHeap(allocator, &d);
                     self.kind = .dfa;
                     self.dfa = heap;
                     return self;
                 };
-                const heap = try allocator.create(full_dfa.Dfa256);
-                heap.* = d;
+                const heap = try full_dfa.packHeap(allocator, &d);
                 self.kind = .reverse_suffix;
                 self.dfa = heap;
                 self.teddy = td;
@@ -869,8 +871,7 @@ pub const Regex = struct {
             // (aws_eni +61%, href +18%, html +5%) at the cost of a corpus
             // where it is frequent (apache_post −17%); net ≈ flat.
             .lit_prefix => |seq| {
-                const heap = try allocator.create(full_dfa.Dfa256);
-                heap.* = d;
+                const heap = try full_dfa.packHeap(allocator, &d);
                 self.dfa = heap;
                 if (core.buildLiteral(&seq)) |td| {
                     self.kind = .lit_prefix;
@@ -882,8 +883,7 @@ pub const Regex = struct {
             // dense single-pass (see `lazy-dfa-stage-status`). Eager DFA.
             // (`.prefix_prefilter` that missed the gate resolves here too.)
             .dfa => {
-                const heap = try allocator.create(full_dfa.Dfa256);
-                heap.* = d;
+                const heap = try full_dfa.packHeap(allocator, &d);
                 self.kind = .dfa;
                 self.dfa = heap;
             },
@@ -893,9 +893,18 @@ pub const Regex = struct {
 
     pub fn deinit(self: *Regex) void {
         self.allocator.free(self.pattern);
-        if (self.dfa) |p| self.allocator.destroy(p);
-        if (self.line_dfa) |p| self.allocator.destroy(p);
-        if (self.rev_end_dfa) |p| self.allocator.destroy(p);
+        if (self.dfa) |p| {
+            p.deinit(self.allocator);
+            self.allocator.destroy(p);
+        }
+        if (self.line_dfa) |p| {
+            p.deinit(self.allocator);
+            self.allocator.destroy(p);
+        }
+        if (self.rev_end_dfa) |p| {
+            p.deinit(self.allocator);
+            self.allocator.destroy(p);
+        }
         if (self.nfa) |p| self.allocator.destroy(p);
         if (self.bt_hir) |p| {
             p.deinit(self.allocator);
@@ -968,7 +977,7 @@ pub const Regex = struct {
     /// `line_dfa.nextFrom` walker (also used by the comptime `Pattern`) runs one
     /// looks-stripped body-DFA pass per line over the FULL input (absolute
     /// coords). See `exec/line_dfa.zig` for the soundness argument.
-    fn lineDfaScan(self: *const Regex, dfa: *const full_dfa.Dfa256, input: []const u8, from: usize) ?core.Span {
+    fn lineDfaScan(self: *const Regex, dfa: *const full_dfa.PackedDfa, input: []const u8, from: usize) ?core.Span {
         return line_dfa_mod.nextFrom(dfa, self.line_has_dollar, if (self.bt_line_first) |*set| set else null, input, from);
     }
 
@@ -977,15 +986,14 @@ pub const Regex = struct {
     /// are the line anchors handled by the scan), Thompson-build, and
     /// determinize. `null` on any build/ceiling failure ⇒ caller keeps the NFA
     /// line scan. The DFA is unanchored (`runFrom` anchors at each line start).
-    fn buildLineDfa(allocator: std.mem.Allocator, h: *const hir.Hir(null)) ?*full_dfa.Dfa256 {
+    fn buildLineDfa(allocator: std.mem.Allocator, h: *const hir.Hir(null)) ?*full_dfa.PackedDfa {
         var oh = hir.Hir(null).initRuntime();
         defer oh.deinit(allocator);
         oh.root = hir.cloneSubtree(null, null, &oh, allocator, h, h.root, true) catch return null;
         var nfa = thompson.build(null, &oh) catch return null;
         const d = full_dfa.compute(null, &nfa, false, false);
         if (d.outcome != .ok) return null;
-        const heap = allocator.create(full_dfa.Dfa256) catch return null;
-        heap.* = d;
+        const heap = full_dfa.packHeap(allocator, &d) catch return null;
         return heap;
     }
 
@@ -994,15 +1002,14 @@ pub const Regex = struct {
     /// other looks), Thompson-build, and `computeReverse`. `null` on any
     /// build/ceiling failure (or a reverse explosion) ⇒ caller keeps the NFA
     /// `bt_look` scan. Mirror of `buildLineDfa`, but reversed for the end anchor.
-    fn buildRevEndDfa(allocator: std.mem.Allocator, h: *const hir.Hir(null)) ?*full_dfa.Dfa256 {
+    fn buildRevEndDfa(allocator: std.mem.Allocator, h: *const hir.Hir(null)) ?*full_dfa.PackedDfa {
         var oh = hir.Hir(null).initRuntime();
         defer oh.deinit(allocator);
         oh.root = hir.cloneSubtree(null, null, &oh, allocator, h, h.root, true) catch return null;
         var nfa = thompson.build(null, &oh) catch return null;
         const d = full_dfa.computeReverse(null, &nfa);
         if (d.outcome != .ok) return null;
-        const heap = allocator.create(full_dfa.Dfa256) catch return null;
-        heap.* = d;
+        const heap = full_dfa.packHeap(allocator, &d) catch return null;
         return heap;
     }
 
@@ -1010,7 +1017,7 @@ pub const Regex = struct {
     /// set): drive `search.reverseSearch` over the baked reverse body DFA, seeded
     /// from the end-boundary set for this anchor (`(?m)$` line ends, or `\Z`'s
     /// `{len, len-1}`). One O(n) pass; the shared peer of `lineDfaScan`.
-    fn revEndScan(self: *const Regex, rd: *const full_dfa.Dfa256, input: []const u8, from: usize) ?core.Span {
+    fn revEndScan(self: *const Regex, rd: *const full_dfa.PackedDfa, input: []const u8, from: usize) ?core.Span {
         return switch (self.rev_end_kind) {
             .line => search.reverseLineEnd(rd, input, from),
             .before_nl => search.reverseBeforeNl(rd, input, from),

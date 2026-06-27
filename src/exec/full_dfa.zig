@@ -195,6 +195,199 @@ pub const Dfa256 = struct {
     }
 };
 
+/// Right-sized **runtime** DFA: the heap-retained peer of `Dfa256`, holding the
+/// transition table packed to `[n_states][n_classes]` (flat `[]u16`, row stride
+/// `n_classes`) instead of the fixed `[256][256]u16` (~128 KB) the build-time
+/// `Dfa256` reserves. This is the runtime analogue of the comptime
+/// `pattern.zig` `compress` → `comptime_dfa.Dfa(ns, nk)` bake: `compute` still
+/// returns the fat `Dfa256` (it must stay allocator-free / comptime-evaluable,
+/// shared with the comptime pipeline), and `pack` copies only the live region
+/// into this owned, minimal form for the `Regex` to retain and search over.
+///
+/// The hot table access becomes `trans[state*stride + cls]` (one runtime
+/// multiply) in exchange for a working set that fits in a few cache lines rather
+/// than striding 512-byte rows. It exposes the same duck-typed surface
+/// (`step`/`runFrom`/`accepting[]`/`class_of`/`start`/prefilter fields) the
+/// generic walkers (`exec/search.zig`, `exec/edge_look.zig`, `exec/line_dfa.zig`)
+/// and the now-generic `exec/core.zig` drive, so it is a drop-in for `Dfa256` at
+/// every runtime call site.
+pub const PackedDfa = struct {
+    class_of: [256]u8,
+    n_classes: usize,
+    /// Physical row stride of `trans`, `n_classes` rounded up to a power of two
+    /// (mirrors the comptime `comptime_dfa.Dfa.Stride`): a power-of-two stride
+    /// turns the row index into `state << shift` (a 1-cycle variable shift on the
+    /// loop-carried critical path) instead of `state * n_classes` (a ~3-cycle
+    /// multiply) — the difference that decides whether the packed walk matches
+    /// the fixed `Dfa256`. `cls < n_classes <= stride`; columns `[n_classes..
+    /// stride)` are unreachable padding (`class_of` only emits `0..n_classes`).
+    stride: usize,
+    /// `log2(stride)` — the row-index shift used by `step`/`runFrom`.
+    shift: u6,
+    n_states: usize,
+    start: usize,
+    a_start: bool,
+    a_end: bool,
+    /// `trans[state*stride + cls] → next state` — owned, length `n_states*stride`.
+    /// The ONLY heap-packed table (the ~128 KB win). `accepting`/`stay_idx` are
+    /// kept inline below: at ≤256 B each they cost negligible memory but spare
+    /// the per-byte hot path the extra slice-pointer load a `[]` would add (that
+    /// indirection measurably regressed the DFA walk vs the fixed `Dfa256`).
+    trans: []u16,
+    /// `accepting[state]` — inline fixed (`MAX_DFA`); only `[0..n_states)` valid.
+    accepting: [MAX_DFA]bool,
+    start_bytes: [256]u8,
+    n_start_bytes: usize,
+    start_byte_set: [32]u8,
+    outcome: Outcome,
+    required: ?u8 = null,
+    req_lit: ?seq_extract.ReqLit = null,
+    has_spin: bool = false,
+    /// `stay_idx[state]` (`SPIN_NONE` ⇒ no skip set) — inline fixed (`MAX_DFA`).
+    stay_idx: [MAX_DFA]u8,
+    stay_sets: [SPIN_MAX][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** SPIN_MAX,
+
+    /// Next state from `state` on byte-class `cls`. Flat-indexed peer of
+    /// `Dfa256.step`; same name so the generic walkers drive either uniformly.
+    pub inline fn step(self: *const PackedDfa, state: u16, cls: u8) u16 {
+        return self.trans[(@as(usize, state) << self.shift) + cls];
+    }
+
+    /// Verbatim port of `Dfa256.runFrom` over the flat table (see that method's
+    /// doc): one predicted branch on `has_spin`; no-spin patterns take the bare
+    /// scalar loop.
+    pub inline fn runFrom(self: *const PackedDfa, input: []const u8, start_pos: usize) ?usize {
+        if (self.has_spin) return self.runFromSpin(input, start_pos);
+        return self.runFromPlain(input, start_pos);
+    }
+
+    inline fn runFromPlain(self: *const PackedDfa, input: []const u8, start_pos: usize) ?usize {
+        const shift = self.shift;
+        const t = self.trans.ptr; // hoist the table base out of the loop
+        var state: u16 = @intCast(self.start);
+        var last_accept: ?usize = if (self.accepting[state]) start_pos else null;
+        var i: usize = start_pos;
+        while (i < input.len) : (i += 1) {
+            const cls = self.class_of[input[i]];
+            state = t[(@as(usize, state) << shift) + cls];
+            if (state == 0) break; // DEAD sink
+            if (self.accepting[state]) last_accept = i + 1;
+        }
+        if (self.a_end) {
+            if (last_accept) |e| {
+                if (e == input.len) return e;
+            }
+            return null;
+        }
+        return last_accept;
+    }
+
+    /// Verbatim port of `Dfa256.runFromSpin` (the adaptive SIMD self-loop skip)
+    /// over the flat table. Out-of-line for the same reason (inlining it
+    /// regresses unrelated no-spin patterns).
+    fn runFromSpin(self: *const PackedDfa, input: []const u8, start_pos: usize) ?usize {
+        const shift = self.shift;
+        const t = self.trans.ptr; // hoist the table base out of the loop
+        var state: u16 = @intCast(self.start);
+        var last_accept: ?usize = if (self.accepting[state]) start_pos else null;
+        var i: usize = start_pos;
+        var spin: usize = 0;
+        while (i < input.len) {
+            const cls = self.class_of[input[i]];
+            const next = t[(@as(usize, state) << shift) + cls];
+            if (next == 0) break; // DEAD sink
+            if (next == state) {
+                spin += 1;
+                if (spin == SPIN_TRIGGER) {
+                    const si = self.stay_idx[state];
+                    if (si != SPIN_NONE) {
+                        const re = pf.runEnd(&self.stay_sets[si], input, i);
+                        if (self.accepting[state]) last_accept = re;
+                        i = re;
+                        spin = 0;
+                        continue;
+                    }
+                }
+                if (self.accepting[state]) last_accept = i + 1;
+                i += 1;
+            } else {
+                spin = 0;
+                state = next;
+                if (self.accepting[state]) last_accept = i + 1;
+                i += 1;
+            }
+        }
+        if (self.a_end) {
+            if (last_accept) |e| {
+                if (e == input.len) return e;
+            }
+            return null;
+        }
+        return last_accept;
+    }
+
+    pub fn deinit(self: *PackedDfa, allocator: std.mem.Allocator) void {
+        allocator.free(self.trans); // the only heap allocation
+    }
+};
+
+/// Copy the live `[n_states][n_classes]` region of a freshly-`compute`d
+/// `Dfa256` into an owned, right-sized `PackedDfa`. The single runtime "pack"
+/// step (peer of the comptime `compress`): the fat `Dfa256` is then discarded
+/// (stack/transient), so the `Regex` retains ~`n_states*n_classes*2` bytes
+/// instead of the fixed ~128 KB table. On allocation failure the partially
+/// taken buffers are freed (`errdefer`). The prefilter / spin metadata is copied
+/// verbatim; only `trans`/`accepting`/`stay_idx` are resized.
+pub fn pack(allocator: std.mem.Allocator, src: *const Dfa256) !PackedDfa {
+    const ns = src.n_states;
+    const nc = src.n_classes;
+    // Power-of-two row stride ⇒ index by shift, not multiply (see `stride` doc).
+    const stride = std.math.ceilPowerOfTwoAssert(usize, @max(1, nc));
+    const shift: u6 = @intCast(std.math.log2_int(usize, stride));
+    const trans = try allocator.alloc(u16, ns * stride);
+    errdefer allocator.free(trans);
+
+    const out: PackedDfa = .{
+        .class_of = src.class_of,
+        .n_classes = nc,
+        .stride = stride,
+        .shift = shift,
+        .n_states = ns,
+        .start = src.start,
+        .a_start = src.a_start,
+        .a_end = src.a_end,
+        .accepting = src.accepting, // inline copy (only [0..ns) read)
+        .trans = trans,
+        .start_bytes = src.start_bytes,
+        .n_start_bytes = src.n_start_bytes,
+        .start_byte_set = src.start_byte_set,
+        .outcome = src.outcome,
+        .required = src.required,
+        .req_lit = src.req_lit,
+        .has_spin = src.has_spin,
+        .stay_idx = src.stay_idx, // inline copy
+        .stay_sets = src.stay_sets,
+    };
+    var s: usize = 0;
+    while (s < ns) : (s += 1) {
+        const base = s << shift;
+        var c: usize = 0;
+        while (c < nc) : (c += 1) trans[base + c] = src.trans[s][c];
+        while (c < stride) : (c += 1) trans[base + c] = 0; // DEAD padding (never indexed)
+    }
+    return out;
+}
+
+/// Heap-allocate a `PackedDfa` packed from `src` (the common retain idiom:
+/// `compute` → `packHeap` → store the pointer on the `Regex`). Frees nothing of
+/// `src` (caller owns it). On OOM the packed buffers are released.
+pub fn packHeap(allocator: std.mem.Allocator, src: *const Dfa256) !*PackedDfa {
+    const p = try allocator.create(PackedDfa);
+    errdefer allocator.destroy(p);
+    p.* = try pack(allocator, src);
+    return p;
+}
+
 /// Subset-construction state interner shared by `compute` and `computeReverse`:
 /// the id of the NFA-set `want[0..want_len]` (DEAD sink `0` for the empty set),
 /// added if new. `E.TooComplex` once the `MAX_DFA` ceiling is reached. Both
