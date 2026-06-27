@@ -330,9 +330,11 @@ than a recoverable runtime `error.NotImplemented`:
 - patterns that overflow an internal construction ceiling (`>1000`-count
   repetition; a DFA over the 256-state ceiling). *Exception:* a large keyword
   alternation `\b(?:kw|…)\b` that would blow `MAX_NFA` on the DFA path instead
-  routes (via its `\b`) to the tree-backtracker and **compiles** — correct, though
-  slower than the runtime's dedicated Aho-Corasick `boundary_lits` engine, which
-  has no comptime analogue.
+  routes (via its `\b`) to the comptime `boundary_lits` engine — the **same**
+  Aho-Corasick locate + O(1) `\b` verify the runtime uses (the shared
+  `seq_extract.BoundaryMatcher`, with a Teddy prefilter for small literal sets),
+  with the node-trimmed automaton baked into `.rodata`. So it **compiles and runs
+  at runtime parity**, not on the slow tree-backtracker.
 
 For any of those — or whenever the rejection needs to be a recoverable error — use
 the runtime `Regex`.
@@ -478,6 +480,20 @@ prefilter is chosen by shape: one short literal → `memchr`; a few → multi/ra
 SIMD; several → Teddy; many → Aho-Corasick. Two filters beyond the original plan
 also shipped — the **required-byte** and **required-literal-anywhere** filters
 described above — plus the **Seek** over-approximation for the backtracking tier.
+
+The leading literal run is also **expanded across small "wobbles"** — optional
+groups (`u?`), small character classes (`[ae]`, ≤ 4 members), and inner literal
+alternations (`(?:cat|dog)`) — into the *set* of possible leading literals:
+`colou?r` → {color, colour}, `gr[ae]y` → {gray, grey}, where a single-run
+extractor would stop at the first wobble (or, for a leading class, find no prefix
+at all). The cross-product is bounded (≤ 8 alternatives, ≤ 64 bytes each); past
+that it stops with the prefix collected so far. A multi-literal result is kept
+**inexact** so it drives the Teddy-locate + DFA-verify `.lit_prefix` path
+(leftmost-first decided by the verifying DFA, never an order-sensitive literal
+short-circuit), and a set with an empty alternative (a leading optional `v?…`, a
+nullable pattern) is rejected as non-mandatory. Because the extraction is the
+single function both front-ends share, this lands identically on the runtime and
+the comptime `Pattern` path.
 
 ### The two backtrackers are deliberately separate
 
