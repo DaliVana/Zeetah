@@ -378,6 +378,63 @@ test "comptime Pattern <-> runtime Regex agree: non-regular (tree backtracker) t
     try btAgree(".*?b$", "aabxb");
 }
 
+// Comptime first-byte alternation dispatch (Task A): a top-level `.alt` pattern
+// that routes to the tree backtracker bakes a `[256]` candidate-mask table and
+// tries only the viable branches per start byte instead of all N in source
+// order. `alt_branch_count > 0` proves THIS path engaged (a non-alt backtracker
+// pattern bakes 0). Correctness is the whole point — dispatch must yield the
+// byte-identical leftmost match the whole-root walk would — so we pin
+// find/isMatch AND the enumeration verbs count/findAll (every start position
+// runs the dispatch) against the runtime `Regex` over inputs spanning every
+// first-byte category (letters / digits / space / punctuation / CR-LF) plus
+// dead gaps and the empty input.
+fn altDispAgree(comptime p: []const u8, in: []const u8) !void {
+    const a = std.testing.allocator;
+    const P = regex.Pattern(p, .{});
+    comptime std.debug.assert(!P.has_dfa); // took the .backtrack arm
+    comptime std.debug.assert(P.alt_branch_count > 0); // dispatch engaged
+    var rx = try Regex.compile(a, p);
+    defer rx.deinit();
+
+    try std.testing.expectEqual(try rx.isMatch(in), P.isMatch(in));
+    const pm = P.find(in);
+    var rm = try rx.find(in);
+    defer if (rm) |*x| x.deinit(a);
+    try std.testing.expectEqual(rm == null, pm == null);
+    if (pm) |pmm| {
+        try std.testing.expectEqual(rm.?.start, pmm.start);
+        try std.testing.expectEqual(rm.?.end, pmm.end);
+    }
+    try std.testing.expectEqual(try rx.count(in), P.count(in));
+    const pall = try P.findAll(a, in);
+    defer a.free(pall);
+    const rall = try rx.findAll(a, in);
+    defer a.free(rall);
+    try std.testing.expectEqual(rall.len, pall.len);
+    for (pall, rall) |pa, ra| {
+        try std.testing.expectEqual(ra.start, pa.start);
+        try std.testing.expectEqual(ra.end, pa.end);
+    }
+}
+
+test "comptime first-byte alt dispatch agrees with runtime Regex" {
+    // The GPT-2/tiktoken tokenizer — the dispatch's headline target (7 top-level
+    // branches, possessive quantifiers + a negative lookahead ⇒ tree backtracker).
+    const tok = "(?i:[sdmt]|ll|ve|re)|[^\\r\\n\\p{L}\\p{N}]?+\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]++[\\r\\n]|\\s[\\r\\n]|\\s+(?!\\S)|\\s+";
+    try altDispAgree(tok, "Hello, world! 123 tokens\n  and  more.\r\n");
+    try altDispAgree(tok, ""); // empty input
+    try altDispAgree(tok, "abc"); // letters only
+    try altDispAgree(tok, "   \t  "); // whitespace only
+    try altDispAgree(tok, "0042 99 7"); // digits
+    try altDispAgree(tok, "don't they'll we've re-do 4567"); // contraction shapes
+    try altDispAgree(tok, "!@#$%^&*()\r\n.,;:"); // punctuation + CR/LF
+    // Smaller non-regular top-level alternations: atomic / lookahead / backref
+    // leading branches (each exercises a different FIRST-set / known-flag path).
+    try altDispAgree("(?>a+)b|c+d|\\d{1,3}", "aaab ccccd 99 xx aaab");
+    try altDispAgree("foo(?=bar)|baz|\\d+", "foobar baz 42 fooqux foobar");
+    try altDispAgree("(a)\\1|bc|d+", "aa bc ddd a aa");
+}
+
 // The comptime `.boundary_lits` arm: a `\b(?:lit|lit|…)\b` keyword alternation
 // routes to the Aho-Corasick locate + O(1) `\b`-verify engine — NOT the DFA and
 // NOT the tree backtracker — with the AC node-TRIMMED into `.rodata`. The
@@ -751,6 +808,56 @@ test "comptime backtracker capturesAll(): non-overlapping captures parity" {
         try std.testing.expectEqualStrings(r.slice, c.slice());
         try std.testing.expectEqualStrings(r.groups[1].?.slice, c.get(1).?.slice);
     }
+}
+
+// First-byte alt dispatch on the CAPTURE path: a non-regular *alt-with-captures*
+// pattern routes its slot-fill walk through the general scanning backtracker
+// (`capturesFrom`'s fallback), now branch-pruned by the same baked table. The
+// `capturesAll` enumeration runs the dispatch at EVERY start across a multi-match
+// input — the surface a wrong branch selection or a dropped capture would break.
+// `alt_branch_count > 0` proves the dispatch baked (the capture path runs the
+// identical `altDispatchInfo` over the identical baked HIR); the group-span
+// comparison vs the dispatch-free runtime `Regex` proves it stays correct.
+fn altCapAgree(comptime p: []const u8, in: []const u8, comptime ng: usize) !void {
+    const a = std.testing.allocator;
+    const P = regex.Pattern(p, .{});
+    comptime std.debug.assert(!P.has_dfa); // backtrack arm
+    comptime std.debug.assert(P.alt_branch_count > 0); // dispatch eligible
+    var rx = try Regex.compile(a, p);
+    defer rx.deinit();
+
+    const rms = try rx.capturesAll(a, in); // []Match, each owns groups
+    defer {
+        for (rms) |*mt| mt.deinit(a);
+        a.free(rms);
+    }
+    const pcs = try P.capturesAll(a, in); // []Captures — inline groups
+    defer a.free(pcs);
+    try std.testing.expectEqual(rms.len, pcs.len);
+    for (rms, pcs) |r, c| {
+        try std.testing.expectEqual(r.start, c.get(0).?.start);
+        try std.testing.expectEqual(r.end, c.get(0).?.end);
+        inline for (1..ng + 1) |g| {
+            const rg = r.groups[g];
+            const cg = c.get(g);
+            try std.testing.expectEqual(rg == null, cg == null);
+            if (rg) |rgg| {
+                try std.testing.expectEqual(rgg.start, cg.?.start);
+                try std.testing.expectEqual(rgg.end, cg.?.end);
+                try std.testing.expectEqualStrings(rgg.slice, cg.?.slice);
+            }
+        }
+    }
+}
+
+test "comptime alt dispatch on the CAPTURE path: capturesAll parity (non-regular alt+captures)" {
+    // First-byte-disjoint branches (letter vs digit) ⇒ dispatch prunes per start.
+    try altCapAgree("([a-z])\\1|(\\d)(\\d)", "aa12bb34cc xy", 3);
+    // Three branches, mixed backref / class runs, with non-participating groups.
+    try altCapAgree("(\\w+)\\1|(\\d+)|([A-Z]+)", "abab 123 XYZ qq", 3);
+    // Second-branch backref with a group-1 that never participates (whole-pattern
+    // shape from the btCapAgree suite, now driven over multiple matches).
+    try altCapAgree("(x)|(y)\\2", "x y x yy", 2);
 }
 
 test "comptime Pattern findAll/count parity with runtime Regex" {

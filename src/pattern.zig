@@ -154,6 +154,89 @@ const MAX_NFA = thompson.MAX_NFA;
 const MAX_EDGES = thompson.MAX_EDGES;
 const MAX_DFA: usize = 256;
 
+// ── Comptime first-byte alternation dispatch (Task A) ──────────────────────
+// A top-level `.alt` pattern (e.g. the tokenizer's 7-way alternation) is
+// matched by the backtracker by trying every branch in source order at each
+// start. When the leading byte is known, most branches can be skipped: a branch
+// whose FIRST-set excludes that byte (and which is non-nullable) cannot begin a
+// match there. We bake a `[256]` candidate-mask table from each branch's
+// FIRST-set (`properties.firstBytes` — the SAME sound over-approximation the
+// prefilter paths use) and thread it into the backtracker; see
+// `backtrack.AltDispatch`. This is also the charclass codegen (Task B) of each
+// branch's leading byte: the per-branch leading classes are decomposed and
+// fused into one O(1) table lookup, replacing N per-branch `hasBit` probes.
+
+/// Master toggle. Flip to `false` to A/B the dispatch against the plain
+/// source-order whole-root walk in an otherwise identical build.
+const ALT_DISPATCH_ENABLED = true;
+
+/// Widest top-level alternation the dispatch handles (one `AltMask` bit per
+/// branch). Wider alternations fall back to the whole-root walk.
+const MAX_ALT_BRANCHES = @bitSizeOf(backtrack.AltMask);
+
+const AltInfo = struct {
+    n: usize, // dispatched branch count (0 ⇒ no dispatch)
+    branches: [MAX_ALT_BRANCHES]hir.NodeRef,
+    table: [256]backtrack.AltMask,
+};
+
+/// Flatten a left-leaning `.alt` chain (`alt(alt(b0,b1),b2)` → `[b0,b1,b2]`) in
+/// source order. Descends only through `.alt` nodes, so `concat(alt(..),..)` is
+/// a single branch; alt-associativity makes flattening through a group's inner
+/// alt (e.g. an unwrapped `(?i:a|b)`) semantics-preserving. Counts past the cap
+/// so the caller can reject an over-wide alternation.
+fn flattenAlt(comptime cap: ?usize, h: *const hir.Hir(cap), ref: hir.NodeRef, out: *[MAX_ALT_BRANCHES]hir.NodeRef, n: *usize) void {
+    const nd = h.node(ref);
+    if (nd.tag != .alt) {
+        if (n.* < MAX_ALT_BRANCHES) out[n.*] = ref;
+        n.* += 1;
+        return;
+    }
+    flattenAlt(cap, h, nd.a, out, n);
+    if (n.* < MAX_ALT_BRANCHES) out[n.*] = nd.b;
+    n.* += 1;
+}
+
+/// Build the first-byte dispatch for a top-level `.alt` root. `n == 0` ⇒ no
+/// dispatch (root not an alt, or more branches than the mask holds). A branch
+/// whose FIRST-set is unknown (`!ok` — e.g. a leading backref) or nullable stays
+/// an unconditional candidate for every byte; otherwise it is a candidate only
+/// for the bytes in its FIRST-set. SOUNDNESS: pruning only ever removes a branch
+/// that provably cannot begin a non-empty match at that byte and cannot match
+/// empty — so the masked, source-ordered trial yields the identical leftmost
+/// match `m(root)` would.
+fn altDispatchInfo(comptime cap: ?usize, h: *const hir.Hir(cap)) AltInfo {
+    @setEvalBranchQuota(1_000_000); // 256 bytes × up to 64 branches of table fill
+    var info: AltInfo = .{ .n = 0, .branches = undefined, .table = [_]backtrack.AltMask{0} ** 256 };
+    if (h.root == hir.none or h.node(h.root).tag != .alt) return info;
+    var n: usize = 0;
+    flattenAlt(cap, h, h.root, &info.branches, &n);
+    if (n < 2 or n > MAX_ALT_BRANCHES) return info;
+    for (0..n) |i| {
+        var bm = [_]u8{0} ** 32;
+        const fr = properties.firstBytes(cap, h, info.branches[i], &bm);
+        const bit = @as(backtrack.AltMask, 1) << @intCast(i);
+        if (!fr.ok or fr.nullable) {
+            for (0..256) |b| info.table[b] |= bit;
+        } else {
+            for (0..256) |b| {
+                if ((bm[b >> 3] & (@as(u8, 1) << @intCast(b & 7))) != 0) info.table[b] |= bit;
+            }
+        }
+    }
+    info.n = n;
+    return info;
+}
+
+// Task B (per-set single-byte charclass codegen — inline range compares instead
+// of `hasBit` for narrow interior `.set` tests) was prototyped and A/B'd here
+// and measured FLAT on the tokenizer (the interior classes are wide-negated or
+// multi-range `\p{N}`, where `hasBit` already wins), with a regression risk on
+// wide-class patterns. Its realized value — codegen of each branch's LEADING
+// byte — is already delivered by the Task A dispatch table above, so the
+// standalone path was dropped per the engine's "only ship what wins regardless"
+// rule. See the commit/PR notes for the measurement.
+
 const Outcome = enum { ok, unsupported, exploded, invalid };
 
 /// §6/(c) monomorphization: which planner strategy the baked matcher emits.
@@ -871,6 +954,29 @@ fn CaptureSupport(comptime built: Built) type {
             return if (cap_seek) |*sv| sv else null;
         }
 
+        // First-byte alternation dispatch on the CAPTURE path — the same baked
+        // table the whole-match `.backtrack` arm uses (baked here independently,
+        // like `cap_seek` parallels the arm's `bt_seek`; the two structs can't
+        // share a const). Lets a non-regular *alt-with-captures* pattern's
+        // slot-fill walk prune branches per start byte too. `null` (non-alt root
+        // or disabled) keeps the whole-root walk. The one-pass / line-DFA /
+        // reverse capture paths anchor the backtracker at a known start (not an
+        // alt root), so in practice this only engages the general scanning
+        // fallback — exactly where it helps; threading it everywhere is
+        // correctness-neutral (dispatch is leftmost-first-preserving and the
+        // same `m`/`cap` machinery fills slots).
+        const cap_alt_info = if (ALT_DISPATCH_ENABLED) altDispatchInfo(NN, &baked) else AltInfo{ .n = 0, .branches = undefined, .table = [_]backtrack.AltMask{0} ** 256 };
+        const cap_alt_branches: [cap_alt_info.n]hir.NodeRef = blk: {
+            var a: [cap_alt_info.n]hir.NodeRef = undefined;
+            for (0..cap_alt_info.n) |i| a[i] = cap_alt_info.branches[i];
+            break :blk a;
+        };
+        const cap_alt_table: [256]backtrack.AltMask = cap_alt_info.table;
+        const cap_alt_disp: backtrack.AltDispatch = .{ .branches = &cap_alt_branches, .table = &cap_alt_table };
+        inline fn capAltDispPtr() ?*const backtrack.AltDispatch {
+            return if (cap_alt_info.n > 0) &cap_alt_disp else null;
+        }
+
         /// Materialize a `Caps` from filled `slots` (`slots[0..2]` = whole span).
         fn slotsToCaps(input: []const u8, slots: []const i32) Caps {
             var caps: Caps = .{ .groups = undefined };
@@ -904,6 +1010,7 @@ fn CaptureSupport(comptime built: Built) type {
                 // a per-position scan. Mirrors the runtime line-DFA capture path.
                 const sp = line_dfa.nextFrom(&line_body, built.line_has_dollar, if (line_first_const) |*fs| fs else null, input, from) orelse return null;
                 var bt = BT.init(&cap_h, cap_h.anchored_start, cap_h.anchored_end, NG, null, null);
+                bt.alt_disp = capAltDispPtr();
                 _ = (bt.runFrom(input, sp.start, slots[0..nslots]) catch return null) orelse return null;
                 slots[0] = @intCast(sp.start);
                 slots[1] = @intCast(sp.end);
@@ -927,6 +1034,7 @@ fn CaptureSupport(comptime built: Built) type {
                         return slotsToCaps(input, slots[0..nslots]);
                 }
                 var bt = BT.init(&cap_h, cap_h.anchored_start, cap_h.anchored_end, NG, null, null);
+                bt.alt_disp = capAltDispPtr();
                 _ = (bt.runFrom(input, span.start, slots[0..nslots]) catch return null) orelse return null;
                 slots[0] = @intCast(span.start);
                 slots[1] = @intCast(span.end);
@@ -944,6 +1052,7 @@ fn CaptureSupport(comptime built: Built) type {
                 // mis-gated (should not happen for op_ok); fall through to bt.
             }
             var bt = BT.init(&cap_h, cap_h.anchored_start, cap_h.anchored_end, NG, capSeekPtr(), null);
+            bt.alt_disp = capAltDispPtr();
             const sp = (bt.runFrom(input, from, slots[0..nslots]) catch return null) orelse return null;
             slots[0] = @intCast(sp.start);
             slots[1] = @intCast(sp.end);
@@ -1071,6 +1180,27 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             const gnames = built.gnames;
             const a_start = baked.anchored_start;
             const a_end = baked.anchored_end;
+
+            // First-byte alternation dispatch (Tasks A+B), baked into `.rodata`
+            // and threaded into the backtracker (`bt.alt_disp`). For a top-level
+            // `.alt` root the per-position scan tries only the candidate branches
+            // for `input[start]` instead of walking all N in source order. The
+            // branch list and `[256]` mask table are comptime consts; `null`
+            // (non-alt root or disabled) keeps the whole-root walk. `alt_branch_count`
+            // (>0 ⇒ dispatch engaged) is the differential-test engagement proof,
+            // analogous to `bt_node_count` / `ac_node_count`.
+            const alt_info = if (ALT_DISPATCH_ENABLED) altDispatchInfo(NN, &baked) else AltInfo{ .n = 0, .branches = undefined, .table = [_]backtrack.AltMask{0} ** 256 };
+            const alt_branches: [alt_info.n]hir.NodeRef = blk: {
+                var a: [alt_info.n]hir.NodeRef = undefined;
+                for (0..alt_info.n) |i| a[i] = alt_info.branches[i];
+                break :blk a;
+            };
+            const alt_table: [256]backtrack.AltMask = alt_info.table;
+            const alt_disp_val: backtrack.AltDispatch = .{ .branches = &alt_branches, .table = &alt_table };
+            pub const alt_branch_count: usize = alt_info.n;
+            inline fn altDispPtr() ?*const backtrack.AltDispatch {
+                return if (alt_info.n > 0) &alt_disp_val else null;
+            }
             /// Comptime "seek" prefilter, baked from the HIR and threaded INTO
             /// the backtracker (`BT.init`'s `seek` arg) so `run`'s own scan loop
             /// applies it at *every* step — skipping interior dead regions, not
@@ -1195,6 +1325,7 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             /// differential parity.
             pub fn nextSpanFrom(input: []const u8, from: usize) ?search.Span {
                 var bt = BT.init(&h, a_start, a_end, n_groups, seekPtr(), delPtr());
+                bt.alt_disp = altDispPtr();
                 var slots: [2 * (hir.MAX_GROUPS + 1)]i32 = undefined;
                 const sp = (bt.runFrom(input, from, slots[0 .. 2 * (n_groups + 1)]) catch return null) orelse return null;
                 return .{ .start = sp.start, .end = sp.end };

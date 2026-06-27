@@ -401,11 +401,17 @@ fn maxLen(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) ?usize {
     }
 }
 
-const FirstResult = struct { ok: bool, nullable: bool };
+pub const FirstResult = struct { ok: bool, nullable: bool };
 
 /// OR into `set` the bytes a match of `ref` may begin with (necessary
 /// condition). Ported from `optimizer.firstBytes` onto `Hir` tags.
-fn firstBytes(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, set: *[32]u8) FirstResult {
+///
+/// `pub` so the comptime first-byte alternation dispatch (`pattern.zig`) can
+/// reuse the SAME sound over-approximation it uses for prefilters, rather than
+/// maintaining a divergent copy: `ok == false` (backref / irregular) or
+/// `nullable == true` ⇒ the branch must stay an unconditional candidate; else
+/// `set` is the exact leading-byte filter for that branch.
+pub fn firstBytes(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, set: *[32]u8) FirstResult {
     const nd = h.node(ref);
     switch (nd.tag) {
         .empty => return .{ .ok = true, .nullable = true },

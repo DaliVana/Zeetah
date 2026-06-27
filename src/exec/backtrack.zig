@@ -21,6 +21,22 @@ const NodeRef = hir.NodeRef;
 pub const Span = struct { start: usize, end: usize };
 pub const Error = error{Budget};
 
+/// Comptime first-byte alternation dispatch (baked by `Pattern`; `null` for the
+/// runtime backtracker). When the root is a top-level `.alt` chain, `branches`
+/// is its source-ordered list of branch roots and `table[byte]` is a bitmask of
+/// which branches can begin a match at that leading byte (bit `i` ⇒ try
+/// `branches[i]`). Trying only the masked branches, in source order, is
+/// byte-identical to walking the whole `.alt` via `m` — a branch is omitted only
+/// when its FIRST-set proves it cannot begin a non-empty match at that byte and
+/// it is non-nullable (see `properties.firstBytes`). This turns an N-way
+/// source-order trial (e.g. the 7-branch tokenizer) into ~1–2 trials for the
+/// common letter/digit case. The mask width caps the dispatched branch count.
+pub const AltMask = u64;
+pub const AltDispatch = struct {
+    branches: []const NodeRef,
+    table: *const [256]AltMask,
+};
+
 /// CPS frame: a tagged union so each variant carries *only* its live fields
 /// (the struct-of-everything form had ~24 B of dead fields per frame and made
 /// the variant invariants by-convention; the union shrinks the frame ~33%
@@ -59,6 +75,9 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
         /// Optional concat-internal regular-island delegation plan (see
         /// `exec/delegate.zig`). `null` ⇒ pure tree-walk.
         del: ?*const delegate.Plan = null,
+        /// Optional comptime first-byte alternation dispatch (see `AltDispatch`;
+        /// baked by `Pattern`). `null` ⇒ the root is matched whole via `m`.
+        alt_disp: ?*const AltDispatch = null,
         input: []const u8 = &.{},
         slots: [2 * (hir.MAX_GROUPS + 1)]i32 = undefined,
         match_end: usize = 0,
@@ -338,6 +357,29 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
             }
         }
 
+        /// Attempt a match anchored at `start` with continuation `top`. With an
+        /// `alt_disp` table this tries only the candidate top-level branches for
+        /// `input[start]` (in source order) instead of walking the whole root
+        /// `.alt`; the result is identical because branch trial order and state
+        /// threading match `m`'s `.alt` arm exactly, and pruned branches provably
+        /// cannot begin a non-empty match here. At `start == input.len` (no lead
+        /// byte) or with no table it falls back to the whole-root walk, which
+        /// still handles any zero-width / nullable branches correctly.
+        inline fn tryAt(self: *Self, start: usize, top: *const Cont) Error!bool {
+            if (self.alt_disp) |ad| {
+                if (start < self.input.len) {
+                    var bits = ad.table[self.input[start]];
+                    while (bits != 0) {
+                        const i = @ctz(bits);
+                        bits &= bits - 1; // clear lowest set bit
+                        if (try self.m(ad.branches[i], start, top)) return true;
+                    }
+                    return false;
+                }
+            }
+            return self.m(self.h.root, start, top);
+        }
+
         pub fn init(
             h: *const H,
             a_start: bool,
@@ -398,7 +440,7 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
                     .{ .accept_at = input.len }
                 else
                     .accept;
-                if (try self.m(self.h.root, start, &top)) {
+                if (try self.tryAt(start, &top)) {
                     const end = if (self.a_end) input.len else self.match_end;
                     self.slots[1] = @intCast(end);
                     if (slots_out.len >= 2 * (self.n_groups + 1))
