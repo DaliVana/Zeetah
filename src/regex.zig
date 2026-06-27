@@ -348,12 +348,12 @@ pub const Regex = struct {
         ng: usize,
         gnames: [hir.MAX_GROUPS + 1]?[]const u8,
     ) !Regex {
-        const nh = nheap orelse blk: {
-            const p = try allocator.create(thompson.Nfa(null));
-            p.* = nfa_local.*;
-            break :blk p;
-        };
-        errdefer if (nheap == null) allocator.destroy(nh);
+        // Build-time NFA reads (the one-pass detector, the freeze oracle) only
+        // need a valid NFA *during this call* — use the caller's transient
+        // `nfa_local` (or the existing heap copy when captures/look already
+        // forced one). This avoids a 90 KB copy on the capture-free path, where
+        // the resulting `DenseSearch` is self-contained and the NFA is dropped.
+        const build_nfa: *const thompson.Nfa(null) = nheap orelse nfa_local;
 
         // Preserve the one-pass capture fast path (mirrors the eager `.dfa`
         // build's `op_ok`): a one-pass capture pattern reconstructs slots with a
@@ -361,11 +361,11 @@ pub const Regex = struct {
         // returns — here the O(n) dense/lazy single pass. Without this, the
         // `$`-reroute would silently demote `([0-9]+)$` / `(cat|dog)$` / `(\w+)$`
         // captures to the slower bounded backtracker. `capturesFrom` gates on it.
-        const op_onepass = ng > 0 and onepass.isOnePassNfa(null, nh);
+        const op_onepass = ng > 0 and onepass.isOnePassNfa(null, build_nfa);
 
         // Materialise via a temporary LazyProg (only its CSR/oracle is
         // needed to freeze; the DenseSearch is self-contained afterwards).
-        var tmp = try lazy_dfa.LazyProg.init(allocator, nh, a_start, a_end);
+        var tmp = try lazy_dfa.LazyProg.init(allocator, build_nfa, a_start, a_end);
         const ds_opt = tmp.freezeDense(allocator) catch |e| {
             tmp.deinit();
             return e;
@@ -382,7 +382,9 @@ pub const Regex = struct {
                 .pattern = owned,
                 .flags = flags,
                 .kind = .dense_search,
-                .nfa = nh,
+                // Retain the NFA only for the capture path (`ng > 0`); a
+                // capture-free `DenseSearch` is self-contained (C1).
+                .nfa = nheap,
                 .dsearch = ds,
                 .bt_a_start = a_start,
                 .bt_a_end = a_end,
@@ -393,6 +395,15 @@ pub const Regex = struct {
         }
 
         // Too many states for the dense table — keep the plain lazy engine.
+        // The lazy engine reads `nfa.sets` at SEARCH time, so unlike the dense
+        // path it must retain the NFA on the heap for the engine's lifetime
+        // (reuse the capture copy when present, else make one now).
+        const nh = nheap orelse blk: {
+            const p = try allocator.create(thompson.Nfa(null));
+            p.* = nfa_local.*;
+            break :blk p;
+        };
+        errdefer if (nheap == null) allocator.destroy(nh);
         const lz = try makeLazyProg(allocator, nh, a_start, a_end);
         errdefer {
             lz.prog.deinit();

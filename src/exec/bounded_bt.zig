@@ -12,6 +12,7 @@ const hir = @import("../hir.zig");
 const cc = @import("charclass.zig");
 
 const MAX_NFA = thompson.MAX_NFA;
+const MAX_EDGES = thompson.MAX_EDGES;
 
 /// The search and capture-trace walks use **explicit heap worklists**, not
 /// native recursion. The `(state,pos)` visited memo bounds *work* to O(n·m),
@@ -63,6 +64,20 @@ pub const BtScratch = struct {
     reach_cap: usize = 0,
     cap_stack: []CapFrame = &.{},
     cap_stack_cap: usize = 0,
+    /// Per-state out-edge CSR over the NFA (counting-sort, priority-preserving):
+    /// `edge_order[edge_off[s]..edge_off[s+1]]` are state `s`'s out-edge ids in
+    /// original (= NFA emission = priority) order. Built once per (scratch, NFA)
+    /// by `ensureIndex` and reused across a whole `findAll` loop, so `matchAt`/
+    /// `recCap` iterate a state's *own* out-edges instead of rescanning all
+    /// `n_edges` at every visited `(state,pos)` — the O(n_states·len·n_edges) →
+    /// O(n_states·len) win on deep-alternation (`bt_look`) and capture patterns.
+    /// Mirrors `onepass.EdgeIndex`; the priority order is preserved (stable sort)
+    /// because `recCap`'s leftmost-first trace depends on it.
+    edge_off: [MAX_NFA + 1]u16 = [_]u16{0} ** (MAX_NFA + 1),
+    edge_order: [MAX_EDGES]u16 = undefined,
+    /// The NFA `edge_off`/`edge_order` were built for (`null` ⇒ not yet built);
+    /// `ensureIndex` skips the rebuild when the pointer is unchanged.
+    idx_nfa: ?*const thompson.Nfa(null) = null,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) BtScratch {
@@ -102,6 +117,32 @@ pub const BtScratch = struct {
         @memset(self.visited, 0);
         self.n_dirty = 0;
         self.cap_words = nwords;
+    }
+
+    /// Build the per-state out-edge CSR for `nfa` (idempotent: a no-op when the
+    /// index is already built for this exact NFA, so the hot `findAll` loop pays
+    /// one pointer compare per `BoundedBt` construction). Counting sort by
+    /// `e_from`, iterated in edge order ⇒ each state's out-edges keep their
+    /// original priority order (required by `recCap`). Allocation-free.
+    pub fn ensureIndex(self: *BtScratch, nfa: *const thompson.Nfa(null)) void {
+        if (self.idx_nfa) |p| {
+            if (p == nfa) return;
+        }
+        @memset(self.edge_off[0 .. nfa.n_states + 1], 0);
+        var ei: usize = 0;
+        while (ei < nfa.n_edges) : (ei += 1) self.edge_off[nfa.e_from[ei] + 1] += 1;
+        var s: usize = 0;
+        while (s < nfa.n_states) : (s += 1) self.edge_off[s + 1] += self.edge_off[s];
+        var next: [MAX_NFA]u16 = undefined;
+        s = 0;
+        while (s < nfa.n_states) : (s += 1) next[s] = self.edge_off[s];
+        ei = 0;
+        while (ei < nfa.n_edges) : (ei += 1) {
+            const f = nfa.e_from[ei];
+            self.edge_order[next[f]] = @intCast(ei);
+            next[f] += 1;
+        }
+        self.idx_nfa = nfa;
     }
 };
 
@@ -146,6 +187,7 @@ pub const BoundedBt = struct {
         sc: *BtScratch,
         n_pos1: usize,
     ) BoundedBt {
+        sc.ensureIndex(nfa); // build/refresh the per-state out-edge CSR (idempotent)
         return .{ .nfa = nfa, .a_start = a_start, .a_end = a_end, .sc = sc, .n_pos1 = n_pos1 };
     }
 
@@ -163,6 +205,7 @@ pub const BoundedBt = struct {
         sc.* = BtScratch.init(allocator);
         const n_pos1 = max_input + 1;
         try sc.ensure((nfa.n_states * n_pos1 + 63) / 64);
+        sc.ensureIndex(nfa); // build the per-state out-edge CSR
         return .{ .nfa = nfa, .a_start = a_start, .a_end = a_end, .sc = sc, .n_pos1 = n_pos1, .owned = sc };
     }
 
@@ -209,9 +252,12 @@ pub const BoundedBt = struct {
                 if (best == null or pos > best.?) best = pos;
                 // Don't stop: a longer accept may lie beyond (greedy).
             }
-            var ei: usize = 0;
-            while (ei < nfa.n_edges) : (ei += 1) {
-                if (nfa.e_from[ei] != state) continue;
+            // Only this state's own out-edges (CSR), in priority order — not a
+            // rescan of all `n_edges` per visited config (see `BtScratch`).
+            var c: usize = self.sc.edge_off[state];
+            const c_end: usize = self.sc.edge_off[@as(usize, state) + 1];
+            while (c < c_end) : (c += 1) {
+                const ei: usize = self.sc.edge_order[c];
                 const k = nfa.e_kind[ei];
                 if (k == 0) {
                     n = try self.pushReach(n, nfa.e_to[ei], pos);
@@ -321,16 +367,18 @@ pub const BoundedBt = struct {
         // Mirror the recursive entry: seen-check then accept-check for the root.
         if (self.seen(state0, start)) return false;
         if (state0 == accept and start == end) return true;
-        var sp = try self.pushCap(0, .{ .state = state0, .pos = start, .ei = 0, .rslot = -1, .rold = -1 });
+        // `CapFrame.ei` is a cursor into this state's CSR run `edge_order[
+        // edge_off[state] .. edge_off[state+1])` (priority order), not a global
+        // edge index — so the frame walks only its own out-edges.
+        var sp = try self.pushCap(0, .{ .state = state0, .pos = start, .ei = self.sc.edge_off[state0], .rslot = -1, .rold = -1 });
         while (sp > 0) {
             const cur = sp - 1; // index, not a pointer — `pushCap` may realloc
             const state = self.sc.cap_stack[cur].state;
             const pos = self.sc.cap_stack[cur].pos;
             var descended = false;
-            while (self.sc.cap_stack[cur].ei < nfa.n_edges) {
-                const ei = self.sc.cap_stack[cur].ei;
+            while (self.sc.cap_stack[cur].ei < self.sc.edge_off[@as(usize, state) + 1]) {
+                const ei: usize = self.sc.edge_order[self.sc.cap_stack[cur].ei];
                 self.sc.cap_stack[cur].ei += 1;
-                if (nfa.e_from[ei] != state) continue;
                 const k = nfa.e_kind[ei];
                 if (k == 0) {
                     const slot = nfa.e_slot[ei];
@@ -345,7 +393,7 @@ pub const BoundedBt = struct {
                         continue;
                     }
                     if (to == accept and pos == end) return true; // success: slot write kept
-                    sp = try self.pushCap(sp, .{ .state = to, .pos = pos, .ei = 0, .rslot = slot, .rold = old });
+                    sp = try self.pushCap(sp, .{ .state = to, .pos = pos, .ei = self.sc.edge_off[to], .rslot = slot, .rold = old });
                     descended = true;
                     break;
                 } else if (k == 2) {
@@ -353,7 +401,7 @@ pub const BoundedBt = struct {
                         const to = nfa.e_to[ei];
                         if (self.seen(to, pos)) continue;
                         if (to == accept and pos == end) return true;
-                        sp = try self.pushCap(sp, .{ .state = to, .pos = pos, .ei = 0, .rslot = -1, .rold = -1 });
+                        sp = try self.pushCap(sp, .{ .state = to, .pos = pos, .ei = self.sc.edge_off[to], .rslot = -1, .rold = -1 });
                         descended = true;
                         break;
                     }
@@ -361,7 +409,7 @@ pub const BoundedBt = struct {
                     const to = nfa.e_to[ei];
                     if (self.seen(to, pos + 1)) continue;
                     if (to == accept and pos + 1 == end) return true;
-                    sp = try self.pushCap(sp, .{ .state = to, .pos = pos + 1, .ei = 0, .rslot = -1, .rold = -1 });
+                    sp = try self.pushCap(sp, .{ .state = to, .pos = pos + 1, .ei = self.sc.edge_off[to], .rslot = -1, .rold = -1 });
                     descended = true;
                     break;
                 }
