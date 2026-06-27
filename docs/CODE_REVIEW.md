@@ -42,14 +42,16 @@ guard for the refactors.
   `pattern.zig:buildAll` 256→65 lines (7 named arm helpers), with matching helper names + order so the
   comptime⇄runtime correspondence is diffable. Routing logic was moved verbatim (differential-tested
   identical; only `&h`→`h`/`h.*` pointer adjustments and one `if`→early-return tidy in `tryClassSpan`).
-- ✅ **#5 capture-numbering cross-check** — `tests/capture_numbering.zig` pins `scanGroups`'s count + name
-  placement against the parser's real HIR `.cap` numbering over a divergence-prone corpus (catches the
-  `(?=(a)b)(a)(b)` phantom-slot bug class). This is the review's recommended minimum; the deeper
-  "eliminate `scanGroups`, have the parser emit names" unification remains open.
+- ✅ **#5 unified capture-numbering recognizer** — the standalone `scanGroups` byte-scanner (a second copy
+  of the paren/class/escape/lookaround grammar) was **deleted**; both front-ends now read the numbering +
+  names the parser itself emits via the new `parser.parseCaptures` (−51 lines net). The runtime parses the
+  `Regex`-owned copy so the `(?<name>)` name slices stay alive. `tests/capture_numbering.zig` was
+  repurposed to guard the single recognizer's internal consistency (reported count == baked `.cap` nodes,
+  contiguous 1..N, in-lookaround captures excluded) over a divergence-prone corpus. There is now nothing
+  to keep in sync — the duplication is gone, not just guarded.
 
 **Still open:** #3 (dedup the 4× DFA run loops), #4 (shared `\p{}` spec parser), #6 (one canonical
-`hasBit`/`Span`), #7 (name the anti-ReDoS budget constants + dense-route predicate), and the deeper #5
-unification.
+`hasBit`/`Span`), #7 (name the anti-ReDoS budget constants + dense-route predicate).
 
 ## Executive summary
 
@@ -149,7 +151,7 @@ changes.
    `parseSpec(...) error{...}!struct{found, negated}` called by both, branching only on
    RangeList-vs-bitmap materialization — makes the identical error contract structural.
 
-5. **[High · ✅ Cross-check added] Make capture-numbering a single recognizer instead of two hand-synced grammars.**
+5. **[High · ✅ DONE] Make capture-numbering a single recognizer instead of two hand-synced grammars.**
    `scanGroups` ([../src/parser.zig:288](../src/parser.zig#L288)–367) re-implements the same
    paren/class/escape/lookaround grammar that `parsePrimary`/`openGroup`
    ([../src/parser.zig:898](../src/parser.zig#L898)–1018) implements; the comment notes a `(?=(a)b)(a)(b)`

@@ -61,12 +61,6 @@ const MetaKind = enum { literal, dfa, lit_prefix, reverse_suffix, bt_look, backt
 /// the 1024-node `prefilter.AhoCorasick`; the comptime arm trims the table.
 const BLits = seq_extract.BoundaryMatcher(prefilter.AhoCorasick);
 
-/// Capture-group numbering + `(?<name>)` names, in source order. Lifted to
-/// `parser.zig` as the single source of truth so the runtime and comptime
-/// (`pattern.zig`) `.backtrack` paths agree by construction; aliased here so the
-/// existing call site reads unchanged.
-const scanGroups = parser.scanGroups;
-
 /// Shift every set capture slot (`>= 0`) and leave unset slots (`-1`) alone,
 /// converting offsets that were computed over `input[pos..]` back to absolute
 /// `input` coordinates. A no-op when `pos == 0`.
@@ -726,15 +720,26 @@ pub const Regex = struct {
         if (flags.unicode)
             return RegexError.NotImplemented;
 
+        // Dupe the pattern FIRST and parse the copy: `parseCaptures` reports the
+        // `(?<name>)` name slices as aliases into the parsed source, so they must
+        // point into the `Regex`-owned `owned` (kept for the regex's lifetime),
+        // not the caller's transient `pattern`.
+        const owned = try allocator.dupe(u8, pattern);
+        errdefer allocator.free(owned);
+
         var h = hir.Hir(null).initRuntime();
         var h_owned = true; // false once ownership is transferred to a heap copy
         defer if (h_owned) h.deinit(allocator);
-        parser.parse(null, &h, allocator, pattern, .{
+        var gnames0 = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1);
+        var ng0: usize = 0;
+        // `parseCaptures` is the single source of truth for capture numbering +
+        // names (replaces the old standalone `scanGroups` second grammar).
+        parser.parseCaptures(null, &h, allocator, owned, .{
             .ci = flags.case_insensitive,
             .dot_all = flags.dot_all,
             .extended = flags.extended,
             .multiline = flags.multiline,
-        }) catch |e| {
+        }, &ng0, &gnames0) catch |e| {
             return switch (e) {
                 hir.Error.Invalid => RegexError.InvalidPattern,
                 hir.Error.Unsupported => RegexError.NotImplemented,
@@ -743,12 +748,6 @@ pub const Regex = struct {
         };
 
         const props = properties.analyze(null, &h);
-
-        const owned = try allocator.dupe(u8, pattern);
-        errdefer allocator.free(owned);
-
-        var gnames0 = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1);
-        const ng0 = scanGroups(owned, &gnames0);
 
         // --- Non-regular tier (backreferences / lookaround): the tree
         // backtracker + its narrow fast-path peels (edge-look / split-alt /

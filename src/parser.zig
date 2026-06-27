@@ -268,104 +268,6 @@ fn hasTopLevelAlt(pat: []const u8) bool {
     return false;
 }
 
-/// Count capturing groups in source order (group 0 = whole match; plain `(`
-/// and `(?<name>)`/`(?P<name>)` count, `(?:`/flags/lookaround do not) and
-/// record `(?<name>)` names (aliasing `pattern`) into `gnames[group]`.
-///
-/// This is the **single source of truth** for capture numbering + names, shared
-/// by the runtime (`regex.zig`) and comptime (`pattern.zig`) `.backtrack` paths
-/// so they agree by construction. It is a *source* scan, deliberately distinct
-/// from the parser's HIR group indices: a capture inside a `{m,n}` re-parse is
-/// parsed non-capturing (no `.cap` node) yet its source `(` is counted here
-/// once (the original copy), matching the runtime. **Captures inside a
-/// lookaround are skipped**: the parser parses them non-capturing and gives
-/// them no HIR `.cap` index, so counting them here would shift every following
-/// group's number and leave a phantom unset slot in the reported vector (the
-/// `(?=(a)b)(a)(b)` mis-numbering bug). Skipping keeps this count equal to the
-/// highest HIR `.cap` index — what the tree backtracker needs to size its live
-/// slot-reset range. (In-lookaround captures are still not *reported* — a
-/// documented Phase-E limitation — but they no longer corrupt the numbering.)
-pub fn scanGroups(pattern: []const u8, gnames: *[hir.MAX_GROUPS + 1]?[]const u8) usize {
-    var n: usize = 0;
-    var i: usize = 0;
-    var in_class = false;
-    var depth: usize = 0;
-    // `la_active` holds between the outermost enclosing lookaround's `(` and its
-    // matching `)` (a nested look doesn't change in-ness); capturing groups are
-    // not counted while it is set, mirroring the parser's `capturing = false`.
-    var la_active = false;
-    var la_exit_depth: usize = 0;
-    while (i < pattern.len) : (i += 1) {
-        const c = pattern[i];
-        if (c == '\\') {
-            i += 1; // skip the escaped byte
-            continue;
-        }
-        if (in_class) {
-            if (c == ']') in_class = false;
-            continue;
-        }
-        if (c == '[') {
-            in_class = true;
-            continue;
-        }
-        if (c == ')') {
-            if (depth > 0) depth -= 1;
-            if (la_active and depth == la_exit_depth) la_active = false;
-            continue;
-        }
-        if (c != '(') continue;
-
-        // Classify this `(`: capturing (plain or `(?<name>`/`(?P<name>`), a
-        // lookaround (`(?=`/`(?!`/`(?<=`/`(?<!`), or other non-capturing
-        // (`(?:`/`(?>`/`(?flags…`). Matches `Parser.parsePrimary`'s recognition.
-        var is_cap = false;
-        var is_look = false;
-        var name: ?[]const u8 = null;
-        if (i + 1 < pattern.len and pattern[i + 1] == '?') {
-            if (i + 2 < pattern.len and pattern[i + 2] == '<' and
-                i + 3 < pattern.len and pattern[i + 3] != '=' and pattern[i + 3] != '!')
-            {
-                const ns = i + 3; // (?<name>…
-                var j = ns;
-                while (j < pattern.len and pattern[j] != '>') j += 1;
-                if (j < pattern.len) {
-                    is_cap = true;
-                    name = pattern[ns..j];
-                }
-            } else if (i + 3 < pattern.len and pattern[i + 2] == 'P' and pattern[i + 3] == '<') {
-                const ns = i + 4; // (?P<name>…
-                var j = ns;
-                while (j < pattern.len and pattern[j] != '>') j += 1;
-                if (j < pattern.len) {
-                    is_cap = true;
-                    name = pattern[ns..j];
-                }
-            } else if (i + 2 < pattern.len and (pattern[i + 2] == '=' or pattern[i + 2] == '!')) {
-                is_look = true; // (?=…) (?!…)
-            } else if (i + 2 < pattern.len and pattern[i + 2] == '<' and
-                i + 3 < pattern.len and (pattern[i + 3] == '=' or pattern[i + 3] == '!'))
-            {
-                is_look = true; // (?<=…) (?<!…)
-            }
-            // else: (?:…) / (?>…) / (?flags…) — non-capturing, not a lookaround.
-        } else {
-            is_cap = true; // plain capturing group
-        }
-
-        depth += 1;
-        if (is_look and !la_active) {
-            la_active = true;
-            la_exit_depth = depth - 1;
-        }
-        if (is_cap and !la_active and n < hir.MAX_GROUPS) {
-            n += 1;
-            gnames[n] = name;
-        }
-    }
-    return n;
-}
-
 /// Parse `src` into `h` (prescan + grammar). On success sets `h.root`,
 /// `h.anchored_start/end`, `h.saw_lazy`. Mirrors the front half of the old
 /// `computeDfa`: empty pattern, trailing garbage and `anchored_end && lazy`
@@ -376,6 +278,40 @@ pub fn parse(
     allocator: std.mem.Allocator,
     src: []const u8,
     flags: ParseFlags,
+) Error!void {
+    return parseInner(cap, h, allocator, src, flags, null, null);
+}
+
+/// Like `parse`, but also reports the capture-group numbering — the SINGLE
+/// source of truth, replacing the old standalone `scanGroups` byte-scanner that
+/// re-implemented the grammar a second time and could drift from it. `out_ng.*`
+/// = the number of capturing groups (group 0 = whole match, so user groups are
+/// 1..N); `out_gnames.*[g]` = group `g`'s `(?<name>)` name, else `null`. Groups
+/// inside a lookaround, `(?:`/`(?>`, and a `{m,n}` re-parse's repeated copies are
+/// non-capturing and excluded (see `openGroup`/`lookAround`), so this matches the
+/// `.cap` nodes the parser emits by construction. The name slices alias `src`, so
+/// a caller that outlives the parse (the runtime `Regex`) must pass a buffer it
+/// keeps alive (the owned pattern), not a transient input.
+pub fn parseCaptures(
+    comptime cap: ?usize,
+    h: *hir.Hir(cap),
+    allocator: std.mem.Allocator,
+    src: []const u8,
+    flags: ParseFlags,
+    out_ng: *usize,
+    out_gnames: *[hir.MAX_GROUPS + 1]?[]const u8,
+) Error!void {
+    return parseInner(cap, h, allocator, src, flags, out_ng, out_gnames);
+}
+
+fn parseInner(
+    comptime cap: ?usize,
+    h: *hir.Hir(cap),
+    allocator: std.mem.Allocator,
+    src: []const u8,
+    flags: ParseFlags,
+    out_ng: ?*usize,
+    out_gnames: ?*[hir.MAX_GROUPS + 1]?[]const u8,
 ) Error!void {
     if (src.len == 0) return Error.Unsupported;
 
@@ -435,6 +371,17 @@ pub fn parse(
     // end-anchor (`accept_at = len`) independently and correctly.
     h.root = root;
     h.saw_lazy = p.saw_lazy;
+
+    // Single-source-of-truth capture numbering: hand back the parser's
+    // authoritative group count + `(?<name>)` names (already excludes groups
+    // inside a lookaround / `(?:`/`(?>` / `{m,n}` re-parse copies). This is what
+    // the standalone `scanGroups` byte-scanner used to recompute independently.
+    if (out_ng) |p_ng| p_ng.* = p.n_groups;
+    if (out_gnames) |g| {
+        g.* = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1);
+        var k: usize = 0;
+        while (k < p.n_names) : (k += 1) g.*[p.name_g[k]] = p.names[k];
+    }
 }
 
 fn Parser(comptime cap: ?usize) type {
@@ -480,9 +427,10 @@ fn Parser(comptime cap: ?usize) type {
         }
 
         /// Reserve this group's number *before* its body is parsed, so nesting
-        /// is numbered in opening-paren order (standard, and matching
-        /// `regex.scanGroups`). Returns 0 for a non-capturing context (a
-        /// `{m,n}` re-parse: repeated copies must not mis-number — that atom's
+        /// is numbered in opening-paren order (standard). The final `p.n_groups`
+        /// + recorded names are handed back by `parseCaptures` (the single source
+        /// of truth for capture numbering). Returns 0 for a non-capturing context
+        /// (a `{m,n}` re-parse: repeated copies must not mis-number — that atom's
         /// captures are simply not reported, a documented Phase-D limitation).
         fn openGroup(p: *Self, name: ?[]const u8) Error!u32 {
             if (!p.capturing) return 0;

@@ -289,10 +289,10 @@ const Built = struct {
     /// intermediate is comptime-only and never reaches `.rodata`; its tail is
     /// `undefined` (parser writes only the live prefix) and is never read.
     hir: hir.Hir(HIR_CAP) = undefined,
-    /// Capture-group count + `(?<name>)` names, from `parser.scanGroups` over
-    /// the source (NOT the HIR) — the same call the runtime `.backtrack` path
-    /// uses, so the two agree by construction (incl. groups inside a lookaround,
-    /// which are HIR-non-capturing but still reserve a numbered, named slot).
+    /// Capture-group count + `(?<name>)` names, from `parser.parseCaptures` —
+    /// the same single-source-of-truth numbering the runtime `.backtrack` path
+    /// uses, so the two front-ends agree by construction (groups inside a
+    /// lookaround are non-capturing, so they are neither counted nor named).
     n_groups: usize = 0,
     gnames: [hir.MAX_GROUPS + 1]?[]const u8 = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1),
     /// `.edge_look` arm: verify spec for the peeled trailing width-1 look.
@@ -668,7 +668,11 @@ fn buildRegularBuilt(h: *hir.Hir(HIR_CAP), props: properties.Properties, ng: usi
 fn buildAll(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) Built {
     @setEvalBranchQuota(8_000_000);
     var h = hir.Hir(HIR_CAP).initComptime();
-    parser.parse(HIR_CAP, &h, undefined, pattern, .{ .ci = ci, .multiline = ml }) catch |e| {
+    // `parseCaptures` is the single source of truth for capture numbering + names
+    // (replaces the old standalone `parser.scanGroups`); it fills `gnames`/`ng`.
+    var gnames = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1);
+    var ng_groups: usize = 0;
+    parser.parseCaptures(HIR_CAP, &h, undefined, pattern, .{ .ci = ci, .multiline = ml }, &ng_groups, &gnames) catch |e| {
         return .{
             .dfa = full_dfa.emptyDfa256(.ok),
             .outcome = switch (e) {
@@ -700,15 +704,13 @@ fn buildAll(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) 
     // after the DFA build) is free and lets the regular path fall through.
     const props = properties.analyze(HIR_CAP, &h);
 
-    // Capture metadata, computed once for EVERY `.ok` strat (not just
-    // `.backtrack`): a regular-with-captures pattern (e.g. `(\d{4})-(\d{2})`)
-    // routes to the DFA arm but still needs `n_groups`/`gnames` + the baked HIR
-    // so the DFA arm can offer zero-alloc `findCaptures` (it bakes a capture-only
-    // `BacktrackerG` over this HIR; the DFA still serves `find`/`count`). Group
-    // count + names come from `parser.scanGroups` over the source — the single
-    // source of truth shared with the runtime, so the two agree by construction.
-    var gnames = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1);
-    const ng = parser.scanGroups(pattern, &gnames);
+    // Capture metadata (`n_groups`/`gnames`, from `parseCaptures` above — the
+    // single source of truth shared with the runtime `regex.zig`) is needed for
+    // EVERY `.ok` strat, not just `.backtrack`: a regular-with-captures pattern
+    // like `(\d{4})-(\d{2})` routes to the DFA arm but still bakes a capture-only
+    // `BacktrackerG` over this HIR for zero-alloc `findCaptures` (the DFA still
+    // serves `find`/`count`).
+    const ng = ng_groups;
 
     // Engine-selection cascade. Each arm is a named `*Built` helper above; the
     // first that applies returns. Order + names mirror the runtime `regex.zig`

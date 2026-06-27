@@ -1,37 +1,42 @@
-//! Cross-check: `parser.scanGroups` (the standalone byte-scanner that the two
-//! front-ends call to size capture vectors + report group names) must agree
-//! with the parser's REAL capture numbering — i.e. the `.cap` nodes the grammar
-//! actually emits into the HIR (`set_idx` = 1-based group index).
+//! Guard for the unified capture-numbering recognizer.
 //!
-//! `scanGroups` re-implements the paren/class/escape/lookaround grammar a second
-//! time (see its doc comment). When the two drift, capture vectors are mis-sized
-//! and group names land on the wrong index — the documented `(?=(a)b)(a)(b)`
-//! phantom-slot bug. This test pins the invariant the doc claims:
-//!   scanGroups(pattern) == count of `.cap` nodes in parser(pattern)'s HIR
-//! over a corpus that deliberately exercises the divergence-prone shapes
-//! (captures inside look-ahead/behind, named groups, nesting, alternation,
-//! non-capturing/atomic groups, backrefs, classes containing `(`).
+//! `parser.parseCaptures` is the SINGLE source of truth for capture-group
+//! numbering + `(?<name>)` names. (The old standalone `scanGroups` byte-scanner
+//! — a second copy of the paren/class/escape/lookaround grammar that could drift
+//! from the real parse, as the `(?=(a)b)(a)(b)` phantom-slot bug once showed —
+//! was deleted; both front-ends now read the numbering the parser emits.)
 //!
-//! Captures inside a lookaround are parsed non-capturing (no `.cap` node), so
-//! they must NOT be counted or named — the part of the grammar `scanGroups`
-//! is most likely to get wrong.
+//! This test pins the recognizer's internal consistency: the group count it
+//! REPORTS (`out_ng`) must equal the number of `.cap` nodes it actually emits
+//! into the HIR, with contiguous 1..N indices (no phantom/gap), over a corpus
+//! that exercises the divergence-prone shapes — captures inside look-ahead/behind
+//! (which must NOT be counted or named), named groups, nesting, alternation,
+//! non-capturing/atomic groups, backrefs, and classes containing `(`.
 
 const std = @import("std");
 const zeetah = @import("zeetah");
 const parser = zeetah.parser;
 const hir = zeetah.hir;
 
-/// The parser's authoritative capture numbering, read back from the HIR it
-/// produced: every capturing group emits exactly one `.cap` node whose
-/// `set_idx` is its 1-based number; non-capturing / atomic / in-lookaround
-/// groups emit none. Returns the count and whether the indices form the
-/// contiguous set {1..count} (a phantom/gap would break contiguity).
-const CapInfo = struct { count: usize, max: usize, contiguous: bool };
+const CapCheck = struct {
+    /// `parseCaptures` reported group count.
+    reported: usize,
+    /// Count of `.cap` nodes the parser baked into the HIR.
+    cap_nodes: usize,
+    /// Highest `.cap` `set_idx` seen.
+    max_idx: usize,
+    /// The `.cap` indices form the contiguous set {1..cap_nodes} (no phantom/gap).
+    contiguous: bool,
+    /// `parseCaptures` reported names, by 1-based group index.
+    names: [hir.MAX_GROUPS + 1]?[]const u8,
+};
 
-fn parserCapInfo(pattern: []const u8) !CapInfo {
+fn check(pattern: []const u8) !CapCheck {
     var h = hir.Hir(null).initRuntime();
     defer h.deinit(std.testing.allocator);
-    parser.parse(null, &h, std.testing.allocator, pattern, .{}) catch return error.ParseFailed;
+    var names = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1);
+    var ng: usize = 0;
+    parser.parseCaptures(null, &h, std.testing.allocator, pattern, .{}, &ng, &names) catch return error.ParseFailed;
 
     var seen = [_]bool{false} ** (hir.MAX_GROUPS + 1);
     var count: usize = 0;
@@ -48,10 +53,10 @@ fn parserCapInfo(pattern: []const u8) !CapInfo {
     while (k <= maxi) : (k += 1) {
         if (!seen[k]) contiguous = false;
     }
-    return .{ .count = count, .max = maxi, .contiguous = contiguous };
+    return .{ .reported = ng, .cap_nodes = count, .max_idx = maxi, .contiguous = contiguous, .names = names };
 }
 
-test "scanGroups count agrees with the parser's HIR capture numbering" {
+test "parseCaptures count matches the .cap nodes the parser emits" {
     const patterns = [_][]const u8{
         // plain / nested / alternation
         "(a)(b)(c)",
@@ -71,13 +76,12 @@ test "scanGroups count agrees with the parser's HIR capture numbering" {
         // classes containing `(` / `)` must not be miscounted
         "([(])(x)",
         "(a)[)(]+(b)",
-        // THE regression: a capture inside a look-ahead must not be counted,
-        // and must not shift the following groups' numbers (phantom slot).
+        // a capture inside a look-ahead/behind must NOT be counted, and must not
+        // shift the following groups' numbers (the phantom-slot bug class).
         "(?=(a)b)(a)(b)",
         "(?!(z))(a)(b)",
         "(?<=(a))(b)",
         "(?<!(z))(b)",
-        // named capture inside a lookaround: not counted, not named
         "(?=(?<inner>a))(?<outer>b)",
         // realistic bench-style shapes
         "(\\d{4})-(\\d{2})-(\\d{2})",
@@ -86,46 +90,43 @@ test "scanGroups count agrees with the parser's HIR capture numbering" {
     };
 
     for (patterns) |pat| {
-        var names = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1);
-        const sg = parser.scanGroups(pat, &names);
-        const info = try parserCapInfo(pat);
-        // The whole point: the two grammars report the same group count.
-        std.testing.expectEqual(info.count, sg) catch |e| {
-            std.debug.print("pattern {s}: scanGroups={d} but HIR has {d} .cap nodes\n", .{ pat, sg, info.count });
+        const c = check(pat) catch |e| {
+            std.debug.print("pattern {s}: parse failed\n", .{pat});
             return e;
         };
-        // The parser numbers groups 1..n contiguously; max index must equal the
-        // count and have no gap (a phantom slot would violate this).
-        try std.testing.expectEqual(info.count, info.max);
-        try std.testing.expect(info.contiguous);
+        // The crux: the reported group count equals the `.cap` nodes baked.
+        std.testing.expectEqual(c.cap_nodes, c.reported) catch |e| {
+            std.debug.print("pattern {s}: parseCaptures reported {d} but HIR has {d} .cap nodes\n", .{ pat, c.reported, c.cap_nodes });
+            return e;
+        };
+        // Numbered 1..N contiguously (a phantom/gap would break this).
+        try std.testing.expectEqual(c.cap_nodes, c.max_idx);
+        try std.testing.expect(c.contiguous);
     }
 }
 
-test "scanGroups places names at the right indices (and skips in-lookaround names)" {
+test "parseCaptures places names at the right indices (and skips in-lookaround names)" {
     // Named groups land on their 1-based index.
     {
-        var names = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1);
-        const n = parser.scanGroups("(?<year>\\d{4})-(?<month>\\d{2})", &names);
-        try std.testing.expectEqual(@as(usize, 2), n);
-        try std.testing.expectEqualStrings("year", names[1].?);
-        try std.testing.expectEqualStrings("month", names[2].?);
+        const c = try check("(?<year>\\d{4})-(?<month>\\d{2})");
+        try std.testing.expectEqual(@as(usize, 2), c.reported);
+        try std.testing.expectEqualStrings("year", c.names[1].?);
+        try std.testing.expectEqualStrings("month", c.names[2].?);
     }
     // A named capture INSIDE a lookahead is not counted, so the following named
     // group keeps index 1 and the inner name never appears.
     {
-        var names = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1);
-        const n = parser.scanGroups("(?=(?<inner>a))(?<outer>b)", &names);
-        try std.testing.expectEqual(@as(usize, 1), n);
-        try std.testing.expectEqualStrings("outer", names[1].?);
-        try std.testing.expect(names[2] == null);
+        const c = try check("(?=(?<inner>a))(?<outer>b)");
+        try std.testing.expectEqual(@as(usize, 1), c.reported);
+        try std.testing.expectEqualStrings("outer", c.names[1].?);
+        try std.testing.expect(c.names[2] == null);
     }
     // Unnamed groups leave a null name at their index.
     {
-        var names = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1);
-        const n = parser.scanGroups("(a)(?<b>x)(c)", &names);
-        try std.testing.expectEqual(@as(usize, 3), n);
-        try std.testing.expect(names[1] == null);
-        try std.testing.expectEqualStrings("b", names[2].?);
-        try std.testing.expect(names[3] == null);
+        const c = try check("(a)(?<b>x)(c)");
+        try std.testing.expectEqual(@as(usize, 3), c.reported);
+        try std.testing.expect(c.names[1] == null);
+        try std.testing.expectEqualStrings("b", c.names[2].?);
+        try std.testing.expect(c.names[3] == null);
     }
 }

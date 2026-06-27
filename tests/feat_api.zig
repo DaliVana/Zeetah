@@ -856,8 +856,8 @@ test "comptime line-DFA with captures: DFA-backed, slots == runtime" {
 // `captures()` (→ `Captures`) must agree with the runtime `Regex.captures` (→
 // allocator-owned `Match`) on the whole-match span AND every numbered/named
 // group (slice, start, end, participation), since both derive numbering + names
-// from the same `parser.scanGroups`. Compares group-by-group, comptime `Captures`
-// vs runtime `Match`.
+// from the same `parser.parseCaptures`. Compares group-by-group, comptime
+// `Captures` vs runtime `Match`.
 fn btCapAgree(comptime p: []const u8, in: []const u8, comptime ng: usize) !void {
     const a = std.testing.allocator;
     const P = regex.Pattern(p, .{});
