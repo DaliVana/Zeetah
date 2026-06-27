@@ -201,6 +201,12 @@ Teddy is a *necessary-condition* candidate finder for a small set of literal
 needles (an `a|bc|def` alternation, or a multi-literal prefix). It is the
 building block the planner's `.literal` / `.prefix_prefilter` strategies consume
 (see [planner.zig](../src/planner.zig) and [search.zig](../src/exec/search.zig)).
+The multi-literal needle set is widened by **cross-product expansion** of a
+leading literal run across small optional/class/alternation wobbles in
+`seq_extract.prefix` (`colou?r` → {color, colour}; `gr[ae]y` → {gray, grey};
+bounded to ≤ 8 alternatives), so more patterns reach this SIMD kernel instead of
+falling back to a broad first-byte-set scan — the same expanded `Seq` feeds the
+runtime and the comptime-baked Teddy alike.
 It locates positions where *some* needle's prefix *could* start, then verifies a
 real occurrence — so it never reports a position where no needle starts, and the
 engine re-runs from the reported offset, keeping an over-approximation correct.

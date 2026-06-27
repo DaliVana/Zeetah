@@ -107,45 +107,6 @@ fn wholeLiteral(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, buf:
     }
 }
 
-/// Leading run of literal bytes (a *necessary* prefix). Stops at the first
-/// non-literal element; `exact` reports whether the whole pattern was that
-/// literal.
-fn leadingRun(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, buf: *[MAX_LIT]u8, len: usize, exact: *bool) usize {
-    const nd = h.node(ref);
-    switch (nd.tag) {
-        .empty => return len,
-        .set => {
-            const b = singleByte(cap, h, nd.set_idx) orelse {
-                exact.* = false;
-                return len;
-            };
-            if (len >= MAX_LIT) {
-                exact.* = false;
-                return len;
-            }
-            buf[len] = b;
-            return len + 1;
-        },
-        .concat => {
-            // Walk left chain first; only continue right if the left was a
-            // *complete* literal (otherwise the run ends inside the left).
-            var lit_only = true;
-            const before = len;
-            const l = leadingRun(cap, h, nd.a, buf, len, &lit_only);
-            if (!lit_only or l == before) {
-                exact.* = false;
-                return l;
-            }
-            return leadingRun(cap, h, nd.b, buf, l, exact);
-        },
-        .cap, .atomic => return leadingRun(cap, h, nd.a, buf, len, exact), // transparent
-        .alt, .star, .plus, .opt, .look, .backref, .look_around => {
-            exact.* = false;
-            return len;
-        },
-    }
-}
-
 fn trailingRun(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, buf: *[MAX_LIT]u8, len: usize, exact: *bool) usize {
     const nd = h.node(ref);
     switch (nd.tag) {
@@ -193,9 +154,178 @@ fn collectAlts(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, out: 
     return true;
 }
 
+// --- Small cross-product literal expansion ----------------------------------
+//
+// Extends a leading literal *run* through small "wobbles" — optional groups
+// (`u?`, `(?:foo)?`), small character classes (`[ae]`, `gr[ae]y`), and literal
+// alternations (`(?:cat|dog)`) — into the *set* of literal strings the spine
+// can produce (`colou?r` → {color, colour}; `gr[ae]y` → {gray, grey}). The set
+// is a sound necessary-prefix condition, so it drives the Teddy-locate +
+// DFA-verify `.lit_prefix` path: a far more selective prefilter than the single
+// leading run the plain extractor stops at the first wobble. Bounded by
+// `MAX_ALTS` (cross-product size) and `MAX_LIT` (per-alternative length); the
+// moment either would overflow, expansion stops with the prefix collected so
+// far (still sound). A multi-literal result is deliberately kept *inexact* (see
+// `prefix`) so leftmost-first is always resolved by the verifying DFA, never by
+// the order-sensitive pure-literal short-circuit.
+
+/// Max members of a character class enumerated into alternatives. Tiny on
+/// purpose: a class wider than this (`[0-9]`, `[a-z]`) is not a small wobble —
+/// its fan-out blows `MAX_ALTS` for no selectivity gain, so it stops the run.
+const SMALL_CLASS_MAX: usize = 4;
+
+/// A bounded set of literal alternatives under construction. Mirrors `Seq`'s
+/// storage but carries no `exact` flag; the expansion helpers compose these by
+/// concatenation (cross-product) and union. Defaults are all-zero so an
+/// untouched byte tail is `0` (never `undefined` — safe to bake at comptime).
+const LitSet = struct {
+    lits: [MAX_ALTS][MAX_LIT]u8 = [_][MAX_LIT]u8{[_]u8{0} ** MAX_LIT} ** MAX_ALTS,
+    lens: [MAX_ALTS]u8 = [_]u8{0} ** MAX_ALTS,
+    n: usize = 0,
+};
+
+/// The singleton set `{""}` — the identity for concatenation.
+fn litEmpty() LitSet {
+    return .{ .n = 1 };
+}
+
+/// The singleton set `{<b>}`.
+fn litByte(b: u8) LitSet {
+    var s = LitSet{ .n = 1 };
+    s.lits[0][0] = b;
+    s.lens[0] = 1;
+    return s;
+}
+
+/// Cross-product concatenation `{a_i ++ b_j}`. Null if it would exceed
+/// `MAX_ALTS` alternatives or any alternative would exceed `MAX_LIT` bytes.
+fn concatSets(a: LitSet, b: LitSet) ?LitSet {
+    if (a.n * b.n > MAX_ALTS) return null;
+    var out = LitSet{};
+    var k: usize = 0;
+    var i: usize = 0;
+    while (i < a.n) : (i += 1) {
+        var j: usize = 0;
+        while (j < b.n) : (j += 1) {
+            const al: usize = a.lens[i];
+            const bl: usize = b.lens[j];
+            if (al + bl > MAX_LIT) return null;
+            var m: usize = 0;
+            while (m < al) : (m += 1) out.lits[k][m] = a.lits[i][m];
+            while (m < al + bl) : (m += 1) out.lits[k][m] = b.lits[j][m - al];
+            out.lens[k] = @intCast(al + bl);
+            k += 1;
+        }
+    }
+    out.n = k;
+    return out;
+}
+
+/// Set union `a ∪ b` (no dedup — duplicate needles are harmless to a
+/// prefilter). Null if it would exceed `MAX_ALTS`.
+fn unionSets(a: LitSet, b: LitSet) ?LitSet {
+    if (a.n + b.n > MAX_ALTS) return null;
+    var out = a;
+    var j: usize = 0;
+    while (j < b.n) : (j += 1) {
+        out.lits[out.n] = b.lits[j];
+        out.lens[out.n] = b.lens[j];
+        out.n += 1;
+    }
+    return out;
+}
+
+/// A class of `1..SMALL_CLASS_MAX` members as one-byte alternatives, else null.
+fn smallClassSet(comptime cap: ?usize, h: *const hir.Hir(cap), set_idx: u32) ?LitSet {
+    const bm = h.setBitmap(set_idx);
+    var out = LitSet{};
+    var c: usize = 0;
+    while (c < 256) : (c += 1) {
+        if (hasBit(&bm, @intCast(c))) {
+            if (out.n >= SMALL_CLASS_MAX) return null;
+            out.lits[out.n][0] = @intCast(c);
+            out.lens[out.n] = 1;
+            out.n += 1;
+        }
+    }
+    if (out.n == 0) return null;
+    return out;
+}
+
+/// The *complete* finite set of literal strings a subtree can match, or null if
+/// it is not boundedly literal (unbounded repetition, a wide class, look,
+/// backref, or an overflow of the `MAX_ALTS`/`MAX_LIT` budget).
+fn expandNode(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) ?LitSet {
+    const nd = h.node(ref);
+    switch (nd.tag) {
+        .empty => return litEmpty(),
+        .set => return if (singleByte(cap, h, nd.set_idx)) |b|
+            litByte(b)
+        else
+            smallClassSet(cap, h, nd.set_idx),
+        .concat => return concatSets(
+            expandNode(cap, h, nd.a) orelse return null,
+            expandNode(cap, h, nd.b) orelse return null,
+        ),
+        .alt => return unionSets(
+            expandNode(cap, h, nd.a) orelse return null,
+            expandNode(cap, h, nd.b) orelse return null,
+        ),
+        .opt => return unionSets(litEmpty(), expandNode(cap, h, nd.a) orelse return null),
+        .cap, .atomic => return expandNode(cap, h, nd.a), // transparent
+        .star, .plus, .look, .look_around, .backref => return null,
+    }
+}
+
+/// Accumulate the leading-spine prefix set into `acc` (cross-product), walking
+/// `concat` left-to-right and through transparent `cap`/`atomic`. Returns false
+/// — stopping the run — at the first factor that is not boundedly literal or
+/// that would overflow the budget; `acc` then holds the longest sound prefix.
+fn walkSpine(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, acc: *LitSet) bool {
+    const nd = h.node(ref);
+    switch (nd.tag) {
+        .concat => {
+            if (!walkSpine(cap, h, nd.a, acc)) return false;
+            return walkSpine(cap, h, nd.b, acc);
+        },
+        .cap, .atomic => return walkSpine(cap, h, nd.a, acc),
+        else => {
+            const fs = expandNode(cap, h, ref) orelse return false;
+            acc.* = concatSets(acc.*, fs) orelse return false;
+            return true;
+        },
+    }
+}
+
+/// True if any alternative is the empty string. Such a set is not a *mandatory*
+/// prefix (a match could begin with nothing — e.g. a leading optional `v?…`, or
+/// a nullable pattern), so it must not be used as a selective prefilter: it
+/// would match at every position and, worse, poison `Seq.isEmpty`/`minLen`.
+fn hasEmptyAlt(set: LitSet) bool {
+    var i: usize = 0;
+    while (i < set.n) : (i += 1) if (set.lens[i] == 0) return true;
+    return false;
+}
+
+fn seqFromSet(set: LitSet, exact: bool) Seq {
+    var s = Seq{};
+    var i: usize = 0;
+    while (i < set.n) : (i += 1) {
+        s.lits[i] = set.lits[i];
+        s.lens[i] = set.lens[i];
+    }
+    s.n = @intCast(set.n);
+    s.exact = exact;
+    return s;
+}
+
 /// Prefix `Seq`: an alternation whose every branch is a whole literal yields
-/// an *exact* multi-literal Seq (e.g. `cat|dog|bird`); otherwise the single
-/// leading literal run (exact iff it is the whole pattern).
+/// an *exact* multi-literal Seq (e.g. `cat|dog|bird`); otherwise the leading
+/// literal run, **expanded across small optional/class/alternation wobbles**
+/// into the set of possible leading literals (`colou?r` → {color, colour}).
+/// `exact` is set only for a single whole-pattern literal (the pure-`.literal`
+/// fast path); any multi-literal result is inexact so leftmost-first is decided
+/// by the verifying DFA on the `.lit_prefix` path.
 pub fn prefix(comptime cap: ?usize, h: *const hir.Hir(cap)) Seq {
     @setEvalBranchQuota(1_000_000);
     var s = Seq{};
@@ -225,15 +355,22 @@ pub fn prefix(comptime cap: ?usize, h: *const hir.Hir(cap)) Seq {
         }
     }
 
-    var buf: [MAX_LIT]u8 = undefined;
-    var exact = true;
-    const ln = leadingRun(cap, h, h.root, &buf, 0, &exact);
-    if (ln == 0) return Seq{};
-    s.lits[0] = buf;
-    s.lens[0] = @intCast(ln);
-    s.n = 1;
-    s.exact = exact;
-    return s;
+    // Whole pattern is a finite literal set (`hello`, `colou?r`, `gr[ae]y`):
+    // exact only when it is a single literal (safe pure-`.literal` route). A set
+    // with an empty alternative (nullable pattern) is not a mandatory prefix.
+    if (expandNode(cap, h, h.root)) |full| {
+        if (full.n >= 1 and !hasEmptyAlt(full)) return seqFromSet(full, full.n == 1);
+        return Seq{};
+    }
+    // Otherwise the expanded leading prefix up to the first non-literal element.
+    // `walkSpine` seeds `acc` with `{""}`, so a non-extending walk (leading
+    // `.star`/look) or a leading optional (`v?…`) leaves an empty alternative —
+    // `hasEmptyAlt` then correctly reports "no mandatory prefix".
+    var acc = litEmpty();
+    _ = walkSpine(cap, h, h.root, &acc);
+    if (acc.n >= 1 and !hasEmptyAlt(acc)) return seqFromSet(acc, false);
+
+    return Seq{};
 }
 
 /// Trailing literal run (a necessary suffix; exact iff whole pattern).
@@ -837,4 +974,83 @@ test "seq_extract: alternation of literals -> exact multi Seq" {
     try std.testing.expectEqualStrings("cat", p.alt(0));
     try std.testing.expectEqualStrings("dog", p.alt(1));
     try std.testing.expectEqualStrings("bird", p.alt(2));
+}
+
+// 3.1 — small cross-product literal expansion. A leading run with a single
+// optional / small-class / literal-alternation wobble expands into the full
+// literal set, kept *inexact* (multi-literal) so it drives `.lit_prefix`.
+
+fn expectSet(comptime src: []const u8, expected: []const []const u8, exact: bool) !void {
+    const parser = @import("../parser.zig");
+    const H = hir.Hir(256);
+    var h = H.initComptime();
+    try parser.parse(256, &h, undefined, src, .{});
+    const p = prefix(256, &h);
+    try std.testing.expectEqual(@as(u8, @intCast(expected.len)), p.n);
+    try std.testing.expectEqual(exact, p.exact);
+    for (expected, 0..) |e, i| try std.testing.expectEqualStrings(e, p.alt(i));
+}
+
+test "seq_extract: optional wobble expands (colou?r)" {
+    // Whole pattern is the finite set {color, colour}; multi-literal => inexact.
+    try expectSet("colou?r", &.{ "color", "colour" }, false);
+}
+
+test "seq_extract: small class wobble expands (gr[ae]y)" {
+    try expectSet("gr[ae]y", &.{ "gray", "grey" }, false);
+}
+
+test "seq_extract: inner literal alternation expands ((?:cat|dog)house)" {
+    try expectSet("(?:cat|dog)house", &.{ "cathouse", "doghouse" }, false);
+}
+
+test "seq_extract: leading small class produces a prefix where the plain run gave none" {
+    // Leads with a class: the old single-run extractor stopped immediately and
+    // yielded an empty prefix; expansion yields {xabcdef, yabcdef}.
+    try expectSet("[xy]abcdef", &.{ "xabcdef", "yabcdef" }, false);
+}
+
+test "seq_extract: expansion stops at an unbounded element (colou?r.*end)" {
+    // The trailing `.*end` is non-literal, so the prefix is the expanded head.
+    try expectSet("colou?r.*end", &.{ "color", "colour" }, false);
+}
+
+test "seq_extract: single whole literal stays exact (pure .literal route)" {
+    try expectSet("hello", &.{"hello"}, true);
+}
+
+test "seq_extract: wide class is not expanded; run stops before it (ab[0-9]cd)" {
+    // `[0-9]` (10 members > SMALL_CLASS_MAX) is a hard stop; prefix is "ab".
+    try expectSet("ab[0-9]cd", &.{"ab"}, false);
+}
+
+test "seq_extract: leading optional yields no mandatory prefix (v?[0-9]+...)" {
+    // `v?` makes the prefix non-mandatory (a match may start with a digit), so
+    // the expansion must NOT produce a `{"", "v"}` set — the Seq stays empty.
+    const parser = @import("../parser.zig");
+    const H = hir.Hir(256);
+    var h = H.initComptime();
+    try parser.parse(256, &h, undefined, "v?[0-9]+\\.[0-9]+", .{});
+    try std.testing.expectEqual(@as(u8, 0), prefix(256, &h).n);
+}
+
+test "seq_extract: nullable whole pattern yields no prefix (a?)" {
+    const parser = @import("../parser.zig");
+    const H = hir.Hir(256);
+    var h = H.initComptime();
+    try parser.parse(256, &h, undefined, "a?", .{});
+    try std.testing.expectEqual(@as(u8, 0), prefix(256, &h).n);
+}
+
+test "seq_extract: cross-product over budget stops with the prefix so far" {
+    // [ab][cd][ef][gh] = 16 > MAX_ALTS(8): expand the first three (8 alts),
+    // then the fourth would overflow, so the run stops at length 3.
+    const parser = @import("../parser.zig");
+    const H = hir.Hir(256);
+    var h = H.initComptime();
+    try parser.parse(256, &h, undefined, "[ab][cd][ef][gh]", .{});
+    const p = prefix(256, &h);
+    try std.testing.expectEqual(@as(u8, 8), p.n);
+    try std.testing.expect(!p.exact);
+    try std.testing.expectEqual(@as(usize, 3), p.minLen());
 }
