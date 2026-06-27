@@ -38,6 +38,19 @@ pub const DEAD = 0;
 /// shared with the runtime executor via `exec/search.zig`.
 pub const Span = search.Span;
 
+/// Adaptive SIMD self-loop "spin-skip" — the comptime peer of
+/// `full_dfa.Dfa256.runFromSpin`. A state that self-loops over a wide byte class
+/// (`.*`, `[^"]*`, base64) is invariant across the run, so after a short scalar
+/// warm-up it is sound to SIMD-scan (`pf.runEnd`) to the first byte that leaves
+/// the state. These MUST match `full_dfa`'s constants. `SPIN_MAX` is guarded for
+/// free — `compressTo` assigns `t.stay_sets = m.stay_sets`, so a size mismatch is
+/// a compile error. `SPIN_TRIGGER` is NOT type-guarded: a divergence only shifts
+/// the engage point (a perf inconsistency, never a wrong result — `runFromSpin`
+/// is byte-identical to `runFromPlain` at any trigger); keep it equal by hand.
+pub const SPIN_MAX: usize = 16; // max wide-self-loop states tracked per DFA
+pub const SPIN_NONE: u8 = 0xFF; // `stay_idx` sentinel: state has no skip set
+const SPIN_TRIGGER: usize = 64; // engage only after this many self-loop bytes
+
 pub fn Dfa(comptime n_states: usize, comptime n_classes: usize) type {
     return struct {
         const Self = @This();
@@ -120,6 +133,26 @@ pub fn Dfa(comptime n_states: usize, comptime n_classes: usize) type {
         required: ?u8 = null,
         req_lit: ?seq_extract.ReqLit = null,
 
+        /// Adaptive spin-skip metadata, carried verbatim from the source
+        /// `Dfa256` by `compressTo` (state numbering is preserved 1:1). `has_spin`
+        /// gates the whole feature: false ⇒ `runFrom` takes the untouched scalar
+        /// `runFromPlain`. For a tracked wide-self-loop state `s`, `stay_idx[s]`
+        /// indexes `stay_sets` (the bytes that keep the walk in `s`); else
+        /// `SPIN_NONE`. Defaults keep hand-built test DFAs (and `computeReverse`'s
+        /// no-spin reverse tables) on the zero-overhead plain loop.
+        ///
+        /// `.rodata` cost: `stay_sets` is a fixed `[SPIN_MAX][32]u8` = 512 B baked
+        /// into EVERY compressed DFA (not just spin ones). Measured impact is small
+        /// (~14 KB across the 53-pattern bench binary — the all-zero default of
+        /// no-spin DFAs largely folds), so it is left unconditional for simplicity.
+        /// If a flash-constrained target needs it gone, gate the fields on a
+        /// comptime `has_spin` type parameter (e.g. `Dfa(ns, nk, spin_slots)` with
+        /// `spin_slots = 0` when the source DFA has no spin) — a typed change to
+        /// `compress`/`compressTo` and the few `Dfa(...)` instantiation sites.
+        has_spin: bool = false,
+        stay_idx: [n_states]u8 = [_]u8{SPIN_NONE} ** n_states,
+        stay_sets: [SPIN_MAX][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** SPIN_MAX,
+
         pub inline fn isAccepting(self: *const Self, s: u16) bool {
             return self.accepting[s];
         }
@@ -148,6 +181,14 @@ pub fn Dfa(comptime n_states: usize, comptime n_classes: usize) type {
         // both inline avoids a comptime/runtime asymmetry where the verify call
         // is inlined on one front-end but not the other.
         pub inline fn runFrom(self: *const Self, input: []const u8, start_pos: usize) ?usize {
+            // One predicted branch on a baked `bool`: patterns with no wide
+            // self-loop state inline the untouched scalar loop; only those that
+            // can benefit take the spin variant. Mirrors `full_dfa.runFrom`.
+            if (self.has_spin) return self.runFromSpin(input, start_pos);
+            return self.runFromPlain(input, start_pos);
+        }
+
+        inline fn runFromPlain(self: *const Self, input: []const u8, start_pos: usize) ?usize {
             var state: u16 = self.start;
             var last_accept: ?usize = if (self.isAccepting(state)) start_pos else null;
             var i: usize = start_pos;
@@ -156,6 +197,58 @@ pub fn Dfa(comptime n_states: usize, comptime n_classes: usize) type {
                 state = self.transitions[state][cls];
                 if (state == DEAD) break;
                 if (self.isAccepting(state)) last_accept = i + 1;
+            }
+            if (self.anchored_end) {
+                if (last_accept) |e| {
+                    if (e == input.len) return e;
+                }
+                return null;
+            }
+            return last_accept;
+        }
+
+        /// `runFromPlain` plus an adaptive SIMD self-loop skip — the comptime peer
+        /// of `full_dfa.Dfa256.runFromSpin`. When the walk self-loops on one state
+        /// for `SPIN_TRIGGER` consecutive bytes and that state has a wide stay set,
+        /// `pf.runEnd` bulk-consumes the maximal run of stay bytes in one vector
+        /// scan instead of one table lookup per byte. Byte-identical to
+        /// `runFromPlain` (short runs never touch SIMD), so the `Pattern`⇄`Regex`
+        /// differential still holds; cost on long self-loop inputs (`.*`/`[^x]*`/
+        /// base64) drops from O(run) to one memory-bandwidth scan. Out-of-line
+        /// (not `inline`) like the runtime, so no-spin patterns keep tight codegen.
+        fn runFromSpin(self: *const Self, input: []const u8, start_pos: usize) ?usize {
+            var state: u16 = self.start;
+            var last_accept: ?usize = if (self.isAccepting(state)) start_pos else null;
+            var i: usize = start_pos;
+            var spin: usize = 0;
+            while (i < input.len) {
+                const cls = self.class_of[input[i]];
+                const next: u16 = self.transitions[state][cls];
+                if (next == DEAD) break;
+                if (next == state) {
+                    spin += 1;
+                    if (spin == SPIN_TRIGGER) {
+                        const si = self.stay_idx[state];
+                        if (si != SPIN_NONE) {
+                            // Every byte of the run keeps `state`; if `state`
+                            // accepts, the greedy end advances to the run end.
+                            const re = pf.runEnd(&self.stay_sets[si], input, i);
+                            if (self.isAccepting(state)) last_accept = re;
+                            i = re;
+                            spin = 0;
+                            continue;
+                        }
+                        // No skip set: let `spin` grow past the trigger so it
+                        // never re-fires for this run (hot path: one add + cmp).
+                    }
+                    if (self.isAccepting(state)) last_accept = i + 1;
+                    i += 1;
+                } else {
+                    spin = 0;
+                    state = next;
+                    if (self.isAccepting(state)) last_accept = i + 1;
+                    i += 1;
+                }
             }
             if (self.anchored_end) {
                 if (last_accept) |e| {

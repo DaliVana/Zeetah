@@ -72,7 +72,17 @@ pub const DupWord = struct {
 };
 
 /// Recognise the exact `(\b CLASS+ \b) SEP \1` HIR shape; else null.
+/// Runtime alias over the heap HIR — every existing caller is unchanged.
 pub fn build(h: *const H) ?DupWord {
+    return buildAt(null, h);
+}
+
+/// `build`, generic over the HIR store cap, so the comptime `Pattern` path can
+/// recognise the shape over its baked `Hir(N)` exactly as the runtime does over
+/// `Hir(null)`. The body touches only `h.root`/`h.node`/`h.setBitmap` and the
+/// pure `cc.*` predicates, all identical across stores, and returns a
+/// HIR-free `DupWord` value (two bitmaps + a group id) — fully comptime-bakeable.
+pub fn buildAt(comptime cap: ?usize, h: *const hir.Hir(cap)) ?DupWord {
     if (h.root == hir.none) return null;
     if (h.anchored_start or h.anchored_end) return null; // keep it simple/sound
 

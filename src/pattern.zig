@@ -26,6 +26,7 @@ const backtrack = @import("exec/backtrack.zig");
 const seek_mod = @import("exec/seek.zig");
 const class_span = @import("exec/class_span.zig");
 const delegate = @import("exec/delegate.zig");
+const dupword = @import("exec/dupword.zig");
 
 const Match = @import("match.zig").Match;
 const Group = @import("match.zig").Group;
@@ -119,6 +120,20 @@ fn compressTo(comptime T: type, comptime m: full_dfa.Dfa256) T {
     t.start_pf = pf.Prefilter.fromBitset(&m.start_byte_set);
     t.required = m.required;
     t.req_lit = m.req_lit;
+    // Adaptive spin-skip metadata (the SIMD self-loop accelerator). State
+    // numbering is preserved 1:1 above, so `stay_idx` carries over per-state;
+    // `stay_sets` copies whole (the `[SPIN_MAX][32]u8` type-match with `Dfa256`
+    // is the guard that the two SPIN_MAX stay in sync). This is what gives the
+    // comptime DFA scanner the same `.*`/`\d+`/`[^x]*` long-run skip the runtime
+    // `full_dfa.runFromSpin` has — closing the comptime-vs-runtime DFA gap.
+    t.has_spin = m.has_spin and !SPIN_FORCE_OFF;
+    t.stay_sets = m.stay_sets;
+    {
+        var s: usize = 0;
+        while (s < T.NumStates) : (s += 1) {
+            t.stay_idx[s] = if (s < m.n_states) m.stay_idx[s] else comptime_dfa.SPIN_NONE;
+        }
+    }
     return t;
 }
 
@@ -169,6 +184,19 @@ const MAX_DFA: usize = 256;
 /// Master toggle. Flip to `false` to A/B the dispatch against the plain
 /// source-order whole-root walk in an otherwise identical build.
 const ALT_DISPATCH_ENABLED = true;
+
+/// A/B knob for the comptime DFA spin-skip (Fix 1). Flip to `true` to force the
+/// comptime DFA back onto the pure scalar `runFromPlain` in an otherwise
+/// identical build, isolating the SIMD self-loop accelerator's contribution.
+const SPIN_FORCE_OFF = false;
+
+/// A/B knob for the comptime `.dup_word` fast path (Fix 2). Flip to `false` to
+/// route `(\b CLASS+ \b) SEP \1` back to the generic tree backtracker.
+const DUP_WORD_ENABLED = true;
+
+/// A/B knob for the comptime backtracker line-start enumeration (Fix 3). Flip to
+/// `false` to scan every position for `(?m)^…` backtrack patterns instead.
+const LINE_SCAN_ENABLED = true;
 
 /// Widest top-level alternation the dispatch handles (one `AltMask` bit per
 /// branch). Wider alternations fall back to the whole-root walk.
@@ -242,7 +270,7 @@ const Outcome = enum { ok, unsupported, exploded, invalid };
 /// §6/(c) monomorphization: which planner strategy the baked matcher emits.
 /// `.literal` skips the DFA table entirely (Teddy only); the other three bake
 /// the DFA and differ only in the per-position prefilter wrapped around it.
-const Strat = enum { literal, reverse_suffix, lit_prefix, dfa, backtrack, edge_look, boundary_lits, line_dfa, rev_end };
+const Strat = enum { literal, reverse_suffix, lit_prefix, dfa, backtrack, edge_look, boundary_lits, line_dfa, rev_end, dup_word };
 
 /// Search mode for the baked-DFA matcher (everything except `.literal`). A
 /// comptime constant, so the `switch (mode)` in each method folds to the one
@@ -277,6 +305,10 @@ const Built = struct {
     /// the Aho-Corasick automaton is rebuilt + node-trimmed in `Pattern` (not
     /// stored here) so `Built` stays small. Empty (`n == 0`) for other strats.
     bl: seq_extract.BoundaryLits = .{},
+    /// `.dup_word` arm: the baked adjacent-duplicate-word recogniser (two
+    /// bitmaps + group id). Default is the never-matching zero descriptor for
+    /// every other strat (it is read only on the `.dup_word` arm).
+    dw: dupword.DupWord = .{ .class = [_]u8{0} ** 32, .sep = [_]u8{0} ** 32, .group = 0 },
     /// `.backtrack` arm: a regular over-approximation DFA used as the seek
     /// prefilter (skip proven-dead prefixes). Built at comptime by the SAME
     /// zero-allocator `full_dfa.compute` the regular arm uses, over a relaxed
@@ -302,6 +334,12 @@ const Built = struct {
     /// non-nullable leading-byte set (per-line reject filter), `null` if none.
     line_has_dollar: bool = false,
     line_first: ?[32]u8 = null,
+    /// `.backtrack` arm: the pattern is leading-line-anchored (`(?m)^…`, i.e.
+    /// `props.bounds.start == .line`) but did NOT qualify for the regular
+    /// `.line_dfa` fast path (e.g. its body can match `\n`, or an alt+`$`
+    /// priority-cut), so the backtracker enumerates line starts (using
+    /// `line_first` as the per-line reject filter) instead of scanning every byte.
+    line_anchor: bool = false,
     /// `.rev_end` arm: `dfa` holds the REVERSE body DFA (`full_dfa.computeReverse`)
     /// of an unanchored reverse end-anchored pattern (`(?m)<class>+$` /
     /// `<class>+\Z`, no captures). `rev_end_kind` selects the end-boundary driver
@@ -613,6 +651,29 @@ fn buildAll(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) 
         }
     }
 
+    // Adjacent-duplicate-word fast path (comptime peer of the runtime
+    // `.dup_word`): the `(\b CLASS+ \b) SEP \1` backref shape (the `backref_word`
+    // workload) reduces to ONE O(n) forward scan — find a maximal word-class run,
+    // then a separator + a byte-identical copy — instead of the tree backtracker's
+    // O(n·tokenlen) per-position restart. Checked BEFORE the backtracker fallback
+    // (the backref + `\b` looks would otherwise route there via `requires_backtracking`).
+    // `ng == 1` by construction (the one captured, back-referenced token);
+    // `dupword.buildAt` is zero-alloc + comptime-eval'able and returns a HIR-free
+    // descriptor, so nothing of the HIR is baked for this arm.
+    if (DUP_WORD_ENABLED and ng == 1) {
+        if (dupword.buildAt(HIR_CAP, &h)) |dw| {
+            return .{
+                .dfa = full_dfa.emptyDfa256(.ok),
+                .outcome = .ok,
+                .strat = .dup_word,
+                .hir = h,
+                .n_groups = ng,
+                .gnames = gnames,
+                .dw = dw,
+            };
+        }
+    }
+
     if (props.requires_backtracking or props.has_look) {
         // Comptime seek prefilter: a regular OVER-APPROXIMATION DFA (built by
         // `overApproxDfa` below — see its doc for the soundness/guards). When
@@ -626,6 +687,11 @@ fn buildAll(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) 
             .hir = h,
             .n_groups = ng,
             .gnames = gnames,
+            // Leading-line-anchored `(?m)^…` that fell through to the backtracker
+            // (its body can match `\n`, or it has an alt+`$` priority-cut, so the
+            // regular `.line_dfa` arm above rejected it): enumerate line starts.
+            .line_anchor = props.bounds.start == .line,
+            .line_first = props.line_first,
         };
         if (overApproxDfa(&h)) |od| {
             built.seek_dfa = od;
@@ -1051,6 +1117,12 @@ fn CaptureSupport(comptime built: Built) type {
                     return slotsToCaps(input, slots[0..nslots]);
                 // mis-gated (should not happen for op_ok); fall through to bt.
             }
+            // NOTE: this capture fallback intentionally does NOT enable the
+            // line-start enumeration (`bt.line_anchor`) the whole-match
+            // `nextSpanFrom` uses — a capturing `(?m)^(…)$` backtrack pattern
+            // fills slots via the per-position scan here (correct, just not
+            // line-accelerated). Captures on such a shape are rare and the
+            // whole-match find/count path (the benchmarked one) is accelerated.
             var bt = BT.init(&cap_h, cap_h.anchored_start, cap_h.anchored_end, NG, capSeekPtr(), null);
             bt.alt_disp = capAltDispPtr();
             const sp = (bt.runFrom(input, from, slots[0..nslots]) catch return null) orelse return null;
@@ -1201,6 +1273,10 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             inline fn altDispPtr() ?*const backtrack.AltDispatch {
                 return if (alt_info.n > 0) &alt_disp_val else null;
             }
+            /// Engagement proof for the line-start enumeration (Fix 3): true ⇒
+            /// this `(?m)^…` backtrack pattern enumerates line starts instead of
+            /// scanning every byte. Differential tests assert this.
+            pub const line_anchor_scan: bool = LINE_SCAN_ENABLED and built.line_anchor;
             /// Comptime "seek" prefilter, baked from the HIR and threaded INTO
             /// the backtracker (`BT.init`'s `seek` arg) so `run`'s own scan loop
             /// applies it at *every* step — skipping interior dead regions, not
@@ -1326,6 +1402,10 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             pub fn nextSpanFrom(input: []const u8, from: usize) ?search.Span {
                 var bt = BT.init(&h, a_start, a_end, n_groups, seekPtr(), delPtr());
                 bt.alt_disp = altDispPtr();
+                if (LINE_SCAN_ENABLED and built.line_anchor) {
+                    bt.line_anchor = true;
+                    bt.line_first = built.line_first;
+                }
                 var slots: [2 * (hir.MAX_GROUPS + 1)]i32 = undefined;
                 const sp = (bt.runFrom(input, from, slots[0 .. 2 * (n_groups + 1)]) catch return null) orelse return null;
                 return .{ .start = sp.start, .end = sp.end };
@@ -1425,6 +1505,55 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             pub const find = V.find;
             pub const count = V.count;
             pub const findAll = V.findAll;
+        };
+    }
+
+    // Adjacent-duplicate-word fast path (comptime peer of runtime `.dup_word`):
+    // the baked `DupWord` recogniser scans `(\b CLASS+ \b) SEP \1` in ONE O(n)
+    // forward pass (the `\b` brackets force a unique token length ⇒ no quantifier
+    // backtracking). `has_dfa = false`; `dup_word_group` (the back-referenced
+    // group id) is the engagement proof, like `bt_node_count`/`ac_node_count`.
+    // find/count (what the `backref_word` workload measures) take the fast
+    // `dw.find`; the capture verbs route through `CaptureSupport`'s backtracker
+    // (the pattern is non-regular — the one-pass DFA can't build), correct but
+    // not the hot path.
+    if (built.strat == .dup_word) {
+        const dw = built.dw;
+        return struct {
+            pub const has_dfa = false;
+            /// Engagement proof: the back-referenced group id (≥ 1 by routing).
+            pub const dup_word_group: u32 = dw.group;
+            const dwm = dw;
+
+            /// Next leftmost span at/after absolute `from` — one O(n) forward
+            /// scan over the FULL input (absolute coords), so the `\b` checks
+            /// see true context exactly like the runtime engine.
+            pub fn nextSpanFrom(input: []const u8, from: usize) ?search.Span {
+                const sp = dwm.find(input, from) orelse return null;
+                return .{ .start = sp.start, .end = sp.end };
+            }
+
+            // Lazy + eager whole-match verbs over `nextSpanFrom`.
+            const V = WholeMatchVerbs(nextSpanFrom);
+            pub const Iterator = V.Iterator;
+            pub const iterator = V.iterator;
+            pub const startsWith = V.startsWith;
+            pub const SplitIterator = V.SplitIterator;
+            pub const splitIterator = V.splitIterator;
+            pub const isMatch = V.isMatch;
+            pub const find = V.find;
+            pub const count = V.count;
+            pub const findAll = V.findAll;
+
+            // Captures via the shared support (backtracker slot-fill — correct
+            // for the backref; find/count above stay on the fast recogniser).
+            const C = CaptureSupport(built);
+            pub const Captures = C.Caps;
+            pub const captures = C.captures;
+            pub const capturesFrom = C.capturesFrom;
+            pub const capturesAll = C.capturesAll;
+            pub const CapturesIterator = C.CapturesIterator;
+            pub const capturesIterator = C.capturesIterator;
         };
     }
 

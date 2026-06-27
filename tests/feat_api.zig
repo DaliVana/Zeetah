@@ -313,6 +313,55 @@ test "comptime Pattern <-> runtime Regex agree across the supported subset" {
     try crAgree("abc.*$");
 }
 
+// The comptime DFA SIMD spin-skip (`comptime_dfa.runFromSpin`) only fires after
+// SPIN_TRIGGER (64) consecutive self-loop bytes, so the `crAgree` corpus (≤13 B
+// inputs) never exercises it. This pins the spin path to the runtime `Regex`
+// over LONG wide-self-loop runs straddling the trigger (lengths 1/63/64/65/200
+// around it) — find/isMatch/count, so the greedy `last_accept = runEnd` and the
+// resume convention are both checked at speed.
+fn spinAgree(comptime p: []const u8, in: []const u8) !void {
+    const a = std.testing.allocator;
+    const P = regex.Pattern(p, .{});
+    comptime std.debug.assert(P.has_dfa);
+    var rx = try Regex.compile(a, p);
+    defer rx.deinit();
+    try std.testing.expectEqual(try rx.isMatch(in), P.isMatch(in));
+    const pm = P.find(in);
+    var rm = try rx.find(in);
+    defer if (rm) |*x| x.deinit(a);
+    try std.testing.expectEqual(rm == null, pm == null);
+    if (pm) |pmm| {
+        try std.testing.expectEqual(rm.?.start, pmm.start);
+        try std.testing.expectEqual(rm.?.end, pmm.end);
+    }
+    try std.testing.expectEqual(try rx.count(in), P.count(in));
+    const pall = try P.findAll(a, in);
+    defer a.free(pall);
+    const rall = try rx.findAll(a, in);
+    defer a.free(rall);
+    try std.testing.expectEqual(rall.len, pall.len);
+    for (pall, rall) |pa, ra| {
+        try std.testing.expectEqual(ra.start, pa.start);
+        try std.testing.expectEqual(ra.end, pa.end);
+    }
+}
+
+test "comptime DFA spin-skip: long wide-self-loop runs straddle SPIN_TRIGGER, parity with runtime" {
+    // `.*X` / `[^"]*"` / `<[^>]+>` / base64 — wide self-loop states (`has_spin`).
+    inline for (.{ 1, 62, 63, 64, 65, 66, 130, 200 }) |n| {
+        try spinAgree(".*x", "a" ** n ++ "x" ++ "tail");
+        try spinAgree(".*x", "a" ** n); // no terminator → run to EOI, no match
+        try spinAgree("\"[^\"]*\"", "\"" ++ "b" ** n ++ "\" rest");
+        try spinAgree("<[^>]+>", "<" ++ "c" ** n ++ "> after");
+        try spinAgree("[A-Za-z0-9+/]+=*", "Zm9v" ** n ++ "== next"); // base64-ish
+        try spinAgree(".*=.*", "k" ** n ++ "=" ++ "v" ** n); // two long runs
+    }
+    // Multiple matches over a long input — exercises the spin path under
+    // `findAll`/`count` non-overlapping resume.
+    try spinAgree("<[^>]+>", "<" ++ "a" ** 100 ++ "> mid <" ++ "b" ** 100 ++ "> end");
+    try spinAgree(".*x", ("y" ** 80 ++ "x\n") ** 4);
+}
+
 // Non-regular tier differential: backref / lookaround / atomic / possessive /
 // lazy-anchored patterns route to the comptime-baked tree backtracker
 // (`has_dfa == false`, no DFA table — Steps 1-3 of the comptime-backtracker
@@ -376,6 +425,93 @@ test "comptime Pattern <-> runtime Regex agree: non-regular (tree backtracker) t
     // routes to the tree backtracker (the DFA accept-cut can't model it).
     try btAgree("a*?$", "aaa");
     try btAgree(".*?b$", "aabxb");
+}
+
+// Comptime `.dup_word` arm (peer of the runtime `dup_word` engine): the
+// `(\b CLASS+ \b) SEP \1` adjacent-duplicate-word shape routes to the O(n)
+// recogniser instead of the tree backtracker. `dup_word_group` (the back-
+// referenced group id) proves THIS arm engaged. find/count/findAll AND the
+// captured group span are pinned to the runtime `Regex`.
+fn dupWordAgree(comptime p: []const u8, in: []const u8) !void {
+    const a = std.testing.allocator;
+    const P = regex.Pattern(p, .{});
+    comptime std.debug.assert(!P.has_dfa);
+    comptime std.debug.assert(@hasDecl(P, "dup_word_group")); // dup_word arm engaged
+    comptime std.debug.assert(P.dup_word_group >= 1);
+    var rx = try Regex.compile(a, p);
+    defer rx.deinit();
+
+    try std.testing.expectEqual(try rx.isMatch(in), P.isMatch(in));
+    try std.testing.expectEqual(try rx.count(in), P.count(in));
+    const pall = try P.findAll(a, in);
+    defer a.free(pall);
+    const rall = try rx.findAll(a, in);
+    defer a.free(rall);
+    try std.testing.expectEqual(rall.len, pall.len);
+    for (pall, rall) |pm, rm| {
+        try std.testing.expectEqual(rm.start, pm.start);
+        try std.testing.expectEqual(rm.end, pm.end);
+    }
+    const pc = P.captures(in);
+    var rc = try rx.captures(a, in);
+    defer if (rc) |*x| x.deinit(a);
+    try std.testing.expectEqual(rc == null, pc == null);
+    if (pc) |caps| {
+        try std.testing.expectEqual(rc.?.groups[1] != null, caps.get(1) != null);
+        if (rc.?.groups[1]) |rg| {
+            try std.testing.expectEqual(rg.start, caps.get(1).?.start);
+            try std.testing.expectEqual(rg.end, caps.get(1).?.end);
+        }
+    }
+}
+
+test "comptime .dup_word arm: adjacent-duplicate-word parity with runtime Regex" {
+    const p = "(\\b[A-Za-z]+\\b) \\1";
+    try dupWordAgree(p, "the the quick brown fox");
+    try dupWordAgree(p, "x the the y cat cat z");
+    try dupWordAgree(p, "no repeats in this line");
+    try dupWordAgree(p, "ab abc abc ab");
+    try dupWordAgree(p, "");
+    try dupWordAgree(p, "go go go go");
+    try dupWordAgree(p, "trailing dup dup");
+}
+
+// Comptime backtracker line-start enumeration (Fix 3): a `(?m)^…` pattern that
+// falls to the backtracker (body can match `\n`, or alt+`$`) enumerates line
+// starts instead of scanning every byte. `line_anchor_scan` proves the path
+// engaged; find/count/findAll are pinned to the runtime `Regex` over a
+// multi-line haystack.
+fn lineScanAgree(comptime p: []const u8, in: []const u8) !void {
+    const a = std.testing.allocator;
+    const P = regex.Pattern(p, .{ .multiline = true });
+    comptime std.debug.assert(!P.has_dfa); // backtrack arm
+    comptime std.debug.assert(@hasDecl(P, "line_anchor_scan"));
+    comptime std.debug.assert(P.line_anchor_scan); // line enumeration engaged
+    var rx = try Regex.compileWithFlags(a, p, .{ .multiline = true });
+    defer rx.deinit();
+
+    try std.testing.expectEqual(try rx.isMatch(in), P.isMatch(in));
+    try std.testing.expectEqual(try rx.count(in), P.count(in));
+    const pall = try P.findAll(a, in);
+    defer a.free(pall);
+    const rall = try rx.findAll(a, in);
+    defer a.free(rall);
+    try std.testing.expectEqual(rall.len, pall.len);
+    for (pall, rall) |pm, rm| {
+        try std.testing.expectEqual(rm.start, pm.start);
+        try std.testing.expectEqual(rm.end, pm.end);
+    }
+}
+
+test "comptime backtracker line-start enumeration: (?m)^…$ parity with runtime" {
+    const uk = "^[A-Za-z]{1,2}\\d{1,2}[A-Za-z]?\\s?\\d[A-Za-z]{2}$";
+    try lineScanAgree(uk, "SW1A 1AA\nnope\nEC1A1BB\n W1 2AB \nM11AE\n");
+    try lineScanAgree(uk, "no postcodes here\nat all on any line\n");
+    try lineScanAgree(uk, "");
+    try lineScanAgree(uk, "EC1A1BB");
+    const isbn = "^(?:\\d{9}[\\dXx]|\\d{13})$";
+    try lineScanAgree(isbn, "123456789X\nbad\n9780306406157\n000000000\n12345\n");
+    try lineScanAgree(isbn, "line1\nline2\nline3\n");
 }
 
 // Comptime first-byte alternation dispatch (Task A): a top-level `.alt` pattern

@@ -78,6 +78,15 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
         /// Optional comptime first-byte alternation dispatch (see `AltDispatch`;
         /// baked by `Pattern`). `null` ⇒ the root is matched whole via `m`.
         alt_disp: ?*const AltDispatch = null,
+        /// Line-anchored scan (comptime peer of runtime `bounded_bt.findLineStart`):
+        /// when set, a `(?m)^…` match can only begin at a line start, so `runFrom`
+        /// enumerates line starts (`\n` memchr) instead of every position. Baked by
+        /// `Pattern` from `props.bounds.start == .line`; `false` ⇒ per-position scan.
+        line_anchor: bool = false,
+        /// Optional one-byte reject filter for `line_anchor` mode: the body's
+        /// leading-byte set, so a non-matching line is skipped with a single byte
+        /// test before the (dominant-cost) tree walk. `null` ⇒ no filter.
+        line_first: ?[32]u8 = null,
         input: []const u8 = &.{},
         slots: [2 * (hir.MAX_GROUPS + 1)]i32 = undefined,
         match_end: usize = 0,
@@ -418,6 +427,9 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
             if (self.seek) |sd| {
                 if (sd.rejectsAnchoredEnd(input, from)) return null;
             }
+            // Line-anchored `(?m)^…`: a match can only begin at a line start, so
+            // enumerate those (one `\n` memchr per line) instead of every byte.
+            if (self.line_anchor) return self.lineStartScan(from, slots_out);
             var start: usize = from;
             while (start <= input.len) : (start += 1) {
                 // Seek: skip the proven-dead prefix where the regular
@@ -451,6 +463,53 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
                     return .{ .start = start, .end = end };
                 }
                 if (self.a_start) return null;
+            }
+            return null;
+        }
+
+        /// Line-anchored leftmost match (the `self.line_anchor` path of
+        /// `runFrom`): a `(?m)^…` match begins only at a line start, so enumerate
+        /// line starts (`\n` memchr) and try the tree walk only there — O(#lines)
+        /// attempts instead of O(n). Mirrors runtime `bounded_bt.findLineStart`:
+        /// advance to the first line start ≥ `from`, reject non-candidate lines
+        /// with the one-byte `line_first` filter, then `tryAt` at each. Absolute
+        /// coords throughout (the `^` look re-verifies the line start), so
+        /// non-overlapping iteration stays correct. Completeness: every match's
+        /// start satisfies `^` (s == 0 or `input[s-1] == '\n'`), and every such
+        /// position is visited; the body may still consume past a `\n` (a `\s`
+        /// that matches newline only affects the END, not the start).
+        fn lineStartScan(self: *Self, from: usize, slots_out: []i32) Error!?Span {
+            const input = self.input;
+            var s = from;
+            // `s == 0` short-circuits, so the right disjunct is only reached when
+            // s > 0; `s <= input.len` keeps `input[s-1]` in bounds defensively.
+            if (!(s == 0 or (s <= input.len and input[s - 1] == '\n'))) {
+                const nl = std.mem.indexOfScalarPos(u8, input, s, '\n') orelse return null;
+                s = nl + 1;
+            }
+            const live = 2 * (self.n_groups + 1);
+            while (s <= input.len) {
+                const skip = if (self.line_first) |*set|
+                    (s < input.len and !cc.hasBit(set, input[s]))
+                else
+                    false;
+                if (!skip) {
+                    @memset(self.slots[0..live], -1);
+                    self.slots[0] = @intCast(s);
+                    const top: Cont = if (self.a_end)
+                        .{ .accept_at = input.len }
+                    else
+                        .accept;
+                    if (try self.tryAt(s, &top)) {
+                        const end = if (self.a_end) input.len else self.match_end;
+                        self.slots[1] = @intCast(end);
+                        if (slots_out.len >= live)
+                            @memcpy(slots_out[0..live], self.slots[0..live]);
+                        return .{ .start = s, .end = end };
+                    }
+                }
+                const nl = std.mem.indexOfScalarPos(u8, input, s, '\n') orelse return null;
+                s = nl + 1;
             }
             return null;
         }
