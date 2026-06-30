@@ -183,8 +183,8 @@ pub const LazyProg = struct {
         ei = 0;
         while (ei < nfa.n_edges) : (ei += 1) {
             const k = nfa.e_kind[ei];
-            if (k == 2) self.has_cond = true;
-            if (k == 0) recount[nfa.e_to[ei]] += 1 else rccount[nfa.e_to[ei]] += 1;
+            if (k == .look) self.has_cond = true;
+            if (k == .eps) recount[nfa.e_to[ei]] += 1 else rccount[nfa.e_to[ei]] += 1;
         }
         acc = 0;
         s = 0;
@@ -209,7 +209,7 @@ pub const LazyProg = struct {
         ei = 0;
         while (ei < nfa.n_edges) : (ei += 1) {
             const t = nfa.e_to[ei]; // reverse: index by forward target
-            if (nfa.e_kind[ei] == 0) {
+            if (nfa.e_kind[ei] == .eps) {
                 self.reps_to[refill[t]] = nfa.e_from[ei];
                 refill[t] += 1;
             } else {
@@ -332,25 +332,6 @@ pub const LazyProg = struct {
         }
     }
 
-    /// Single-pass `$`/`\z`-anchored leftmost match (see `findLeftmostFrom`):
-    /// a match must end exactly at `input.len`, so this is a **pure reverse
-    /// reachability** pass from `input.len` back toward `from`. `P` matches a
-    /// suffix ending at `input.len` iff the reverse automaton (seeded from the
-    /// forward accept) reaches the forward start; the leftmost position where
-    /// it does is the leftmost match start. Reverse reachability is used (not
-    /// the `Σ*?` forward pass) precisely because the forward leftmost-first
-    /// accept-cut would drop a later-starting thread once an earlier thread
-    /// accepts *mid-string* — but for `$` only an accept at the very end counts,
-    /// so that thread must survive (`ab$` on `"ababab"`: the match is the *last*
-    /// `ab`, whose thread the forward cut discards). One O(n) reverse pass,
-    /// replacing the per-position `restartFrom` (O(n²) on `class+$` input).
-    ///
-    /// No flush/restart guard (unlike the forward fast path): every `rStep`
-    /// re-interns and returns a current-generation reverse-state id, and the
-    /// loop reassigns `rsid` before reading `m.rhas_start[rsid]`, so a mid-walk
-    /// reverse-memo flush is self-healing — the same idiom `reverseStart` uses.
-    /// (A `restartFrom` fallback would be pointless: it IS the per-position scan
-    /// this method exists to avoid.)
     /// Shared backward walk over the reverse memo: from `end` toward `lo`, find
     /// whether any suffix ending at `end` reaches the forward start (`exists`)
     /// and the leftmost position where it does (`start`, defaulting to `end` for
@@ -380,6 +361,14 @@ pub const LazyProg = struct {
         return out;
     }
 
+    /// Single-pass `$`/`\z`-anchored leftmost match: a match must end exactly at
+    /// `input.len`, so this is a pure reverse-reachability pass (`reverseScan`)
+    /// from `input.len` back toward `from`. Reverse — not the `Σ*?` forward pass
+    /// — because the forward leftmost-first accept-cut drops a later-starting
+    /// thread once an earlier one accepts mid-string, but for `$` only an accept
+    /// at the very end counts (`ab$` on `"ababab"`: the match is the *last* `ab`).
+    /// One O(n) pass, replacing the per-position `restartFrom` (O(n²) on
+    /// `class+$` input).
     fn findAnchoredEndFrom(self: *const LazyProg, m: *LazyMemo, input: []const u8, from: usize) !?Span {
         const r = try self.reverseScan(m, input, input.len, from);
         if (!r.exists) return null;

@@ -563,15 +563,13 @@ pub fn findLiteralOcc(input: []const u8, from: usize, lit: []const u8, probe: u8
 // strategies consume; the SIMD Teddy kernel must keep matching this
 // scalar-verified baseline.
 
-/// 16-byte table lookup (one instruction): `out[k] = table[idx[k] & 0x0F]`
-/// for our nibble indices (0..15) — PSHUFB on x86_64 SSSE3, TBL on aarch64
-/// NEON. Both zero a lane whose index has bit7 set / is >=16; our indices are
-/// nibbles so the two are bit-identical. Arch is selected by a *comptime*
-/// switch, so only the target's prong is analysed/emitted (no per-target
-/// runtime branch; non-shuffle targets never reference this).
-/// One-instruction byte shuffle `out[k] = table[idx[k] & 0x0F]` (our indices
-/// are nibbles). Width = `TW` (16 baseline, 32 on AVX2). The arch/feature
-/// branch is a *comptime* switch — only the target's prong is analysed/emitted.
+/// One-instruction byte shuffle `out[k] = table[idx[k] & 0x0F]` (our indices are
+/// nibbles, 0..15) — PSHUFB on x86_64 (SSSE3, or `vpshufb` under AVX2), TBL on
+/// aarch64 NEON. Both zero a lane whose index has bit7 set / is ≥16, and since
+/// our indices are nibbles the two are bit-identical. Width = `TW` (16 baseline,
+/// 32 on AVX2). Arch/feature is selected by a *comptime* switch, so only the
+/// target's prong is analysed/emitted (no per-target runtime branch; non-shuffle
+/// targets never reference this).
 const shuf = switch (builtin.cpu.arch) {
     .aarch64 => struct {
         inline fn f(table: VT, idx: VT) VT {

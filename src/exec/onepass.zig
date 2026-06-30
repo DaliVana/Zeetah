@@ -14,9 +14,9 @@
 //! "lane" (the table already collapsed equivalent NFA sets, so the test is
 //! whether the raw subset never produced a multi-NFA-state DFA state — which
 //! the minimized table reflects as: no state both accepts and continues into
-//! a distinct accepting lineage). We use the conservative, sound proxy:
-//! `n_states` grew linearly with `min_len` is NOT reliable, so detection is
-//! kept structural and pure over the DFA shape.
+//! a distinct accepting lineage). Detection is structural and pure over the DFA
+//! shape — no `min_len` / state-count heuristics (an earlier idea, dropped as
+//! unreliable).
 
 const std = @import("std");
 const common = @import("../common.zig");
@@ -33,7 +33,7 @@ pub const Span = search.Span;
 /// that forces the engine to keep more than one hypothesis alive). False
 /// negatives are fine (we just don't take the fast path); never a false
 /// positive (which would risk a wrong capture later).
-pub fn isOnePass(d: *const full_dfa.Dfa256) bool {
+pub fn dfaMatchIsOnePass(d: *const full_dfa.Dfa256) bool {
     if (d.outcome != .ok) return false;
     var s: usize = 0;
     while (s < d.n_states) : (s += 1) {
@@ -55,7 +55,7 @@ pub fn isOnePass(d: *const full_dfa.Dfa256) bool {
 const hasBit = common.hasBit;
 
 /// Sound one-pass test over the **NFA** — the correct gate for the capture
-/// fast path (unlike `isOnePass`, which is a DFA-shape *match* signal and
+/// fast path (unlike `dfaMatchIsOnePass`, which is a DFA-shape *match* signal and
 /// e.g. accepts `x(\w+)y`, which is NOT capture-one-pass because `\w` and the
 /// literal `y` overlap so greedy `\w+` must backtrack off the final `y`).
 ///
@@ -65,7 +65,7 @@ const hasBit = common.hasBit;
 /// continue two ways ⇒ more than one live thread ⇒ `fill`'s single
 /// deterministic choice could diverge from leftmost-greedy). Conservative:
 /// false ⇒ just use `bounded_bt`; true ⇒ `fill` is exact.
-pub fn isOnePassNfa(comptime cap: ?usize, nfa: *const thompson.Nfa(cap)) bool {
+pub fn isCaptureOnePass(comptime cap: ?usize, nfa: *const thompson.Nfa(cap)) bool {
     @setEvalBranchQuota(8_000_000); // comptime callers (pattern.zig) recurse deeply
     var s: usize = 0;
     while (s < nfa.n_states) : (s += 1) {
@@ -83,9 +83,9 @@ fn closureOk(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), st: u16, seen:
     while (ei < nfa.n_edges) : (ei += 1) {
         if (nfa.e_from[ei] != st) continue;
         switch (nfa.e_kind[ei]) {
-            0 => if (!closureOk(cap, nfa, nfa.e_to[ei], seen, acc)) return false,
-            2 => return false, // look edge: not a capture-one-pass pattern
-            else => {
+            .eps => if (!closureOk(cap, nfa, nfa.e_to[ei], seen, acc)) return false,
+            .look => return false, // look edge: not a capture-one-pass pattern
+            .consume => {
                 const set = &nfa.sets[nfa.e_set[ei]];
                 var w: usize = 0;
                 while (w < 32) : (w += 1) {
@@ -102,9 +102,9 @@ const Step = union(enum) { matched, fail, consume: u16 };
 
 /// One-pass capture reconstruction over the Thompson NFA.
 ///
-/// Precondition (the caller's gate): `isOnePass(dfa)` is true and the pattern
-/// is look/backref-free (capture patterns with look/backref route to other
-/// engines). The span is supplied by the *DFA* (`Regex.find`, O(n)) — we do
+/// Precondition (the caller's gate): `isCaptureOnePass(nfa)` is true and the
+/// pattern is look/backref-free (capture patterns with look/backref route to
+/// other engines). The span is supplied by the *DFA* (`Regex.find`, O(n)) — we do
 /// **not** re-search for it like `bounded_bt` does. `slots` is caller-sized to
 /// `2*(n_groups+1)` with `slots[0..2]` preset to the span and the rest `-1`.
 ///
@@ -183,7 +183,7 @@ fn epsWalk(
     while (k < idx.off[st + 1]) : (k += 1) {
         const ei: usize = idx.order[k];
         switch (nfa.e_kind[ei]) {
-            0 => {
+            .eps => {
                 const slot = nfa.e_slot[ei];
                 var old: i32 = -1;
                 if (slot >= 0) {
@@ -194,8 +194,8 @@ fn epsWalk(
                 if (r != .fail) return r; // chosen path: keep the saves
                 if (slot >= 0) slots[@intCast(slot)] = old; // dead branch: undo
             },
-            2 => return .fail, // look in a capture pattern: not routed here
-            else => if (pos < end and hasBit(&nfa.sets[nfa.e_set[ei]], input[pos]))
+            .look => return .fail, // look in a capture pattern: not routed here
+            .consume => if (pos < end and hasBit(&nfa.sets[nfa.e_set[ei]], input[pos]))
                 return .{ .consume = nfa.e_to[ei] }, // priority-first consume
         }
     }
@@ -215,7 +215,7 @@ test "onepass: detector is sound (signal only, never affects matching)" {
         try parser.parse(null, &h, a, p, .{});
         var nfa = try thompson.build(null, &h);
         const d = full_dfa.compute(null, &nfa, h.anchored_start, h.anchored_end);
-        try std.testing.expect(isOnePass(&d));
+        try std.testing.expect(dfaMatchIsOnePass(&d));
     }
 
     // Whatever the verdict for a trickier pattern, it must never change what
@@ -226,12 +226,12 @@ test "onepass: detector is sound (signal only, never affects matching)" {
         try parser.parse(null, &h, a, p, .{});
         var nfa = try thompson.build(null, &h);
         const d = full_dfa.compute(null, &nfa, h.anchored_start, h.anchored_end);
-        _ = isOnePass(&d); // sound by construction; just exercise it
+        _ = dfaMatchIsOnePass(&d); // sound by construction; just exercise it
         try std.testing.expect(core.isMatch(&d, "abc") or !core.isMatch(&d, "abc"));
     }
 }
 
-test "onepass: isOnePassNfa accepts deterministic, rejects overlap/ambiguous" {
+test "onepass: isCaptureOnePass accepts deterministic, rejects overlap/ambiguous" {
     const hir = @import("../hir.zig");
     const parser = @import("../parser.zig");
     const a = std.testing.allocator;
@@ -253,7 +253,7 @@ test "onepass: isOnePassNfa accepts deterministic, rejects overlap/ambiguous" {
         defer h.deinit(a);
         parser.parse(null, &h, a, c.p, .{}) catch continue;
         var nfa = try thompson.build(null, &h);
-        try std.testing.expectEqual(c.want, isOnePassNfa(null, &nfa));
+        try std.testing.expectEqual(c.want, isCaptureOnePass(null, &nfa));
     }
 }
 
@@ -284,7 +284,7 @@ test "onepass: fill captures are byte-identical to bounded_bt (soundness gate)" 
         parser.parse(null, &h, a, p, .{}) catch continue;
         var nfa = try thompson.build(null, &h);
         const d = full_dfa.compute(null, &nfa, h.anchored_start, h.anchored_end);
-        if (d.outcome != .ok or !isOnePassNfa(null, &nfa)) continue;
+        if (d.outcome != .ok or !isCaptureOnePass(null, &nfa)) continue;
 
         for (ins) |in| {
             // Reference: bounded_bt (its own findLeftmost + trace recon).
@@ -303,7 +303,7 @@ test "onepass: fill captures are byte-identical to bounded_bt (soundness gate)" 
                 @memset(got[0..], -1);
                 got[0] = @intCast(sp.start);
                 got[1] = @intCast(sp.end);
-                // isOnePassNfa(true) ⇒ fill MUST resolve deterministically.
+                // isCaptureOnePass(true) ⇒ fill MUST resolve deterministically.
                 try std.testing.expect(fill(null, &nfa, in, .{ .start = sp.start, .end = sp.end }, got[0..]));
                 try std.testing.expectEqualSlices(i32, ref[0..bounded_bt.MAX_SLOTS], got[0..bounded_bt.MAX_SLOTS]);
             }

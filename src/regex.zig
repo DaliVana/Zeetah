@@ -258,7 +258,7 @@ pub const Regex = struct {
     /// O(1) edge check applied to each candidate end (see `exec/edge_look.zig`).
     el_spec: edge_look.Spec = .{ .set = [_]u8{0} ** 32, .behind = false, .neg = false },
     /// Captures fast path: when the pattern is one-pass (decided at compile by
-    /// the pure `onepass.isOnePass` over the DFA), `captures()` resolves slots
+    /// the pure `onepass.dfaMatchIsOnePass` over the DFA), `captures()` resolves slots
     /// via a single allocation-free deterministic forward pass instead of the
     /// `bounded_bt` memoized double-search. Pure speed — `bounded_bt` is the
     /// always-correct fallback if the deterministic walk bails.
@@ -354,7 +354,7 @@ pub const Regex = struct {
         // returns — here the O(n) dense/lazy single pass. Without this, the
         // `$`-reroute would silently demote `([0-9]+)$` / `(cat|dog)$` / `(\w+)$`
         // captures to the slower bounded backtracker. `capturesFrom` gates on it.
-        const op_onepass = ng > 0 and onepass.isOnePassNfa(null, build_nfa);
+        const op_onepass = ng > 0 and onepass.isCaptureOnePass(null, build_nfa);
 
         // Materialise via a temporary LazyProg (only its CSR/oracle is
         // needed to freeze; the DenseSearch is self-contained afterwards).
@@ -737,7 +737,7 @@ pub const Regex = struct {
         // One-pass capture gate: a one-pass pattern with groups reconstructs
         // slots in a single allocation-free forward pass (`nfa` retained because
         // `need_nfa = needs_captures or has_look`).
-        const op_ok = props.needs_captures and onepass.isOnePassNfa(null, nfa);
+        const op_ok = props.needs_captures and onepass.isCaptureOnePass(null, nfa);
         var self = Regex{
             .allocator = allocator,
             .pattern = owned,

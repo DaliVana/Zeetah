@@ -907,7 +907,7 @@ fn CaptureSupport(comptime built: Built) type {
 
     // ── One-pass capture fast path (mirrors the runtime `op_onepass`) ──
     // For a REGULAR capture pattern that is "one-pass" (deterministic ε-closure,
-    // no overlapping consumes — `onepass.isOnePassNfa`), captures can be filled
+    // no overlapping consumes — `onepass.isCaptureOnePass`), captures can be filled
     // by a single O(n·m) deterministic NFA walk with NO backtracking and NO step
     // budget — exactly how the runtime avoids the tree-backtracker for these. The
     // tree backtracker is budget-bounded and, on a `(.*)`-over-long-line pattern
@@ -924,7 +924,7 @@ fn CaptureSupport(comptime built: Built) type {
         break :blk .{ .nfa = n, .ok = true };
     };
     const op_nfa = op_built.nfa;
-    const op_ok: bool = comptime (NG > 0 and op_built.ok and onepass.isOnePassNfa(NN, &op_nfa));
+    const op_ok: bool = comptime (NG > 0 and op_built.ok and onepass.isCaptureOnePass(NN, &op_nfa));
     const op_dfa: full_dfa.Dfa256 = if (op_ok) comptime blk: {
         var n = op_nfa;
         break :blk full_dfa.compute(NN, &n, baked.anchored_start, baked.anchored_end);

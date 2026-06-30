@@ -77,9 +77,28 @@ guard for the refactors.
   and `prefilter.inSet` stay `pub` re-exports), and the 5 structural `Span` redeclarations now alias the
   canonical `search.Span`. Pure dedup, bit math + layout unchanged.
 
-**Still open:** only #3 run-loop merge remains, and it is closed-by-decision — the merge was attempted and
-reverted (measured ~5–12% regression on `bench-tokenizer`), so it stays as documented, differential-tested
-duplication rather than a pending task. Every other top-priority item is actioned.
+**Still open (top priorities):** only #3 run-loop merge remains, and it is closed-by-decision — the merge
+was attempted and reverted (measured ~5–12% regression on `bench-tokenizer`), so it stays as documented,
+differential-tested duplication rather than a pending task. Every other top-priority item is actioned.
+
+**Review-body findings (Readability / Maintainability sections) — actioned**
+- ✅ **EdgeKind enum (type-safety)** — the bare-`u8` edge-kind protocol (`0=eps/1=consume/2=look`) baked
+  into `thompson.Nfa` became `pub const EdgeKind = enum(u8) { eps, consume, look }` (tags unchanged ⇒
+  byte-identical baked representation). All 16 sites across thompson/dfa_build/onepass/full_dfa/lazy_dfa/
+  bounded_bt updated, and the two `onepass` closure `switch`es lost their `else`-catches-`.consume` arm —
+  a future 4th kind is now a compile error, not a silent misclassification. The field-type change made the
+  compiler enumerate every read site (no manual hunt).
+- ✅ **Confusable one-pass predicate names** — `isOnePass`→`dfaMatchIsOnePass` (DFA-shape *match* signal)
+  and `isOnePassNfa`→`isCaptureOnePass` (capture-correctness gate); mixing them silently corrupts captures.
+  This also fixed a latent inaccuracy: `onepass.fill`'s precondition doc cited `isOnePass(dfa)` but the
+  real caller gate is the NFA capture test (now correctly `isCaptureOnePass(nfa)`).
+- ✅ **Doc/code drift cleared (5 blocks)** — `onepass` module header (abandoned `min_len`/state-count
+  proxy reasoning), `lazy_dfa.reverseScan` (stale block describing the higher-level anchored-end match →
+  moved onto `findAnchoredEndFrom`), `full_dfa` (the `runFrom` contract block sat above `step` → swapped),
+  `seq_extract.leadingLookbehindSet` (block describing `requiredLeadingLookbehindByte` → relocated onto it,
+  which had no doc), and `prefilter.shuf` (two stacked, partly-contradicting blocks → merged).
+
+All of the above validated under `zig build test` (Debug) and `-Doptimize=ReleaseSafe`.
 
 ## Executive summary
 

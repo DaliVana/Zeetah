@@ -87,7 +87,7 @@ pub fn buildForwardCsr(
     var ccount = [_]usize{0} ** MAX_NFA;
     var ei: usize = 0;
     while (ei < nfa.n_edges) : (ei += 1) {
-        if (nfa.e_kind[ei] == 0) ecount[nfa.e_from[ei]] += 1 else ccount[nfa.e_from[ei]] += 1;
+        if (nfa.e_kind[ei] == .eps) ecount[nfa.e_from[ei]] += 1 else ccount[nfa.e_from[ei]] += 1;
     }
     var acc: usize = 0;
     var s: usize = 0;
@@ -112,7 +112,7 @@ pub fn buildForwardCsr(
     ei = 0;
     while (ei < nfa.n_edges) : (ei += 1) {
         const f = nfa.e_from[ei];
-        if (nfa.e_kind[ei] == 0) {
+        if (nfa.e_kind[ei] == .eps) {
             eps_to[efill[f]] = nfa.e_to[ei];
             efill[f] += 1;
         } else {

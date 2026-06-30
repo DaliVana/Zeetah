@@ -88,6 +88,14 @@ pub const Dfa256 = struct {
     stay_idx: [MAX_DFA]u8 = [_]u8{SPIN_NONE} ** MAX_DFA,
     stay_sets: [SPIN_MAX][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** SPIN_MAX,
 
+    /// Next state from `state` on byte-class `cls`. The table-access primitive
+    /// shared with the comptime `comptime_dfa.Dfa` (whose field is named
+    /// `transitions`, not `trans`) so generic walkers — e.g. `edge_look.nextFrom`
+    /// — drive either representation uniformly.
+    pub inline fn step(self: *const Dfa256, state: u16, cls: u8) u16 {
+        return self.trans[state][cls];
+    }
+
     /// Anchored leftmost-first run from `start_pos`: walk the table consuming
     /// input until the DEAD sink (state 0) or end of input, tracking the last
     /// accepting position reached (the leftmost-first end for the surviving
@@ -102,14 +110,6 @@ pub const Dfa256 = struct {
     /// `isMatch`, which previously inlined a file-private `runFrom`. Forcing
     /// inline keeps the cross-file method call zero-cost (no throughput
     /// regression on the DFA hot path).
-    /// Next state from `state` on byte-class `cls`. The table-access primitive
-    /// shared with the comptime `comptime_dfa.Dfa` (whose field is named
-    /// `transitions`, not `trans`) so generic walkers — e.g. `edge_look.nextFrom`
-    /// — drive either representation uniformly.
-    pub inline fn step(self: *const Dfa256, state: u16, cls: u8) u16 {
-        return self.trans[state][cls];
-    }
-
     pub inline fn runFrom(self: *const Dfa256, input: []const u8, start_pos: usize) ?usize {
         // One predicted branch on a `*const` bool: patterns with no wide
         // self-loop state inline the untouched scalar loop; only those that can
@@ -445,7 +445,7 @@ pub fn computeReverse(comptime cap: ?usize, nfa: *const thompson.Nfa(cap)) Dfa25
     {
         var ei: usize = 0;
         while (ei < rev.n_edges) : (ei += 1) {
-            if (rev.e_kind[ei] == 2) return emptyDfa256(.exploded);
+            if (rev.e_kind[ei] == .look) return emptyDfa256(.exploded);
             const f = rev.e_from[ei];
             rev.e_from[ei] = rev.e_to[ei];
             rev.e_to[ei] = f;

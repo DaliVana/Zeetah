@@ -42,6 +42,14 @@ pub const MAX_SETS: usize = 256;
 
 pub const Frag = struct { start: usize, accept: usize };
 
+/// Per-edge classification in the flat NFA. `.eps` = ε-transition (`e_slot` may
+/// carry a capture save); `.consume` = byte-set edge (`e_set` indexes `sets`);
+/// `.look` = zero-width look-assertion (`e_look` holds the `hir.LookKind`). The
+/// `enum(u8)` tags (0/1/2) match the historical bare-int protocol, so the baked
+/// representation is byte-identical — the win is exhaustive, compiler-checked
+/// switching instead of an `else`-catches-`.consume` arm.
+pub const EdgeKind = enum(u8) { eps, consume, look };
+
 /// Flat NFA. Field shapes mirror the old `Builder` so `full_dfa` can lift the
 /// trusted subset/minimization code unchanged. `cap == N` -> comptime (fixed
 /// arrays); `cap == null` -> runtime (heap arrays).
@@ -52,16 +60,16 @@ pub fn Nfa(comptime cap: ?usize) type {
         const Self = @This();
 
         n_states: usize = 0,
-        // kind: 0 = epsilon, 1 = byte-set (set_idx valid), 2 = look-assertion
-        // (conditional epsilon; e_look holds the `hir.LookKind`).
+        // Per-edge kind (see `EdgeKind`): .eps | .consume (e_set valid) |
+        // .look (conditional epsilon; e_look holds the `hir.LookKind`).
         e_from: [MAX_EDGES]u16 = undefined,
         e_to: [MAX_EDGES]u16 = undefined,
-        e_kind: [MAX_EDGES]u8 = undefined,
+        e_kind: [MAX_EDGES]EdgeKind = undefined,
         e_set: [MAX_EDGES]u16 = undefined,
         e_look: [MAX_EDGES]u8 = undefined,
-        // Capture save-slot for a kind-0 epsilon: -1 = ordinary epsilon,
+        // Capture save-slot for an .eps edge: -1 = ordinary epsilon,
         // >=0 = write the current position into slot `e_slot` (transparent
-        // to the DFA, which only distinguishes kind 0 vs non-0).
+        // to the DFA, which only distinguishes .eps vs non-.eps).
         e_slot: [MAX_EDGES]i32 = undefined,
         n_edges: usize = 0,
         sets: [MAX_SETS][32]u8 = undefined,
@@ -80,19 +88,19 @@ pub fn Nfa(comptime cap: ?usize) type {
             if (b.n_edges >= MAX_EDGES) return Error.TooComplex;
             b.e_from[b.n_edges] = @intCast(from);
             b.e_to[b.n_edges] = @intCast(to);
-            b.e_kind[b.n_edges] = 0;
+            b.e_kind[b.n_edges] = .eps;
             b.e_set[b.n_edges] = 0;
             b.e_slot[b.n_edges] = -1;
             b.n_edges += 1;
         }
 
-        /// A kind-0 epsilon that also records `pos` into capture slot `slot`.
-        /// Transparent to the DFA (it treats every kind-0 edge as epsilon).
+        /// An .eps epsilon that also records `pos` into capture slot `slot`.
+        /// Transparent to the DFA (it treats every .eps edge as epsilon).
         fn addSaveEps(b: *Self, from: usize, to: usize, slot: i32) Error!void {
             if (b.n_edges >= MAX_EDGES) return Error.TooComplex;
             b.e_from[b.n_edges] = @intCast(from);
             b.e_to[b.n_edges] = @intCast(to);
-            b.e_kind[b.n_edges] = 0;
+            b.e_kind[b.n_edges] = .eps;
             b.e_set[b.n_edges] = 0;
             b.e_slot[b.n_edges] = slot;
             b.n_edges += 1;
@@ -102,7 +110,7 @@ pub fn Nfa(comptime cap: ?usize) type {
             if (b.n_edges >= MAX_EDGES) return Error.TooComplex;
             b.e_from[b.n_edges] = @intCast(from);
             b.e_to[b.n_edges] = @intCast(to);
-            b.e_kind[b.n_edges] = 2;
+            b.e_kind[b.n_edges] = .look;
             b.e_look[b.n_edges] = kind;
             b.e_set[b.n_edges] = 0;
             b.e_slot[b.n_edges] = -1;
@@ -114,7 +122,7 @@ pub fn Nfa(comptime cap: ?usize) type {
             b.sets[b.n_sets] = set;
             b.e_from[b.n_edges] = @intCast(from);
             b.e_to[b.n_edges] = @intCast(to);
-            b.e_kind[b.n_edges] = 1;
+            b.e_kind[b.n_edges] = .consume;
             b.e_set[b.n_edges] = @intCast(b.n_sets);
             b.e_slot[b.n_edges] = -1;
             b.n_sets += 1;

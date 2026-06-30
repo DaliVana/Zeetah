@@ -260,9 +260,9 @@ pub const BoundedBt = struct {
             while (c < c_end) : (c += 1) {
                 const ei: usize = self.sc.edge_order[c];
                 const k = nfa.e_kind[ei];
-                if (k == 0) {
+                if (k == .eps) {
                     n = try self.pushReach(n, nfa.e_to[ei], pos);
-                } else if (k == 2) {
+                } else if (k == .look) {
                     if (cc.lookHolds(nfa.e_look[ei], input, pos))
                         n = try self.pushReach(n, nfa.e_to[ei], pos); // zero-width
                 } else if (pos < input.len and cc.hasBit(&nfa.sets[nfa.e_set[ei]], input[pos])) {
@@ -381,7 +381,7 @@ pub const BoundedBt = struct {
                 const ei: usize = self.sc.edge_order[self.sc.cap_stack[cur].ei];
                 self.sc.cap_stack[cur].ei += 1;
                 const k = nfa.e_kind[ei];
-                if (k == 0) {
+                if (k == .eps) {
                     const slot = nfa.e_slot[ei];
                     var old: i32 = -1;
                     if (slot >= 0) {
@@ -397,7 +397,7 @@ pub const BoundedBt = struct {
                     sp = try self.pushCap(sp, .{ .state = to, .pos = pos, .ei = self.sc.edge_off[to], .rslot = slot, .rold = old });
                     descended = true;
                     break;
-                } else if (k == 2) {
+                } else if (k == .look) {
                     if (cc.lookHolds(nfa.e_look[ei], input, pos)) {
                         const to = nfa.e_to[ei];
                         if (self.seen(to, pos)) continue;

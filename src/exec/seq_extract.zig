@@ -602,15 +602,6 @@ pub fn requiredLiteralBack(comptime cap: ?usize, h: *const hir.Hir(cap)) ?ReqLit
     return best;
 }
 
-/// If the pattern's leading mandatory element is a **positive single-byte
-/// lookbehind** `(?<=X)`, return `X`: every match is then immediately
-/// preceded by `X`, so the match start is exactly `X_pos + 1`. A sound
-/// *necessary* condition (the real candidate starts are a subset), so a
-/// prefilter using it can never drop a match — it just turns a
-/// near-everywhere candidate scan (`lookbehind_amount` over-approx =
-/// `[0-9]+…`) into a `memchr` for a rare byte. Only the leading spine is
-/// walked (`concat` left, `cap` through); negative / multi-byte /
-/// non-leading look-behinds and all look-aheads return `null`.
 /// Bitmap of a leading positive *single-`set`* look-behind `(?<=[…])` — the
 /// set every match start `s` must satisfy at `input[s-1]`. The single spine
 /// walk both `requiredLeadingLookbehindByte` (popcount 1 ⇒ `memchr`) and
@@ -639,6 +630,13 @@ fn popcount(bm: [32]u8) usize {
     return n;
 }
 
+/// If the pattern's leading mandatory element is a **positive single-byte
+/// look-behind** `(?<=X)`, return `X`: every match is then immediately preceded
+/// by `X`, so the match start is exactly `X_pos + 1`. A sound *necessary*
+/// condition (the real candidate starts are a subset), so a prefilter using it
+/// can never drop a match — it just turns a near-everywhere candidate scan into
+/// a `memchr` for a rare byte. (≥2 members ⇒ the set path
+/// `requiredLeadingLookbehindSet` handles it.)
 pub fn requiredLeadingLookbehindByte(comptime cap: ?usize, h: *const hir.Hir(cap)) ?u8 {
     if (h.root == hir.none) return null;
     const bm = leadingLookbehindSet(cap, h, h.root) orelse return null;
