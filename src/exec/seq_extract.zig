@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const hir = @import("../hir.zig");
+const common = @import("../common.zig");
 const pf = @import("../prefilter.zig");
 const cc = @import("charclass.zig");
 const search = @import("search.zig");
@@ -66,9 +67,7 @@ pub const Seq = struct {
     }
 };
 
-inline fn hasBit(set: *const [32]u8, c: u8) bool {
-    return (set[c >> 3] & (@as(u8, 1) << @as(u3, @intCast(c & 7)))) != 0;
-}
+const hasBit = common.hasBit;
 
 /// If `set_idx`'s bitmap has exactly one member, return that byte.
 fn singleByte(comptime cap: ?usize, h: *const hir.Hir(cap), set_idx: u32) ?u8 {

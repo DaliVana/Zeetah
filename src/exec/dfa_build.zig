@@ -12,14 +12,13 @@
 //! `Pattern`⇄`Regex` differential and the `lazy_dfa` differential test.
 
 const std = @import("std");
+const common = @import("../common.zig");
 const thompson = @import("../thompson.zig");
 
 const MAX_NFA = thompson.MAX_NFA;
 const MAX_EDGES = thompson.MAX_EDGES;
 
-inline fn hasBit(set: *const [32]u8, c: u8) bool {
-    return (set[c >> 3] & (@as(u8, 1) << @as(u3, @intCast(c & 7)))) != 0;
-}
+const hasBit = common.hasBit;
 
 /// Byte equivalence classes + per-class representative byte.
 pub const Classes = struct {

@@ -7,13 +7,12 @@
 
 const std = @import("std");
 const hir = @import("../hir.zig");
+const common = @import("../common.zig");
 
-/// 256-bit set membership over a `[32]u8` bitmap (same layout as
-/// `prefilter.inSet`; the wider duplication across the DFA modules is left
-/// out of scope of the backtracking-tier review).
-pub inline fn hasBit(set: *const [32]u8, c: u8) bool {
-    return (set[c >> 3] & (@as(u8, 1) << @as(u3, @intCast(c & 7)))) != 0;
-}
+/// 256-bit set membership over a `[32]u8` bitmap. Re-exported from the one
+/// canonical `common.hasBit` so the backtracking tier can call `cc.hasBit`
+/// without a separate copy of the bit math.
+pub const hasBit = common.hasBit;
 
 /// `\w` membership: `[A-Za-z0-9_]` (ASCII; mirrors the engine's `\b` model).
 pub inline fn isWord(c: u8) bool {

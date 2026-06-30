@@ -18,13 +18,12 @@
 //! state 0 the DEAD sink (mirrors `edge_look.nextFrom`).
 
 const std = @import("std");
+const common = @import("../common.zig");
 const search = @import("search.zig");
 
 pub const Span = search.Span;
 
-inline fn bitsetHas(set: *const [32]u8, c: u8) bool {
-    return (set[c >> 3] & (@as(u8, 1) << @as(u3, @intCast(c & 7)))) != 0;
-}
+const bitsetHas = common.hasBit;
 
 /// Longest body match starting exactly at `s` (anchored), or `null`. Byte-for-
 /// byte the same as `full_dfa.Dfa256.runFrom(input, s)` with `a_end == false`.

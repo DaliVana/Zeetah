@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const hir = @import("../hir.zig");
+const common = @import("../common.zig");
 const full_dfa = @import("full_dfa.zig");
 const core = @import("core.zig");
 
@@ -35,9 +36,7 @@ pub const Spec = struct {
     neg: bool, // negative vs positive
 };
 
-inline fn bitsetHas(set: *const [32]u8, c: u8) bool {
-    return (set[c >> 3] & (@as(u8, 1) << @as(u3, @intCast(c & 7)))) != 0;
-}
+const bitsetHas = common.hasBit;
 
 /// Does the trailing look-assertion hold for a match ending at `end`?
 /// Lookbehind inspects `input[end-1]`; lookahead inspects `input[end]`; a

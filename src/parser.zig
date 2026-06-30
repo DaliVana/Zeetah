@@ -18,9 +18,7 @@ const NodeRef = hir.NodeRef;
 inline fn setBit(out: *[32]u8, c: u8) void {
     out[c >> 3] |= (@as(u8, 1) << @as(u3, @intCast(c & 7)));
 }
-inline fn hasBit(set: *const [32]u8, c: u8) bool {
-    return (set[c >> 3] & (@as(u8, 1) << @as(u3, @intCast(c & 7)))) != 0;
-}
+const hasBit = common.hasBit;
 
 /// Fold ASCII letter bits both ways (case-insensitive matching).
 fn foldCaseBitmap(s: *[32]u8) void {

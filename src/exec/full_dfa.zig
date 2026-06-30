@@ -11,6 +11,7 @@
 //! agree — guarded by `tests/feat_api.zig`'s `Pattern`⇄`Regex` differential.
 
 const std = @import("std");
+const common = @import("../common.zig");
 const pf = @import("../prefilter.zig");
 const thompson = @import("../thompson.zig");
 const seq_extract = @import("seq_extract.zig");
@@ -41,9 +42,7 @@ const E = error{TooComplex};
 
 pub const Outcome = enum { ok, exploded };
 
-inline fn hasBit(set: *const [32]u8, c: u8) bool {
-    return (set[c >> 3] & (@as(u8, 1) << @as(u3, @intCast(c & 7)))) != 0;
-}
+const hasBit = common.hasBit;
 
 pub const Dfa256 = struct {
     class_of: [256]u8,

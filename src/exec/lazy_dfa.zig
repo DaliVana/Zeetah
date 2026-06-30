@@ -37,6 +37,7 @@
 //! test vs `core.findLeftmost` keeps it span-exact.
 
 const std = @import("std");
+const common = @import("../common.zig");
 const thompson = @import("../thompson.zig");
 const dfa_build = @import("dfa_build.zig");
 const lazy_memo = @import("lazy_memo.zig");
@@ -56,9 +57,7 @@ pub const Span = dense_search.Span;
 const UNKNOWN = lazy_memo.UNKNOWN; // transition not yet computed
 const TDEAD = lazy_memo.TDEAD; // computed: no byte successor (anchored only)
 
-inline fn hasBit(set: *const [32]u8, c: u8) bool {
-    return (set[c >> 3] & (@as(u8, 1) << @as(u3, @intCast(c & 7)))) != 0;
-}
+const hasBit = common.hasBit;
 
 /// Immutable program: CSR adjacency, reverse CSR, byte-equivalence classes.
 /// Built once at compile; shared read-only (no mutation during search).

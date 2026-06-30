@@ -20,6 +20,14 @@ pub const CharRange = struct {
     }
 };
 
+/// 256-bit set membership over a `[32]u8` bitmap: `set[c>>3] & (1 << (c&7))`.
+/// The one canonical definition of the engine's hot-path byte-set test — the
+/// per-module `hasBit` / `bitsetHas` / `inSet` names are thin aliases of this,
+/// so the bit math lives in exactly one place.
+pub inline fn hasBit(set: *const [32]u8, c: u8) bool {
+    return (set[c >> 3] & (@as(u8, 1) << @as(u3, @intCast(c & 7)))) != 0;
+}
+
 /// Character class - represents a set of characters
 pub const CharClass = struct {
     ranges: []const CharRange,
@@ -33,7 +41,7 @@ pub const CharClass = struct {
 
     pub fn matches(self: CharClass, c: Char) bool {
         if (self.bitmap) |bm| {
-            return (bm[c >> 3] & (@as(u8, 1) << @as(u3, @intCast(c & 7)))) != 0;
+            return hasBit(bm, c);
         }
         var found = false;
         for (self.ranges) |range| {

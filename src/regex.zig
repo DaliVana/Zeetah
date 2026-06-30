@@ -642,6 +642,92 @@ pub const Regex = struct {
         return null;
     }
 
+    /// Lever A: should this eager-dense-table pattern route through
+    /// `buildDenseRegex` (the lazy single-pass O(n) dense build) instead of the
+    /// default `buildRegularDfa` (eager O(1)/byte table)? Two disjoint sub-cases
+    /// share the "bare dense DFA, no selective literal prefilter" precondition and
+    /// both emit the same dense build, so they live in one predicate — one
+    /// definition, one test point. Clause 2 is load-bearing for the unanchored-`$`
+    /// anti-ReDoS guarantee (the polynomial blowup `tests/security.zig` tracks).
+    fn denseRoute(
+        route: planner.Route,
+        props: properties.Properties,
+        d: *const full_dfa.Dfa256,
+        a_start: bool,
+        a_end: bool,
+    ) bool {
+        // "Plain eager DFA, no selective literal prefilter" — the planner's
+        // `.core`, or a `.prefix_prefilter` that didn't clear the `.lit_prefix`
+        // gate. `route == .dfa` is exactly that classification: under the
+        // `!a_start` guards below the gate's anchor term is moot, so this matches
+        // the old `strat`-based predicate bit-for-bit.
+        const bare_dfa = route == .dfa;
+
+        // --- Lever A: targeted single-pass routing for the O(n·m) floor ---
+        //
+        // The blanket "route the whole `.dfa` tier through the lazy memo"
+        // was reverted because it regresses every pattern that *has* a
+        // usable eager dense DFA: the dense `Dfa256` is one O(1) array
+        // index/byte; the lazy memo is a closure-backed transition + a
+        // reverse pass per match (word 45→1.9, nltk 36→0.9, modsec 57→13;
+        // the rest −10–20%). See `lazy-dfa-stage-status`.
+        //
+        // But for the *floor cluster* the eager path is not O(n) — it is
+        // the O(n·m) broad-first-byte per-position restart (`semver`,
+        // `phone_us`, `credit_card`, `ipv4`: ~40 MB/s). There the
+        // already-tested lazy single pass (`lazy_dfa.findLeftmostFrom`:
+        // lowest-priority `.*?` injection + memoized reverse start, O(n),
+        // differential-tested bit-for-bit vs `full_dfa`, persistent memo
+        // across `findAll`/`count`) wins by a wide margin. Route ONLY that
+        // shape; the regressing patterns are excluded *by construction*:
+        //   • selective prefilter present (`.literal`/`.reverse_suffix`/
+        //     `.lit_prefix`, or a rare necessary literal `req_lit`) ⇒ eager
+        //     is already linear and per-byte faster — keep it;
+        //   • near-universal-accept ⇒ eager restart is effectively O(n)
+        //     and the lazy per-byte cost loses badly (the prior revert:
+        //     word/nltk collapsed). Two complementary guards:
+        //       – `min_len ≥ 4`     excludes `nltk`/`float_sci` (min 1);
+        //       – `n_start_bytes ≤ 16` excludes the broad-alphabet kind
+        //         (`base64` 64-byte start set, `\w`-like) that `min_len`
+        //         alone misses (base64 `min_len`=4 but matches everywhere
+        //         → 54→3 MB/s under lazy). The true floor cluster has a
+        //         narrow start set (semver/phone ≈11, credit_card/ipv4 10);
+        //   • `.*?`-bearing (`modsec_sqli`) ⇒ excluded by `!saw_lazy`;
+        //   • anchored ⇒ no restart problem anyway; excluded.
+        // `d.required` is intentionally NOT a guard: it is only a
+        // *negative* (absent ⇒ no match) filter, so a present-but-common
+        // required byte (semver's `.`) leaves the eager path fully O(n·m).
+        if (bare_dfa and
+            !a_start and !a_end and
+            !props.saw_lazy and props.min_len >= 4 and
+            d.n_start_bytes <= 16 and
+            d.req_lit == null) return true;
+
+        // --- Lever A (anti-ReDoS): the unanchored `$`-anchored bare-DFA class.
+        //
+        // An *unanchored* pattern with a trailing `$`/`\z` and no usable literal
+        // prefilter re-runs the eager `core.findLeftmost` from O(n) start
+        // offsets — each scanning the whole class-run before the `a_end` accept
+        // check fails — so it is O(n²) on non-matching `class+$` input (`a+$`,
+        // `\s+$`, `\d+$`, `(a+)+$`, `a*a*$`, `.*a$`, …; the polynomial ReDoS the
+        // `tests/security.zig` marker tracks). The `required`/`req_lit`
+        // prefilters cannot gate this out: `a+$` *has* required byte `a`, but
+        // it is present in the adversarial input, so the negative filter never
+        // fires. The lazy engine's single forward `Σ*?` pass + reverse start
+        // (now `a_end`-capable, `lazy_dfa.findAnchoredEndFrom`) is O(n) for the
+        // whole class. Route it there; eager keeps every other shape.
+        //
+        // `.lit_prefix` is included too: a literal-prefixed `$` pattern
+        // (`abc.*x$`, `abc[0-9]+$`) otherwise stays on `search.litPrefixFind`,
+        // which loops over every Teddy hit of the prefix and `runFrom`s — O(n²)
+        // when the prefix recurs (`abcabc…`). The reverse engine is O(n); we give
+        // up the prefix Teddy locate (the reverse pass dies on its own at the
+        // first non-suffix byte) for the linearity guarantee.
+        if ((bare_dfa or route == .lit_prefix) and !a_start and a_end) return true;
+
+        return false;
+    }
+
     /// Regular DFA tier route: pack the eager DFA and emit a `.literal` (Teddy
     /// only) / `.reverse_suffix` / `.lit_prefix` / plain `.dfa` `Regex` per the
     /// shared `planner.resolve` route. `op_onepass` gates the zero-alloc one-pass
@@ -809,76 +895,11 @@ pub const Regex = struct {
         // `planner.resolve` — one source of truth for strategy selection.
         const route = planner.resolve(strat, h.anchored_start);
 
-        // --- Lever A: targeted single-pass routing for the O(n·m) floor ---
-        //
-        // The blanket "route the whole `.dfa` tier through the lazy memo"
-        // was reverted because it regresses every pattern that *has* a
-        // usable eager dense DFA: the dense `Dfa256` is one O(1) array
-        // index/byte; the lazy memo is a closure-backed transition + a
-        // reverse pass per match (word 45→1.9, nltk 36→0.9, modsec 57→13;
-        // the rest −10–20%). See `lazy-dfa-stage-status`.
-        //
-        // But for the *floor cluster* the eager path is not O(n) — it is
-        // the O(n·m) broad-first-byte per-position restart (`semver`,
-        // `phone_us`, `credit_card`, `ipv4`: ~40 MB/s). There the
-        // already-tested lazy single pass (`lazy_dfa.findLeftmostFrom`:
-        // lowest-priority `.*?` injection + memoized reverse start, O(n),
-        // differential-tested bit-for-bit vs `full_dfa`, persistent memo
-        // across `findAll`/`count`) wins by a wide margin. Route ONLY that
-        // shape; the regressing patterns are excluded *by construction*:
-        //   • selective prefilter present (`.literal`/`.reverse_suffix`/
-        //     `.lit_prefix`, or a rare necessary literal `req_lit`) ⇒ eager
-        //     is already linear and per-byte faster — keep it;
-        //   • near-universal-accept ⇒ eager restart is effectively O(n)
-        //     and the lazy per-byte cost loses badly (the prior revert:
-        //     word/nltk collapsed). Two complementary guards:
-        //       – `min_len ≥ 4`     excludes `nltk`/`float_sci` (min 1);
-        //       – `n_start_bytes ≤ 16` excludes the broad-alphabet kind
-        //         (`base64` 64-byte start set, `\w`-like) that `min_len`
-        //         alone misses (base64 `min_len`=4 but matches everywhere
-        //         → 54→3 MB/s under lazy). The true floor cluster has a
-        //         narrow start set (semver/phone ≈11, credit_card/ipv4 10);
-        //   • `.*?`-bearing (`modsec_sqli`) ⇒ excluded by `!saw_lazy`;
-        //   • anchored ⇒ no restart problem anyway; excluded.
-        // `d.required` is intentionally NOT a guard: it is only a
-        // *negative* (absent ⇒ no match) filter, so a present-but-common
-        // required byte (semver's `.`) leaves the eager path fully O(n·m).
-        // "Plain eager DFA, no selective literal prefilter" — the planner's
-        // `.core`, or a `.prefix_prefilter` that didn't clear the `.lit_prefix`
-        // gate. `route == .dfa` is exactly that classification: under the
-        // `!h.anchored_start` guard below the gate's anchor term is moot, so
-        // this matches the old `strat`-based predicate bit-for-bit.
-        const bare_dfa = route == .dfa;
-        if (bare_dfa and
-            !h.anchored_start and !h.anchored_end and
-            !props.saw_lazy and props.min_len >= 4 and
-            d.n_start_bytes <= 16 and
-            d.req_lit == null)
-        {
-            return try buildDenseRegex(allocator, &nfa, nheap, owned, flags, h.anchored_start, h.anchored_end, ng, gnames);
-        }
-
-        // --- Lever A (anti-ReDoS): the unanchored `$`-anchored bare-DFA class.
-        //
-        // An *unanchored* pattern with a trailing `$`/`\z` and no usable literal
-        // prefilter re-runs the eager `core.findLeftmost` from O(n) start
-        // offsets — each scanning the whole class-run before the `a_end` accept
-        // check fails — so it is O(n²) on non-matching `class+$` input (`a+$`,
-        // `\s+$`, `\d+$`, `(a+)+$`, `a*a*$`, `.*a$`, …; the polynomial ReDoS the
-        // `tests/security.zig` marker tracks). The `required`/`req_lit`
-        // prefilters cannot gate this out: `a+$` *has* required byte `a`, but
-        // it is present in the adversarial input, so the negative filter never
-        // fires. The lazy engine's single forward `Σ*?` pass + reverse start
-        // (now `a_end`-capable, `lazy_dfa.findAnchoredEndFrom`) is O(n) for the
-        // whole class. Route it there; eager keeps every other shape.
-        //
-        // `.lit_prefix` is included too: a literal-prefixed `$` pattern
-        // (`abc.*x$`, `abc[0-9]+$`) otherwise stays on `search.litPrefixFind`,
-        // which loops over every Teddy hit of the prefix and `runFrom`s — O(n²)
-        // when the prefix recurs (`abcabc…`). The reverse engine is O(n); we give
-        // up the prefix Teddy locate (the reverse pass dies on its own at the
-        // first non-suffix byte) for the linearity guarantee.
-        if ((bare_dfa or route == .lit_prefix) and !h.anchored_start and h.anchored_end) {
+        // Lever A: the O(n·m) floor cluster and the unanchored-`$` anti-ReDoS
+        // class both reroute the eager dense table onto the lazy single-pass
+        // dense build. The full rationale and the exclusion-by-construction
+        // guards live in `denseRoute` — one definition, one test point.
+        if (denseRoute(route, props, &d, h.anchored_start, h.anchored_end)) {
             return try buildDenseRegex(allocator, &nfa, nheap, owned, flags, h.anchored_start, h.anchored_end, ng, gnames);
         }
         // Everything else with an eager dense table stays on the O(1)/byte

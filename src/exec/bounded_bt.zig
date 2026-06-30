@@ -10,6 +10,7 @@ const std = @import("std");
 const thompson = @import("../thompson.zig");
 const hir = @import("../hir.zig");
 const cc = @import("charclass.zig");
+const search = @import("search.zig");
 
 const MAX_NFA = thompson.MAX_NFA;
 const MAX_EDGES = thompson.MAX_EDGES;
@@ -32,7 +33,7 @@ const CapFrame = struct { state: u16, pos: usize, ei: usize, rslot: i32, rold: i
 /// Capture slots = 2 per group (start,end); group 0 = whole match.
 pub const MAX_SLOTS: usize = 2 * (hir.MAX_GROUPS + 1);
 
-pub const Span = struct { start: usize, end: usize };
+pub const Span = search.Span;
 
 /// Reusable `(state,pos)` visited scratch for the bounded backtracker. Split
 /// out of `BoundedBt` so it can be **pooled and reused across a whole `findAll`

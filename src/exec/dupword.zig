@@ -18,11 +18,12 @@
 const std = @import("std");
 const hir = @import("../hir.zig");
 const cc = @import("charclass.zig");
+const search = @import("search.zig");
 
 const H = hir.Hir(null);
 const NodeRef = hir.NodeRef;
 
-pub const Span = struct { start: usize, end: usize };
+pub const Span = search.Span;
 
 // `isWord` / set membership now come from `charclass.zig` (`cc`).
 

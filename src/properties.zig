@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const hir = @import("hir.zig");
+const common = @import("common.zig");
 const seq_extract = @import("exec/seq_extract.zig");
 
 const NodeRef = hir.NodeRef;
@@ -359,9 +360,7 @@ fn containsBacktrack(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef)
     };
 }
 
-inline fn hasBit(set: *const [32]u8, c: u8) bool {
-    return (set[c >> 3] & (@as(u8, 1) << @as(u3, @intCast(c & 7)))) != 0;
-}
+const hasBit = common.hasBit;
 
 fn minLen(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) usize {
     const nd = h.node(ref);

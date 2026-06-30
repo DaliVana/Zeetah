@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const common = @import("common.zig");
 
 /// Vector lane count, chosen per target at comptime. `orelse 16` guards
 /// targets where the query returns null (128-bit baseline).
@@ -107,11 +108,9 @@ pub const FREQ: [256]u16 = blk: {
     break :blk f;
 };
 
-/// Canonical 256-bit-set membership test. Every consumer routes through this
-/// so the scalar predicate is identical everywhere.
-pub inline fn inSet(set: *const [32]u8, c: u8) bool {
-    return (set[c >> 3] & (@as(u8, 1) << @as(u3, @intCast(c & 7)))) != 0;
-}
+/// 256-bit-set membership test, re-exported from the one canonical
+/// `common.hasBit` so `pf.inSet` consumers share that single scalar predicate.
+pub const inSet = common.hasBit;
 
 /// Canonical 256-bit-set insertion — the write-side counterpart of `inSet`,
 /// so producers and consumers of a `[32]u8` set share one bit layout.

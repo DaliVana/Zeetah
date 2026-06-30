@@ -245,13 +245,25 @@ fn complement(list: *RangeList, a: std.mem.Allocator) !void {
     try normalizeRanges(list, a); // re-clip the surrogate hole
 }
 
-/// Resolve `spec` (the text inside `\p{...}`, or a single letter for `\pX`).
-/// `outer_negated` is true for `\P`. Caller owns the returned slice.
-pub fn resolve(
-    a: std.mem.Allocator,
-    spec: []const u8,
-    outer_negated: bool,
-) ![]CodepointRange {
+/// Parsed `\p{...}` spec: the resolved general-category lookup and whether the
+/// overall set is negated (folding `\P`, a leading `^`, and an enclosing `[^]`).
+const ParsedSpec = struct { found: NameResult, negated: bool };
+
+/// Parse the text inside `\p{...}` (or a single letter for `\pX`) down to its
+/// general-category lookup and negation flag — the prologue shared by `resolve`
+/// (allocating, full-Unicode) and `resolveLatin1Bitmap` (alloc-free, Latin-1),
+/// so the two stay membership- and error-identical by construction rather than
+/// by hand-kept verbatim copies.
+///
+/// Handles, in order: surrounding whitespace, a leading `^` negation, an
+/// optional `gc=` / `General_Category:` (`=` or `:`) property prefix that must
+/// name general-category, then the loose value-name lookup. The
+/// unsupported-vs-unknown error distinction lives here. Non-allocating (only
+/// stack scratch), so it is usable from the comptime `Pattern` bake path.
+fn parseSpec(spec: []const u8, outer_negated: bool) error{
+    UnknownUnicodeProperty,
+    UnsupportedUnicodeProperty,
+}!ParsedSpec {
     var s = std.mem.trim(u8, spec, " \t");
     if (s.len == 0) return error.UnknownUnicodeProperty;
 
@@ -287,10 +299,22 @@ pub fn resolve(
             error.UnknownUnicodeProperty;
     };
 
+    return .{ .found = found, .negated = negated };
+}
+
+/// Resolve `spec` (the text inside `\p{...}`, or a single letter for `\pX`).
+/// `outer_negated` is true for `\P`. Caller owns the returned slice.
+pub fn resolve(
+    a: std.mem.Allocator,
+    spec: []const u8,
+    outer_negated: bool,
+) ![]CodepointRange {
+    const parsed = try parseSpec(spec, outer_negated);
+
     var list: RangeList = .empty;
     errdefer list.deinit(a);
 
-    switch (found) {
+    switch (parsed.found) {
         .cats => |cats| {
             for (cats) |c| try appendCat(&list, a, c);
             try normalizeRanges(&list, a);
@@ -305,9 +329,9 @@ pub fn resolve(
             },
         },
     }
-    if (found == .special and found.special == .any) try normalizeRanges(&list, a);
+    if (parsed.found == .special and parsed.found.special == .any) try normalizeRanges(&list, a);
 
-    if (negated) try complement(&list, a);
+    if (parsed.negated) try complement(&list, a);
 
     return list.toOwnedSlice(a) catch error.OutOfMemory;
 }
@@ -325,42 +349,10 @@ pub fn resolve(
 /// sort/merge/surrogate-removal in `resolve` are membership-preserving
 /// no-ops, and a universe complement restricted to [0,0xFF] is exactly a
 /// 256-bit inversion. The spec parsing (trim, leading `^`, `gc=`/`:` prefix,
-/// loose-name lookup, unsupported-vs-unknown) is copied verbatim from
-/// `resolve` so the error contract is identical.
+/// loose-name lookup, unsupported-vs-unknown) is shared with `resolve` through
+/// `parseSpec`, so the error contract is identical by construction.
 pub fn resolveLatin1Bitmap(spec: []const u8, outer_negated: bool) ![32]u8 {
-    var s = std.mem.trim(u8, spec, " \t");
-    if (s.len == 0) return error.UnknownUnicodeProperty;
-
-    var negated = outer_negated;
-    if (s[0] == '^') {
-        negated = !negated;
-        s = std.mem.trim(u8, s[1..], " \t");
-        if (s.len == 0) return error.UnknownUnicodeProperty;
-    }
-
-    var value = s;
-    var nbuf: [64]u8 = undefined;
-    if (std.mem.indexOfAny(u8, s, "=:")) |eq_idx| {
-        const prop = normalize(&nbuf, s[0..eq_idx]);
-        const is_gc = std.mem.eql(u8, prop, "gc") or
-            std.mem.eql(u8, prop, "generalcategory");
-        if (!is_gc) {
-            return if (isUnsupportedProperty(prop))
-                error.UnsupportedUnicodeProperty
-            else
-                error.UnknownUnicodeProperty;
-        }
-        value = std.mem.trim(u8, s[eq_idx + 1 ..], " \t");
-    }
-
-    var vbuf: [64]u8 = undefined;
-    const norm = normalize(&vbuf, value);
-    const found = lookupGc(norm) orelse {
-        return if (isUnsupportedProperty(norm))
-            error.UnsupportedUnicodeProperty
-        else
-            error.UnknownUnicodeProperty;
-    };
+    const parsed = try parseSpec(spec, outer_negated);
 
     var bm = [_]u8{0} ** 32;
     const B = struct {
@@ -377,7 +369,7 @@ pub fn resolveLatin1Bitmap(spec: []const u8, outer_negated: bool) ![32]u8 {
             for (tables.rangesFor(c)) |r| setRange(m, r.lo, r.hi);
         }
     };
-    switch (found) {
+    switch (parsed.found) {
         .cats => |cats| for (cats) |c| B.cat(&bm, c),
         .special => |sp| switch (sp) {
             .any => @memset(&bm, 0xFF),
@@ -388,7 +380,7 @@ pub fn resolveLatin1Bitmap(spec: []const u8, outer_negated: bool) ![32]u8 {
             },
         },
     }
-    if (negated) B.invert(&bm);
+    if (parsed.negated) B.invert(&bm);
     return bm;
 }
 

@@ -7,10 +7,12 @@
 //! no `intern`, `gen`, `ensureTrans` or closure on the hot path.
 
 const std = @import("std");
+const search = @import("search.zig");
 
 /// Match span shared by the lazy/dense engines (`lazy_dfa` re-exports this as
-/// `lazy_dfa.Span`).
-pub const Span = struct { start: usize, end: usize };
+/// `lazy_dfa.Span`). Unified onto the canonical `search.Span` so the exec layer
+/// has one nominal span type, not five structurally-identical copies.
+pub const Span = search.Span;
 
 /// Frozen dense form of a `LazyProg`: flat transition tables + a lean
 /// single-pass driver. Behaviourally identical to `LazyProg.findLeftmostFrom`

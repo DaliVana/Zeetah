@@ -60,9 +60,26 @@ guard for the refactors.
   addressed: a new `PackedDfa.runFrom == Dfa256.runFrom` differential test (the packed path previously had
   **none**) now catches any drift, and the duplication is documented as an intentional perf decision.
 
-**Still open:** #3 run-loop merge (only viable with a measured perf regression — left as documented,
-tested duplication), #4 (shared `\p{}` spec parser), #6 (one canonical `hasBit`/`Span`), #7 (name the
-anti-ReDoS budget constants + dense-route predicate).
+- ✅ **#4 shared `\p{}` spec parser** — the trim/`^`/`gc=`/loose-lookup/unsupported-vs-unknown prologue
+  duplicated verbatim between `unicode_class.resolve` (allocating, full-Unicode) and `resolveLatin1Bitmap`
+  (alloc-free, Latin-1, comptime-bakeable) was extracted to one non-allocating `parseSpec` returning
+  `{found, negated}`; the two resolvers now differ only in RangeList-vs-256-bit materialization, so the
+  comptime↔runtime `\p{}` error contract and membership are structural, not a hand-synced copy.
+
+**Naming / single-source-of-truth**
+- ✅ **#7 anti-ReDoS budget constants + dense-route predicate** — `backtrack.zig`'s `8000`/`4000` step
+  budget became named `BUDGET_BASE`/`BUDGET_PER_BYTE` with a doc comment defining a "step" and the
+  scaling↔exposure tradeoff; the two duplicated `buildDenseRegex` guard sites in `regex.zig` (floor
+  cluster + the load-bearing `$`-anchored anti-ReDoS clause) collapsed into one `denseRoute(...)`
+  predicate that owns both clauses and their rationale — one definition, one test point.
+- ✅ **#6 canonical `hasBit` / `Span`** — the 11 byte-identical bitset-membership copies
+  (`hasBit`/`bitsetHas`/`inSet`) collapsed to one `common.hasBit` (the rest are aliases; `charclass.hasBit`
+  and `prefilter.inSet` stay `pub` re-exports), and the 5 structural `Span` redeclarations now alias the
+  canonical `search.Span`. Pure dedup, bit math + layout unchanged.
+
+**Still open:** only #3 run-loop merge remains, and it is closed-by-decision — the merge was attempted and
+reverted (measured ~5–12% regression on `bench-tokenizer`), so it stays as documented, differential-tested
+duplication rather than a pending task. Every other top-priority item is actioned.
 
 ## Executive summary
 
@@ -154,13 +171,16 @@ changes.
    a `step(state, cls)` accessor via `inline fn runImpl(dfa: anytype, ...)` (the technique
    `line_dfa.matchEnd` already uses); extract a shared `collectSeeds(...)` for the gather.
 
-4. **[High] Extract the shared spec parser between the full-Unicode and Latin-1 `\p{}` resolvers.**
-   `resolve` ([../src/unicode_class.zig:250](../src/unicode_class.zig#L250)–313) and
-   `resolveLatin1Bitmap` (330–393) duplicate ~30 lines of negation/alias/unsupported-vs-unknown parsing
-   verbatim; the doc even says it is "copied verbatim so the error contract is identical." A one-sided
-   edit silently diverges `\p{}` membership comptime vs runtime. *Fix:* one private
-   `parseSpec(...) error{...}!struct{found, negated}` called by both, branching only on
-   RangeList-vs-bitmap materialization — makes the identical error contract structural.
+4. **[High · ✅ DONE] Extract the shared spec parser between the full-Unicode and Latin-1 `\p{}` resolvers.**
+   `resolve` ([../src/unicode_class.zig:250](../src/unicode_class.zig#L250)) and
+   `resolveLatin1Bitmap` duplicated ~30 lines of negation/alias/unsupported-vs-unknown parsing verbatim;
+   the doc even said it was "copied verbatim so the error contract is identical." A one-sided edit
+   silently diverged `\p{}` membership comptime vs runtime. *Fixed:* one private non-allocating
+   `parseSpec(spec, outer_negated) error{UnknownUnicodeProperty, UnsupportedUnicodeProperty}!ParsedSpec`
+   (returns `{found: NameResult, negated}`) is now called by both, which branch only on
+   RangeList-vs-bitmap materialization — the identical error contract is structural, not a comment
+   promise. Validated under `zig build test` (Debug) and `-Doptimize=ReleaseSafe`; the comptime⇄runtime
+   `\p{}` differential is the guard.
 
 5. **[High · ✅ DONE] Make capture-numbering a single recognizer instead of two hand-synced grammars.**
    `scanGroups` ([../src/parser.zig:288](../src/parser.zig#L288)–367) re-implements the same
@@ -170,23 +190,30 @@ changes.
    numbering+names, or factor one shared `classifyParen(pat, i)` helper; at minimum add a cross-check test
    asserting `scanGroups` count/names equal the parser's final `n_groups`/names over the bench corpus.
 
-6. **[Medium] Promote one canonical `hasBit` / `Span` and delete the per-module copies.** The 32-byte
-   bitset membership test is byte-identical in 7+ files under two names (`hasBit`/`bitsetHas`/`inSet`):
-   [../src/exec/charclass.zig:14](../src/exec/charclass.zig#L14) (already `pub`), dfa_build.zig:19,
-   full_dfa.zig:44, lazy_dfa.zig:59, onepass.zig:53, seq_extract.zig:69, prefilter.zig:112. `Span` is
-   structurally redeclared in 5 modules ([../src/exec/search.zig:23](../src/exec/search.zig#L23) is
-   canonical) — nominally-distinct types that defeat the "one nominal Span" header. *Fix:* import
-   `charclass.hasBit` (or hoist to common.zig) everywhere; alias `search.Span` in
-   dense_search/backtrack/onepass/bounded_bt/dupword.
+6. **[Medium · ✅ DONE] Promote one canonical `hasBit` / `Span` and delete the per-module copies.** The
+   32-byte bitset membership test was byte-identical in **11** files under three names
+   (`hasBit`/`bitsetHas`/`inSet`), and `Span` was structurally redeclared in 5 exec modules — both
+   defeating the "one definition" intent (drift caught only by differential tests, not the type system).
+   *Fixed:* one canonical `pub inline fn hasBit` now lives in [../src/common.zig](../src/common.zig) (and
+   `CharClass.matches` routes through it, so the bit math has a single home); all 11 former definitions
+   became thin aliases (`const hasBit = common.hasBit;`), with `charclass.hasBit` and `prefilter.inSet`
+   kept as `pub` re-exports for their existing qualified callers (`cc.hasBit`, `pf.inSet`). The 5
+   structural `Span` copies (dense_search/backtrack/onepass/bounded_bt/dupword) now alias the canonical
+   `search.Span`, leaving exactly two nominal spans: the exec `search.Span` and the intentionally-distinct
+   `common.Span` (parser/error-reporting type with `init`/`len`). Pure dedup — bit math and span layout
+   unchanged; validated under Debug and ReleaseSafe.
 
-7. **[Medium] Name the anti-ReDoS step-budget constants and the dense-route predicate.**
-   [../src/exec/backtrack.zig:421](../src/exec/backtrack.zig#L421) `self.budget = 8000 + (input.len+1)*4000`
-   is the single most safety-relevant tunable in the file, written as two bare literals. Separately,
-   `buildDenseRegex` is called from two duplicated guard sites
-   ([../src/regex.zig:785](../src/regex.zig#L785)–816) where guard 2 is load-bearing for the $-anchored
-   anti-ReDoS guarantee. *Fix:* hoist `BUDGET_BASE`/`BUDGET_PER_BYTE` with a comment defining a "step";
-   factor the lever-A decision into one `denseRoute(...)` predicate so the guard has one definition and
-   one test point.
+7. **[Medium · ✅ DONE] Name the anti-ReDoS step-budget constants and the dense-route predicate.**
+   [../src/exec/backtrack.zig](../src/exec/backtrack.zig) `self.budget = 8000 + (input.len+1)*4000` was
+   the single most safety-relevant tunable in the file, written as two bare literals. Separately,
+   `buildDenseRegex` was called from two duplicated guard sites in `regex.zig` where guard 2 is
+   load-bearing for the $-anchored anti-ReDoS guarantee. *Fixed:* hoisted `BUDGET_BASE`/`BUDGET_PER_BYTE`
+   with a doc comment defining a "step" and the scaling↔ReDoS-exposure relationship; factored the lever-A
+   decision into one `denseRoute(route, props, d, a_start, a_end)` predicate (both clauses + their
+   exclusion-by-construction rationale now live in it), collapsing the two guard sites to a single
+   `if (denseRoute(...)) return buildDenseRegex(...)`. Behavior-preserving extraction (the predicate is
+   the original `floor-cluster OR $-anchored` logic bit-for-bit); validated under Debug and ReleaseSafe,
+   the security/ReDoS suite being the guard.
 
 8. **[Medium · ✅ DONE] Delete the dead `profiling.zig` and `benchmark.zig`.**
    [../src/profiling.zig:1](../src/profiling.zig#L1)–241 is never imported/built/tested and has already

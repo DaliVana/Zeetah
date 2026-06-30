@@ -15,10 +15,11 @@ const seek_mod = @import("seek.zig");
 const delegate = @import("delegate.zig");
 const cc = @import("charclass.zig");
 const class_span = @import("class_span.zig");
+const search = @import("search.zig");
 
 const NodeRef = hir.NodeRef;
 
-pub const Span = struct { start: usize, end: usize };
+pub const Span = search.Span;
 pub const Error = error{Budget};
 
 /// Comptime first-byte alternation dispatch (baked by `Pattern`; `null` for the
@@ -133,6 +134,19 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
                 .backref => .{ .min = 0, .max = 0, .bounded = false },
             };
         }
+
+        /// Anti-ReDoS step budget, scaled to the input length: `runFrom` sets
+        /// `budget = BUDGET_BASE + (input.len + 1) * BUDGET_PER_BYTE`. A "step"
+        /// is one `tick()` — charged once per matcher primitive (`m`/`cont`
+        /// recursion, loop iteration, look-assertion entry). The linear-in-`n`
+        /// term is the load-bearing lever: it caps *total* backtracking work at
+        /// O(n), so adversarial inputs (`(a+)\1$`, nested quantifiers) return
+        /// `error.Budget` in O(n) instead of hanging, while the constant base
+        /// covers fixed start-up work that must succeed on tiny inputs. The
+        /// multipliers are tuned to admit every legitimate pattern in the test
+        /// corpus with headroom; raising them widens the ReDoS exposure window.
+        const BUDGET_BASE: u64 = 8000;
+        const BUDGET_PER_BYTE: u64 = 4000;
 
         fn tick(self: *Self) Error!void {
             self.steps += 1;
@@ -418,7 +432,7 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
         /// `run` is `runFrom(…, 0, …)`. Returned span is in absolute coords.
         pub fn runFrom(self: *Self, input: []const u8, from: usize, slots_out: []i32) Error!?Span {
             self.input = input;
-            self.budget = 8000 + @as(u64, input.len + 1) * 4000; // O(n) work bound
+            self.budget = BUDGET_BASE + @as(u64, input.len + 1) * BUDGET_PER_BYTE; // O(n) work bound
             // `$`-anchored fast-negative: one O(n) reverse pass over the regular
             // over-approximation. If no suffix of it ends at `input.len`, no real
             // `$`-anchored backref/lookaround match exists (`L(true) ⊆ L(approx)`)

@@ -19,12 +19,14 @@
 //! kept structural and pure over the DFA shape.
 
 const std = @import("std");
+const common = @import("../common.zig");
 const full_dfa = @import("full_dfa.zig");
 const thompson = @import("../thompson.zig");
+const search = @import("search.zig");
 
 const MAX_NFA = thompson.MAX_NFA;
 
-pub const Span = struct { start: usize, end: usize };
+pub const Span = search.Span;
 
 /// Sound, conservative one-pass test over a built DFA: true only if no state
 /// has two outgoing transitions to *different* accepting states (the shape
@@ -50,9 +52,7 @@ pub fn isOnePass(d: *const full_dfa.Dfa256) bool {
     return true;
 }
 
-inline fn hasBit(set: *const [32]u8, c: u8) bool {
-    return (set[c >> 3] & (@as(u8, 1) << @as(u3, @intCast(c & 7)))) != 0;
-}
+const hasBit = common.hasBit;
 
 /// Sound one-pass test over the **NFA** — the correct gate for the capture
 /// fast path (unlike `isOnePass`, which is a DFA-shape *match* signal and
