@@ -50,8 +50,19 @@ guard for the refactors.
   contiguous 1..N, in-lookaround captures excluded) over a divergence-prone corpus. There is now nothing
   to keep in sync — the duplication is gone, not just guarded.
 
-**Still open:** #3 (dedup the 4× DFA run loops), #4 (shared `\p{}` spec parser), #6 (one canonical
-`hasBit`/`Span`), #7 (name the anti-ReDoS budget constants + dense-route predicate).
+- ◑ **#3 (partial) — lazy gather deduped; DFA run loops measured-and-kept-separate.** The lazy-DFA seed
+  gather (copied across `step`/`aStep`/`uStep`/`rStep`) collapsed to one `inline collectSeeds` helper
+  (codegen-neutral). The `Dfa256`/`PackedDfa` `runFromPlain`/`runFromSpin` merge was **attempted and
+  reverted**: A/B on `bench-tokenizer` showed the `PackedDfa` hand-hoist of `trans.ptr`/`shift` is
+  load-bearing — a shared `dfa: anytype` walker over `step()` cost **~12%** (103→91 MiB/s), and even
+  capturing the table base in a local "stepper" struct still lost **~5%** (→98). Per the engine's
+  benchmarking standard the four run loops stay as hand-written copies, but the review's real concern is
+  addressed: a new `PackedDfa.runFrom == Dfa256.runFrom` differential test (the packed path previously had
+  **none**) now catches any drift, and the duplication is documented as an intentional perf decision.
+
+**Still open:** #3 run-loop merge (only viable with a measured perf regression — left as documented,
+tested duplication), #4 (shared `\p{}` spec parser), #6 (one canonical `hasBit`/`Span`), #7 (name the
+anti-ReDoS budget constants + dense-route predicate).
 
 ## Executive summary
 
@@ -132,7 +143,7 @@ changes.
    `assert(len < out.len)` before each accumulating write — free in ReleaseFast, converts silent
    corruption into a trap, documents the fan-out invariant.
 
-3. **[High] Collapse the duplicated DFA run loops and the seed-collection gather.**
+3. **[High · ◑ Partial — see Status] Collapse the duplicated DFA run loops and the seed-collection gather.**
    `runFromPlain`/`runFromSpin` are copy-pasted across `Dfa256` and `PackedDfa`
    ([../src/exec/full_dfa.zig:122](../src/exec/full_dfa.zig#L122)–195 vs 264–327, doc-commented "Verbatim
    port"), and the PackedDfa copies have **no differential coverage** (the test at :822 exercises only

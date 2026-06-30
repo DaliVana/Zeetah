@@ -282,9 +282,15 @@ pub const PackedDfa = struct {
         return last_accept;
     }
 
-    /// Verbatim port of `Dfa256.runFromSpin` (the adaptive SIMD self-loop skip)
-    /// over the flat table. Out-of-line for the same reason (inlining it
-    /// regresses unrelated no-spin patterns).
+    /// Hand-synced flat-table port of `Dfa256.runFromSpin` (the adaptive SIMD
+    /// self-loop skip). Out-of-line for the same reason (inlining regresses
+    /// unrelated no-spin patterns). NOTE: the four run loops (`Dfa256`/`PackedDfa`
+    /// × plain/spin) are kept as separate hand-written copies ON PURPOSE — hoisting
+    /// the flat-table base pointer + row shift out of the loop is load-bearing
+    /// (≈12% on `tokenizer`; a shared `dfa: anytype` walker over `step()` lost ≈5%
+    /// even with the base captured in a local stepper), so they cannot collapse to
+    /// one generic without a measured throughput hit. Drift between the copies is
+    /// caught by the `PackedDfa.runFrom == Dfa256.runFrom` differential test below.
     fn runFromSpin(self: *const PackedDfa, input: []const u8, start_pos: usize) ?usize {
         const shift = self.shift;
         const t = self.trans.ptr; // hoist the table base out of the loop
@@ -868,6 +874,62 @@ test "runFromSpin == runFromPlain (differential, long self-loop runs)" {
         }
     }
     try std.testing.expect(saw_spin); // the test must exercise real spin DFAs
+}
+
+test "PackedDfa.runFrom == Dfa256.runFrom (pack + flat-table differential)" {
+    // The packed flat-table run loops are a hand-synced copy of the fixed
+    // `Dfa256` loops (kept separate for the hoisting perf — see
+    // `PackedDfa.runFromSpin`). The review noted the packed path had no
+    // differential coverage; pin `PackedDfa.runFrom` (and the packed plain/spin
+    // variants) to the well-tested `Dfa256.runFrom`, so any drift between the
+    // hand-synced copies — or a `pack`/flat-indexing bug — is caught here.
+    const parser = @import("../parser.zig");
+    const hir = @import("../hir.zig");
+    const a = std.testing.allocator;
+
+    const pats = [_][]const u8{
+        ".*x",            ".*",     "a.*9",        "<[^>]+>", "[A-Za-z0-9+/]+=*",
+        "\"[^\"]*\"",     ".*=.*",  "[0-9]+",      "abc",     "v[0-9]+\\.[0-9]+",
+        "(cat|dog|bird)", "[a-z]+", "[^ ]+ [^ ]+",
+    };
+    var prng = std.Random.DefaultPrng.init(0x9E3779B9);
+    const rnd = prng.random();
+    const lengths = [_]usize{ 0, 1, 5, 63, 64, 65, 100, 128, 300, 1000 };
+    const alpha = "aXb9<> \"/+=zQ.@\n";
+
+    for (pats) |p| {
+        var h = hir.Hir(null).initRuntime();
+        defer h.deinit(a);
+        parser.parse(null, &h, a, p, .{}) catch continue;
+        var nfa = thompson.build(null, &h) catch continue;
+        const d = compute(null, &nfa, h.anchored_start, h.anchored_end);
+        if (d.outcome != .ok) continue;
+
+        var pd = pack(a, &d) catch continue;
+        defer pd.deinit(a);
+
+        for (lengths) |len| {
+            const buf = try a.alloc(u8, len);
+            defer a.free(buf);
+
+            // (1) random biased buffer.
+            for (buf) |*c| c.* = alpha[rnd.int(usize) % alpha.len];
+            for (0..len + 1) |sp| {
+                try std.testing.expectEqual(d.runFrom(buf, sp), pd.runFrom(buf, sp));
+                try std.testing.expectEqual(pd.runFromPlain(buf, sp), pd.runFromSpin(buf, sp));
+            }
+
+            // (2) one long pure self-loop run + terminator — fires the SIMD skip
+            // on the FLAT table (the packed indexing under the spin path).
+            if (len >= 2) {
+                @memset(buf, 'a');
+                buf[len - 1] = 'x';
+                for (0..len + 1) |sp| {
+                    try std.testing.expectEqual(d.runFrom(buf, sp), pd.runFrom(buf, sp));
+                }
+            }
+        }
+    }
 }
 
 test "computeReverse + reverseSearch == forward core.findLeftmost ($-anchored oracle)" {

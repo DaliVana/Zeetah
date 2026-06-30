@@ -475,22 +475,41 @@ pub const LazyProg = struct {
         return last;
     }
 
+    /// Gather the consume-edge targets out of `src`'s NFA states that fire on
+    /// `byte` into `seeds` (returns the count). The CSR triple (`off`/`set`/
+    /// `target`) selects the forward (`cnt_*`) or reverse (`rcnt_*`) adjacency, so
+    /// the four transition builders (`step`/`aStep`/`uStep`/`rStep`) share ONE
+    /// gather instead of four hand-synced copies. Bounded by the NFA's total
+    /// consume edges ≤ `MAX_EDGES` (asserted before each accumulating write).
+    inline fn collectSeeds(
+        self: *const LazyProg,
+        src: []const u16,
+        off: []const usize,
+        set: []const u16,
+        target: []const u16,
+        byte: u8,
+        seeds: *[MAX_EDGES]u16,
+    ) usize {
+        var ns: usize = 0;
+        for (src) |nst| {
+            var cj = off[nst];
+            while (cj < off[nst + 1]) : (cj += 1) {
+                if (hasBit(&self.nfa.sets[set[cj]], byte)) {
+                    std.debug.assert(ns < seeds.len); // ≤ MAX_EDGES consume edges
+                    seeds[ns] = target[cj];
+                    ns += 1;
+                }
+            }
+        }
+        return ns;
+    }
+
     fn step(self: *const LazyProg, m: *LazyMemo, state_id: u32, byte: u8, buf: []u16, acc: *bool) !?u32 {
         const list = m.states.items[state_id];
         var src: [MAX_NFA]u16 = undefined;
         @memcpy(src[0..list.len], list);
         var seeds: [MAX_EDGES]u16 = undefined;
-        var ns: usize = 0;
-        for (src[0..list.len]) |nst| {
-            var cj = self.cnt_off[nst];
-            while (cj < self.cnt_off[nst + 1]) : (cj += 1) {
-                if (hasBit(&self.nfa.sets[self.cnt_set[cj]], byte)) {
-                    std.debug.assert(ns < seeds.len); // ≤ MAX_EDGES consume edges
-                    seeds[ns] = self.cnt_to[cj];
-                    ns += 1;
-                }
-            }
-        }
+        const ns = self.collectSeeds(src[0..list.len], self.cnt_off, self.cnt_set, self.cnt_to, byte, &seeds);
         if (ns == 0) return null;
         const len = self.closure(seeds[0..ns], buf, acc);
         return try m.intern(buf[0..len], acc.*);
@@ -508,17 +527,7 @@ pub const LazyProg = struct {
         @memcpy(src[0..list.len], list);
         const sym = self.rep[cls];
         var seeds: [MAX_EDGES]u16 = undefined;
-        var ns: usize = 0;
-        for (src[0..list.len]) |nst| {
-            var cj = self.cnt_off[nst];
-            while (cj < self.cnt_off[nst + 1]) : (cj += 1) {
-                if (hasBit(&self.nfa.sets[self.cnt_set[cj]], sym)) {
-                    std.debug.assert(ns < seeds.len); // ≤ MAX_EDGES consume edges
-                    seeds[ns] = self.cnt_to[cj];
-                    ns += 1;
-                }
-            }
-        }
+        const ns = self.collectSeeds(src[0..list.len], self.cnt_off, self.cnt_set, self.cnt_to, sym, &seeds);
         if (ns == 0) {
             m.atrans.items[idx] = TDEAD;
             return null;
@@ -547,17 +556,7 @@ pub const LazyProg = struct {
         @memcpy(src[0..list.len], list);
         const sym = self.rep[cls];
         var seeds: [MAX_EDGES]u16 = undefined;
-        var ns: usize = 0;
-        for (src[0..list.len]) |nst| {
-            var cj = self.cnt_off[nst];
-            while (cj < self.cnt_off[nst + 1]) : (cj += 1) {
-                if (hasBit(&self.nfa.sets[self.cnt_set[cj]], sym)) {
-                    std.debug.assert(ns < seeds.len); // ≤ MAX_EDGES consume edges
-                    seeds[ns] = self.cnt_to[cj];
-                    ns += 1;
-                }
-            }
-        }
+        var ns = self.collectSeeds(src[0..list.len], self.cnt_off, self.cnt_set, self.cnt_to, sym, &seeds);
         std.debug.assert(ns < seeds.len); // + the lowest-priority start injection
         seeds[ns] = @intCast(self.nfa.start); // lowest priority (last)
         ns += 1;
@@ -585,17 +584,7 @@ pub const LazyProg = struct {
         @memcpy(src[0..list.len], list);
         const sym = self.rep[cls];
         var seeds: [MAX_EDGES]u16 = undefined;
-        var rs: usize = 0;
-        for (src[0..list.len]) |nst| {
-            var cj = self.rcnt_off[nst];
-            while (cj < self.rcnt_off[nst + 1]) : (cj += 1) {
-                if (hasBit(&self.nfa.sets[self.rcnt_set[cj]], sym)) {
-                    std.debug.assert(rs < seeds.len); // ≤ MAX_EDGES reverse edges
-                    seeds[rs] = self.rcnt_from[cj];
-                    rs += 1;
-                }
-            }
-        }
+        const rs = self.collectSeeds(src[0..list.len], self.rcnt_off, self.rcnt_set, self.rcnt_from, sym, &seeds);
         if (rs == 0) {
             m.rtrans.items[idx] = TDEAD;
             return null;
