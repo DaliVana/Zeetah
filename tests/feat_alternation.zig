@@ -29,6 +29,45 @@ test "alternation: n-ary cat|dog|bird" {
     try std.testing.expectEqualStrings("bird", (try slice(a, "cat|dog|bird", "the bird")).?);
 }
 
+test "alternation: large pure-literal set (NFA-overflow) routes to literal_alt" {
+    const a = std.testing.allocator;
+    // 60 distinct 6-byte literals: the naive Thompson NFA overflows MAX_NFA(256)
+    // → the `.literal_alt` heap-trie engine. (Testing allocator ⇒ leak-checked.)
+    var pat: std.ArrayList(u8) = .empty;
+    defer pat.deinit(a);
+    var i: usize = 0;
+    while (i < 60) : (i += 1) {
+        if (i != 0) try pat.append(a, '|');
+        var w: [6]u8 = undefined;
+        _ = std.fmt.bufPrint(&w, "kw{d:0>4}", .{i}) catch unreachable;
+        try pat.appendSlice(a, &w);
+    }
+    var rx = try Regex.compile(a, pat.items);
+    defer rx.deinit();
+    // count: 4 of the 5 tokens are in the set (kw9999 is not).
+    try std.testing.expectEqual(@as(usize, 4), try rx.count("x kw0000 y kw0059 z kw0030 kw9999 kw0001"));
+    try std.testing.expect(try rx.isMatch("zzz kw0042"));
+    try std.testing.expect(!try rx.isMatch("nope nothing here"));
+    try std.testing.expectEqualStrings("kw0007", (try slice(a, pat.items, "aa kw0007 bb")).?);
+}
+
+test "alternation: literal_alt is leftmost-first over prefixes/substrings" {
+    const a = std.testing.allocator;
+    // Pad with throwaway alternatives so the set overflows MAX_NFA and takes the
+    // literal_alt path; the meaningful alternatives test source-order semantics.
+    var pat: std.ArrayList(u8) = .empty;
+    defer pat.deinit(a);
+    try pat.appendSlice(a, "scatter|cat"); // substring "cat" must not pre-empt "scatter"
+    var i: usize = 0;
+    while (i < 60) : (i += 1) {
+        var w: [8]u8 = undefined;
+        _ = std.fmt.bufPrint(&w, "|zz{d:0>4}", .{i}) catch unreachable;
+        try pat.appendSlice(a, &w);
+    }
+    // Scanning "a scatter b": the whole word wins over the internal "cat".
+    try std.testing.expectEqualStrings("scatter", (try slice(a, pat.items, "a scatter b")).?);
+}
+
 test "alternation: grouped (ab|cd)e" {
     const a = std.testing.allocator;
     try std.testing.expectEqualStrings("abe", (try slice(a, "(ab|cd)e", "zzabez")).?);

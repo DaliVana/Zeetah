@@ -87,7 +87,7 @@ fn singleByte(comptime cap: ?usize, h: *const hir.Hir(cap), set_idx: u32) ?u8 {
 /// entire subtree is a fixed single-byte-set concat chain (no alternation,
 /// quantifier, multi-byte class). Returns the new length, or null if not a
 /// pure literal (or it would overflow `MAX_LIT`).
-fn wholeLiteral(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, buf: *[MAX_LIT]u8, len: usize) ?usize {
+pub fn wholeLiteral(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, buf: *[MAX_LIT]u8, len: usize) ?usize {
     const nd = h.node(ref);
     switch (nd.tag) {
         .empty => return len,

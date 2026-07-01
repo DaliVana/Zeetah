@@ -1187,3 +1187,160 @@ test "aho-corasick: finds leftmost needle == naive scan" {
 test "aho-corasick: rejects degenerate needles" {
     try std.testing.expect(AhoCorasick.build(&[_][]const u8{ "a", "" }) == null);
 }
+
+/// Heap-allocated trie for a **large pure-literal alternation** — the runtime
+/// `.literal_alt` engine. Used when a literal alternation (`lit|lit|…`) is too
+/// large for the Thompson NFA's `MAX_NFA` ceiling (e.g. a 5000-word dictionary),
+/// where `AhoCorasickN`'s fixed `[MAX_NODES][256]` table also doesn't fit.
+///
+/// `find` is exact **leftmost-first** (PCRE alternation) semantics: at the
+/// leftmost start position where any literal matches, it returns the span of
+/// the earliest-listed (lowest source index) matching literal. This is correct
+/// regardless of prefix/substring relationships among the literals — unlike a
+/// leftmost-by-end Aho-Corasick *locate*, which can report a later-starting
+/// internal substring (e.g. "cat" inside "scatter"). We get this directly from
+/// a per-start trie walk (`matchAt`) rather than a failure-link automaton, so
+/// no source-order re-verification pass is needed.
+///
+/// Cost: build is one trie; match is O(n) on text sparse in literal starts
+/// (a position whose byte begins no literal costs one array probe), O(n·maxlen)
+/// worst case. Heap, freed by `deinit`.
+pub const LiteralAltScanner = struct {
+    /// goto[node*256 + byte] -> child node id (0 = none; root is node 0 and is
+    /// never a goto target, so 0 unambiguously means "no edge").
+    goto: []u32,
+    /// out_idx[node] = source index of the literal ending at this node, or NONE.
+    out_idx: []u32,
+    n_nodes: usize,
+
+    pub const NONE: u32 = std.math.maxInt(u32);
+    /// Node-id ceiling. Bounds the dense table to ≈`NODE_LIMIT`·1 KiB; a literal
+    /// set whose trie exceeds it returns null from `build` (the caller falls
+    /// back to the existing `PatternTooComplex`, never a wrong or huge build).
+    pub const NODE_LIMIT: usize = 1 << 19;
+
+    pub const Span = struct { start: usize, end: usize };
+
+    /// Build the trie from `needles` in source (priority) order. Returns null on
+    /// an empty needle or if the node ceiling would be exceeded.
+    pub fn build(allocator: std.mem.Allocator, needles: []const []const u8) !?LiteralAltScanner {
+        const ZEROS = [_]u32{0} ** 256;
+        var goto_l: std.ArrayList(u32) = .empty;
+        errdefer goto_l.deinit(allocator);
+        var out_l: std.ArrayList(u32) = .empty;
+        errdefer out_l.deinit(allocator);
+        // Node 0 = root.
+        try goto_l.appendSlice(allocator, &ZEROS);
+        try out_l.append(allocator, NONE);
+
+        for (needles, 0..) |nd, idx| {
+            if (nd.len == 0) return null;
+            var node: u32 = 0;
+            for (nd) |b| {
+                const slot = node * 256 + b;
+                if (goto_l.items[slot] == 0) {
+                    const nid = out_l.items.len; // == goto_l.items.len / 256
+                    if (nid >= NODE_LIMIT) return null;
+                    try goto_l.appendSlice(allocator, &ZEROS);
+                    try out_l.append(allocator, NONE);
+                    goto_l.items[slot] = @intCast(nid);
+                    node = @intCast(nid);
+                } else {
+                    node = goto_l.items[slot];
+                }
+            }
+            // Keep the smallest source index (leftmost-first priority) if the
+            // same string appears twice.
+            if (out_l.items[node] == NONE or idx < out_l.items[node]) {
+                out_l.items[node] = @intCast(idx);
+            }
+        }
+
+        const n_nodes = out_l.items.len;
+        return LiteralAltScanner{
+            .goto = try goto_l.toOwnedSlice(allocator),
+            .out_idx = try out_l.toOwnedSlice(allocator),
+            .n_nodes = n_nodes,
+        };
+    }
+
+    /// Leftmost-first match length of the alternation at exactly `p`, or null.
+    /// Walks the trie collecting every literal that is a prefix of `input[p..]`
+    /// (they form a chain) and returns the length of the earliest-listed one.
+    inline fn matchAt(self: *const LiteralAltScanner, input: []const u8, p: usize) ?usize {
+        var node: u32 = 0;
+        var best_idx: u32 = NONE;
+        var best_len: usize = 0;
+        var k: usize = 0;
+        while (p + k < input.len) {
+            const c = self.goto[node * 256 + input[p + k]];
+            if (c == 0) break;
+            node = c;
+            k += 1;
+            const oi = self.out_idx[node];
+            if (oi < best_idx) {
+                best_idx = oi;
+                best_len = k;
+            }
+        }
+        return if (best_idx != NONE) best_len else null;
+    }
+
+    /// Leftmost match at/after absolute `from`, or null.
+    pub fn find(self: *const LiteralAltScanner, input: []const u8, from: usize) ?Span {
+        var p = from;
+        while (p < input.len) : (p += 1) {
+            if (self.matchAt(input, p)) |len| return .{ .start = p, .end = p + len };
+        }
+        return null;
+    }
+
+    pub fn isMatch(self: *const LiteralAltScanner, input: []const u8) bool {
+        return self.find(input, 0) != null;
+    }
+
+    pub fn deinit(self: *LiteralAltScanner, allocator: std.mem.Allocator) void {
+        allocator.free(self.goto);
+        allocator.free(self.out_idx);
+    }
+};
+
+test "literal-alt scanner: leftmost-first over prefixes and substrings" {
+    const a = std.testing.allocator;
+    {
+        // Prefix chain, shorter listed first (dictionary order): "ab" wins at 0.
+        var s = (try LiteralAltScanner.build(a, &[_][]const u8{ "ab", "abc" })).?;
+        defer s.deinit(a);
+        const m = s.find("abcd", 0).?;
+        try std.testing.expectEqual(@as(usize, 0), m.start);
+        try std.testing.expectEqual(@as(usize, 2), m.end); // "ab" (listed first)
+    }
+    {
+        // Longer listed first: "abc" wins at 0 (leftmost-first prefers earlier alt).
+        var s = (try LiteralAltScanner.build(a, &[_][]const u8{ "abc", "ab" })).?;
+        defer s.deinit(a);
+        const m = s.find("abcd", 0).?;
+        try std.testing.expectEqual(@as(usize, 3), m.end); // "abc"
+    }
+    {
+        // Internal substring must NOT pre-empt an earlier-starting literal:
+        // scanning "scatter", the whole word wins over "cat" at offset 1.
+        var s = (try LiteralAltScanner.build(a, &[_][]const u8{ "scatter", "cat" })).?;
+        defer s.deinit(a);
+        const m = s.find("a scatter b", 0).?;
+        try std.testing.expectEqual(@as(usize, 2), m.start);
+        try std.testing.expectEqual(@as(usize, 9), m.end); // "scatter", not "cat"
+    }
+    {
+        // Counting non-overlapping matches.
+        var s = (try LiteralAltScanner.build(a, &[_][]const u8{ "the", "cat" })).?;
+        defer s.deinit(a);
+        var n: usize = 0;
+        var pos: usize = 0;
+        while (s.find("the cat the cat", pos)) |m| {
+            n += 1;
+            pos = m.end;
+        }
+        try std.testing.expectEqual(@as(usize, 4), n);
+    }
+}

@@ -991,6 +991,9 @@ fn Parser(comptime cap: ?usize) type {
                         'n' => p.setLeaf(singleByteSet('\n')),
                         't' => p.setLeaf(singleByteSet('\t')),
                         'r' => p.setLeaf(singleByteSet('\r')),
+                        'f' => p.setLeaf(singleByteSet(0x0C)), // form feed
+                        'a' => p.setLeaf(singleByteSet(0x07)), // bell (alarm)
+                        'e' => p.setLeaf(singleByteSet(0x1B)), // escape
                         ' ' => p.setLeaf(singleByteSet(' ')), // `\ ` literal space (extended mode)
                         'x' => p.setLeaf(singleByteSet(try p.parseHexByte())),
                         'o' => p.setLeaf(singleByteSet(try p.parseOctalBraced())),
@@ -1202,6 +1205,9 @@ fn Parser(comptime cap: ?usize) type {
                     'n' => '\n',
                     't' => '\t',
                     'r' => '\r',
+                    'f' => 0x0C, // form feed
+                    'a' => 0x07, // bell (alarm)
+                    'e' => 0x1B, // escape
                     // Byte-valued escapes also serve as range endpoints
                     // (`[\x00-\x1F]`, `[\0-\a]`).
                     'x' => try p.parseHexByte(),

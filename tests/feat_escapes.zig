@@ -60,6 +60,21 @@ test "escapes: \\0 and octal" {
     try std.testing.expectError(error.NotImplemented, Regex.compile(a, "\\o{400}"));
 }
 
+test "escapes: \\f \\a \\e control bytes (standalone + in-class)" {
+    const a = std.testing.allocator;
+    // Standalone single-byte control escapes.
+    try std.testing.expect((try find1(a, "a\\fb", "a\x0cb")) != null);
+    try std.testing.expect((try find1(a, "a\\ab", "a\x07b")) != null);
+    try std.testing.expect((try find1(a, "a\\eb", "a\x1bb")) != null);
+    // As class members (the gap that made `[\t\v\f ]`-style lexer patterns
+    // error with NotImplemented before).
+    try std.testing.expect(try isM(a, "[\\t\\f ]", "\x0c"));
+    try std.testing.expect(try isM(a, "[\\t\\v\\f ]+", "\t\x0c "));
+    // As range endpoints: [\a-\f] = [\x07-\x0c].
+    try std.testing.expect(try isM(a, "[\\a-\\f]", "\x0a")); // \n is in 07..0c
+    try std.testing.expect(!try isM(a, "[\\a-\\f]", "z"));
+}
+
 test "escapes: \\h \\H horizontal whitespace (PCRE 8-bit incl. NBSP)" {
     const a = std.testing.allocator;
     try std.testing.expect(try isM(a, "\\h", "x y")); // space

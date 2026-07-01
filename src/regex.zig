@@ -47,7 +47,7 @@ pub const Group = @import("match.zig").Group;
 const wholeMatch = @import("match.zig").wholeMatch;
 const advanceEmpty = @import("match.zig").advanceEmpty;
 
-const MetaKind = enum { literal, dfa, lit_prefix, reverse_suffix, bt_look, backtrack, split_alt, lazy_dfa, dense_search, class_span, boundary_lits, dup_word, dfa_edge_look };
+const MetaKind = enum { literal, dfa, lit_prefix, reverse_suffix, bt_look, backtrack, split_alt, lazy_dfa, dense_search, class_span, boundary_lits, dup_word, dfa_edge_look, literal_alt };
 
 /// `.boundary_lits` engine: `\b(?:lit|lit|…)\b` (a word-boundary-bracketed
 /// pure literal alternation). The naive NFA of a big keyword list blows
@@ -253,6 +253,10 @@ pub const Regex = struct {
     /// `.dup_word`: owned linear recogniser for the `(\b CLASS+ \b) SEP \1`
     /// adjacent-duplicate-token shape (see `exec/dupword.zig`).
     dw: ?*dupword.DupWord = null,
+    /// `.literal_alt`: owned heap trie for a large pure-literal alternation
+    /// (`lit|lit|…`) whose naive NFA blows `MAX_NFA` — leftmost-first scan, no
+    /// NFA (see `prefilter.LiteralAltScanner`).
+    lit_alt: ?*prefilter.LiteralAltScanner = null,
     /// `.dfa_edge_look`: verify spec for the peeled trailing width-1 look.
     /// The regular `core` runs on `self.dfa` (a normal `Dfa256`); this is the
     /// O(1) edge check applied to each candidate end (see `exec/edge_look.zig`).
@@ -564,6 +568,107 @@ pub const Regex = struct {
         return null;
     }
 
+    /// Split `pattern` into its top-level `|` alternation branches, honouring
+    /// escapes, `[...]` classes and `(...)` nesting (a `|` inside a class or a
+    /// group is not a separator). Returns false on an unbalanced group/class.
+    fn splitTopAlt(pattern: []const u8, out: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !bool {
+        var depth: usize = 0;
+        var in_class = false;
+        var start: usize = 0;
+        var i: usize = 0;
+        while (i < pattern.len) {
+            const c = pattern[i];
+            if (c == '\\') {
+                i += 2; // skip the escaped byte (a trailing '\' just runs off the end)
+                continue;
+            }
+            if (in_class) {
+                if (c == ']') in_class = false;
+                i += 1;
+                continue;
+            }
+            switch (c) {
+                '[' => in_class = true,
+                '(' => depth += 1,
+                ')' => {
+                    if (depth == 0) return false;
+                    depth -= 1;
+                },
+                '|' => if (depth == 0) {
+                    try out.append(allocator, pattern[start..i]);
+                    start = i + 1;
+                },
+                else => {},
+            }
+            i += 1;
+        }
+        if (depth != 0 or in_class) return false;
+        try out.append(allocator, pattern[start..]);
+        return true;
+    }
+
+    /// `.literal_alt`: a large **pure-literal alternation** (`lit|lit|…`, e.g. a
+    /// 5000-word dictionary). Such a pattern overflows the construction ceilings
+    /// (`MAX_NODES` at parse, or `MAX_NFA` at NFA build) even though it is
+    /// trivially regular, so it is reached only from those overflow sites. We
+    /// rebuild it as a heap trie scanned leftmost-first — no HIR-wide build, no
+    /// NFA. Each branch is parsed *individually* (tiny, well under the ceilings)
+    /// to reuse the parser's exact literal semantics; a branch that isn't a
+    /// fixed literal makes the whole thing decline (→ the original error,
+    /// unchanged). Case-insensitive is declined (a `(?i)` literal is a set, not
+    /// a byte). Caller gates `ng == 0`.
+    fn tryLiteralAltRaw(allocator: std.mem.Allocator, pattern: []const u8, flags: common.CompileFlags, gnames: [hir.MAX_GROUPS + 1]?[]const u8) !?Regex {
+        if (flags.case_insensitive) return null;
+
+        var branches: std.ArrayList([]const u8) = .empty;
+        defer branches.deinit(allocator);
+        if (!(try splitTopAlt(pattern, &branches, allocator))) return null;
+        if (branches.items.len < 2) return null; // not an alternation
+
+        const pflags = parser.ParseFlags{
+            .ci = false,
+            .dot_all = flags.dot_all,
+            .extended = flags.extended,
+            .multiline = flags.multiline,
+        };
+
+        var backing: std.ArrayList(u8) = .empty;
+        defer backing.deinit(allocator);
+        var spans: std.ArrayList([2]usize) = .empty; // (offset, len) into backing
+        defer spans.deinit(allocator);
+
+        for (branches.items) |br| {
+            var bh = hir.Hir(null).initRuntime();
+            defer bh.deinit(allocator);
+            parser.parse(null, &bh, allocator, br, pflags) catch return null;
+            if (bh.root == hir.none or bh.anchored_start or bh.anchored_end) return null;
+            var buf: [seq_extract.MAX_LIT]u8 = undefined;
+            const ln = seq_extract.wholeLiteral(null, &bh, bh.root, &buf, 0) orelse return null;
+            if (ln == 0) return null;
+            const off = backing.items.len;
+            try backing.appendSlice(allocator, buf[0..ln]);
+            try spans.append(allocator, .{ off, ln });
+        }
+
+        // Backing is stable now; materialise needle slices (read-only; freed below).
+        const needles = try allocator.alloc([]const u8, spans.items.len);
+        defer allocator.free(needles);
+        for (spans.items, 0..) |s, i| needles[i] = backing.items[s[0] .. s[0] + s[1]];
+
+        const scanner = (try prefilter.LiteralAltScanner.build(allocator, needles)) orelse return null;
+        const e = try allocator.create(prefilter.LiteralAltScanner);
+        e.* = scanner;
+        return Regex{
+            .allocator = allocator,
+            .pattern = pattern,
+            .flags = flags,
+            .kind = .literal_alt,
+            .lit_alt = e,
+            .n_groups = 0,
+            .gnames = gnames,
+        };
+    }
+
     /// `.bt_look`: look-assertion patterns (`\b \B`, mid `^ $`, `(?m)`, `\A \z
     /// \Z`) run on the bounded backtracker (it evaluates conditional epsilons
     /// with (prev,next) byte context; the DFA can't fold look-assertions). Bakes
@@ -826,6 +931,14 @@ pub const Regex = struct {
             .extended = flags.extended,
             .multiline = flags.multiline,
         }, &ng0, &gnames0) catch |e| {
+            // A huge pure-literal alternation (e.g. a 5000-word dictionary)
+            // overflows `MAX_NODES` during parse. It is trivially regular, so
+            // before reporting `PatternTooComplex` try rebuilding it as the
+            // heap-trie `.literal_alt` engine (parses each branch on its own,
+            // well under the ceilings). Any non-literal-alt shape declines.
+            if (e == hir.Error.TooComplex) {
+                if (try tryLiteralAltRaw(allocator, owned, flags, gnames0)) |r| return r;
+            }
             return switch (e) {
                 hir.Error.Invalid => RegexError.InvalidPattern,
                 hir.Error.Unsupported => RegexError.NotImplemented,
@@ -850,7 +963,14 @@ pub const Regex = struct {
 
         if (ng0 == 0) if (try tryBoundaryLits(allocator, &h, owned, flags, gnames0)) |r| return r;
 
-        var nfa = thompson.build(null, &h) catch return RegexError.PatternTooComplex;
+        var nfa = thompson.build(null, &h) catch {
+            // The naive NFA overflowed `MAX_NFA`. A pure-literal alternation that
+            // parsed but is too big for the NFA is still trivially regular —
+            // route it to the heap-trie `.literal_alt` engine. Any other shape
+            // returns null here ⇒ `PatternTooComplex`, unchanged.
+            if (ng0 == 0) if (try tryLiteralAltRaw(allocator, owned, flags, gnames0)) |r| return r;
+            return RegexError.PatternTooComplex;
+        };
 
         const gnames = gnames0;
         const ng = ng0;
@@ -952,6 +1072,10 @@ pub const Regex = struct {
         }
         if (self.blits) |p| self.allocator.destroy(p);
         if (self.dw) |p| self.allocator.destroy(p);
+        if (self.lit_alt) |p| {
+            p.deinit(self.allocator);
+            self.allocator.destroy(p);
+        }
     }
 
     /// `.bt_look` leftmost span. The visited bitset is borrowed from a
@@ -1122,6 +1246,7 @@ pub const Regex = struct {
             .boundary_lits => self.blits.?.find(input, 0) != null,
             .dup_word => self.dw.?.find(input, 0) != null,
             .dfa_edge_look => edge_look.nextFrom(self.dfa.?, &self.el_spec, input, 0) != null,
+            .literal_alt => self.lit_alt.?.isMatch(input),
         };
     }
 
@@ -1331,6 +1456,10 @@ pub const Regex = struct {
                 break :blk core.Span{ .start = r.start, .end = r.end }; // absolute
             },
             .dfa_edge_look => edge_look.nextFrom(self.dfa.?, &self.el_spec, input, pos), // absolute
+            .literal_alt => blk: {
+                const r = self.lit_alt.?.find(input, pos) orelse break :blk null;
+                break :blk core.Span{ .start = r.start, .end = r.end }; // absolute
+            },
         };
     }
 
