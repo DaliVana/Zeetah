@@ -20,6 +20,14 @@ const MAX_EDGES = thompson.MAX_EDGES;
 
 const hasBit = common.hasBit;
 
+/// State-count capacity for a given NFA cap: comptime (`cap == N`) NFAs are
+/// sized to the small `MAX_NFA`, the runtime (`cap == null`) NFA to the larger
+/// `MAX_NFA_RUNTIME` (see `thompson`'s `MAX_*_RUNTIME` note). Callers that size
+/// per-state scratch by this stay correct for both fronts.
+fn statesCap(comptime cap: ?usize) usize {
+    return if (cap == null) thompson.MAX_NFA_RUNTIME else MAX_NFA;
+}
+
 /// Byte equivalence classes + per-class representative byte.
 pub const Classes = struct {
     class_of: [256]u8 = [_]u8{0} ** 256,
@@ -83,8 +91,9 @@ pub fn buildForwardCsr(
     cnt_set: []u16,
     cnt_off: []usize,
 ) void {
-    var ecount = [_]usize{0} ** MAX_NFA;
-    var ccount = [_]usize{0} ** MAX_NFA;
+    const NCAP = comptime statesCap(cap);
+    var ecount = [_]usize{0} ** NCAP;
+    var ccount = [_]usize{0} ** NCAP;
     var ei: usize = 0;
     while (ei < nfa.n_edges) : (ei += 1) {
         if (nfa.e_kind[ei] == .eps) ecount[nfa.e_from[ei]] += 1 else ccount[nfa.e_from[ei]] += 1;
@@ -103,8 +112,8 @@ pub fn buildForwardCsr(
         acc += ccount[s];
     }
     cnt_off[nfa.n_states] = acc;
-    var efill: [MAX_NFA + 1]usize = undefined;
-    var cfill: [MAX_NFA + 1]usize = undefined;
+    var efill: [NCAP + 1]usize = undefined;
+    var cfill: [NCAP + 1]usize = undefined;
     for (0..nfa.n_states + 1) |k| {
         efill[k] = eps_off[k];
         cfill[k] = cnt_off[k];
@@ -128,7 +137,14 @@ pub fn buildForwardCsr(
 /// at the first occurrence of `accept_state` so lower-priority threads are
 /// dropped. Writes the ordered NFA-state list to `out`, returns its length;
 /// `acc.*` ⇔ the closure is accepting.
+/// `nmax`/`emax` size the internal `seen`/`stack` scratch: the eager path
+/// passes the small `MAX_NFA`/`MAX_EDGES`, the lazy path the larger runtime
+/// ceilings. Only `seen[0..n_states]` is cleared (n_states = `eps_off.len - 1`),
+/// so a larger capacity costs no extra per-call memset — the hot lazy path over
+/// a small NFA is byte-identical to the old fixed-256 version.
 pub fn closure(
+    comptime nmax: usize,
+    comptime emax: usize,
     eps_to: []const u16,
     eps_off: []const usize,
     accept_state: u16,
@@ -136,9 +152,10 @@ pub fn closure(
     out: []u16,
     acc: *bool,
 ) usize {
-    var seen = [_]bool{false} ** MAX_NFA;
+    var seen: [nmax]bool = undefined;
+    @memset(seen[0 .. eps_off.len - 1], false);
     var len: usize = 0;
-    var stack: [MAX_EDGES]u16 = undefined;
+    var stack: [emax]u16 = undefined;
     for (seeds) |sd| {
         var sp: usize = 0;
         stack[0] = sd;

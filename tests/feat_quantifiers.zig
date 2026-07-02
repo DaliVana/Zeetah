@@ -118,14 +118,12 @@ test "bounded {m,}: open-ended" {
     try std.testing.expect(!try rx.isMatch("a"));
 }
 
-test "bounded: parser ceiling raised 64 -> 1000; two layered guards" {
+test "bounded: parser ceiling raised 64 -> 1000; layered guards" {
     const a = std.testing.allocator;
     // Phase A raised the *parser* MAX_REPEAT 64 -> 1000, so {65} (rejected
-    // before) now compiles. A second, independent guard — the NFA/DFA size
-    // ceiling — still rejects large expansions as PatternTooComplex. Both are
-    // typed contract errors (never a crash); the contract is "small counts
-    // compile, over-parser-ceiling is NotImplemented, big-but-in-budget is
-    // PatternTooComplex".
+    // before) now compiles. Two more layered guards remain, both typed (never a
+    // crash): over-parser-ceiling is NotImplemented; an NFA past the *runtime*
+    // construction ceiling (MAX_NFA_RUNTIME) is PatternTooComplex.
     for ([_][]const u8{ "a{64}", "a{65}" }) |p| {
         var ok = try Regex.compile(a, p);
         ok.deinit();
@@ -133,8 +131,20 @@ test "bounded: parser ceiling raised 64 -> 1000; two layered guards" {
     // Over the parser ceiling: specifically NotImplemented.
     try std.testing.expectError(error.NotImplemented, Regex.compile(a, "a{1001}"));
     try std.testing.expectError(error.NotImplemented, Regex.compile(a, "a{0,1001}"));
-    // In parser budget but past the DFA size guard: typed, not a crash.
-    try std.testing.expectError(error.PatternTooComplex, Regex.compile(a, "a{300}"));
+    // `a{300}` (~600 NFA states) once tripped the eager 256-state guard; the
+    // runtime now hands over-256 regular NFAs to the heap lazy DFA, so it
+    // compiles AND matches. (The comptime `Pattern` path still rejects it — its
+    // baked DFA stays at the small ceiling.)
+    {
+        var rx = try Regex.compile(a, "a{300}");
+        defer rx.deinit();
+        const long = "a" ** 300;
+        try std.testing.expect(try rx.isMatch(long));
+        try std.testing.expect(!try rx.isMatch("a" ** 299));
+    }
+    // Still past the *runtime* size guard (~2048 states): typed, not a crash.
+    // `[ab]{1000}[cd]{1000}` ≈ 4000 NFA states.
+    try std.testing.expectError(error.PatternTooComplex, Regex.compile(a, "[ab]{1000}[cd]{1000}"));
 }
 
 // Migrated from the retired tests/meta_phase6.zig "known boundaries" gate.

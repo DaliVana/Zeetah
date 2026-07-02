@@ -40,6 +40,24 @@ pub const MAX_EDGES: usize = 1024;
 // bake alike. (Decoupled from `MAX_EDGES`, which still bounds edges/`e_set`.)
 pub const MAX_SETS: usize = 256;
 
+// --- Runtime-only construction ceilings -------------------------------------
+// The COMPTIME front-end (`pattern.zig`) bakes a fixed-size DFA into `.rodata`
+// and cannot afford large construction arrays (they blow the comptime branch
+// budget — a global raise timed the comptime rebar build out at >2 min). The
+// RUNTIME front-end (`regex.zig`) has no such constraint: an over-256-state NFA
+// is handed to the heap-based lazy DFA (`exec/lazy_dfa.zig`), which computes
+// states on demand. So `Nfa(null)` (runtime) is sized to these larger ceilings
+// while `Nfa(N)` (comptime, concrete `N`) stays at the small `MAX_*` above —
+// the two are distinct types, so the comptime bake is entirely unaffected.
+// The eager DFA (`full_dfa.Dfa256`) stays at `MAX_NFA`/`MAX_DFA` and size-guards
+// itself; NFAs beyond it route to the lazy engine. Values chosen to admit the
+// benchmark's bounded-repeat blowups (`(?:[A-Z][a-z]+\s*){10,100}` ≈ 1.3 k
+// states, `[\s\S]{0,100}…` ≈ 0.9 k) with headroom; `n_edges ≤ 2.5·n_states`
+// and `n_sets ≤ n_states/2` bound the other two.
+pub const MAX_NFA_RUNTIME: usize = 2048;
+pub const MAX_EDGES_RUNTIME: usize = 6144;
+pub const MAX_SETS_RUNTIME: usize = 1536;
+
 pub const Frag = struct { start: usize, accept: usize };
 
 /// Per-edge classification in the flat NFA. `.eps` = ε-transition (`e_slot` may
@@ -54,38 +72,44 @@ pub const EdgeKind = enum(u8) { eps, consume, look };
 /// trusted subset/minimization code unchanged. `cap == N` -> comptime (fixed
 /// arrays); `cap == null` -> runtime (heap arrays).
 pub fn Nfa(comptime cap: ?usize) type {
-    _ = cap; // Both modes use the same fixed ceilings; comptime evaluates the
-    // arrays away, runtime stack/heap-allocates them once per compile.
     return struct {
         const Self = @This();
+        // `cap == null` -> runtime: sized to the larger runtime ceilings (an
+        // over-`MAX_NFA` NFA is served by the heap lazy DFA). `cap == N` ->
+        // comptime: sized to the small fixed `MAX_*` (the baked DFA path), so
+        // the comptime instantiation is byte-identical to before. See the
+        // `MAX_*_RUNTIME` note above.
+        const NS = if (cap == null) MAX_NFA_RUNTIME else MAX_NFA;
+        const NE = if (cap == null) MAX_EDGES_RUNTIME else MAX_EDGES;
+        const NST = if (cap == null) MAX_SETS_RUNTIME else MAX_SETS;
 
         n_states: usize = 0,
         // Per-edge kind (see `EdgeKind`): .eps | .consume (e_set valid) |
         // .look (conditional epsilon; e_look holds the `hir.LookKind`).
-        e_from: [MAX_EDGES]u16 = undefined,
-        e_to: [MAX_EDGES]u16 = undefined,
-        e_kind: [MAX_EDGES]EdgeKind = undefined,
-        e_set: [MAX_EDGES]u16 = undefined,
-        e_look: [MAX_EDGES]u8 = undefined,
+        e_from: [NE]u16 = undefined,
+        e_to: [NE]u16 = undefined,
+        e_kind: [NE]EdgeKind = undefined,
+        e_set: [NE]u16 = undefined,
+        e_look: [NE]u8 = undefined,
         // Capture save-slot for an .eps edge: -1 = ordinary epsilon,
         // >=0 = write the current position into slot `e_slot` (transparent
         // to the DFA, which only distinguishes .eps vs non-.eps).
-        e_slot: [MAX_EDGES]i32 = undefined,
+        e_slot: [NE]i32 = undefined,
         n_edges: usize = 0,
-        sets: [MAX_SETS][32]u8 = undefined,
+        sets: [NST][32]u8 = undefined,
         n_sets: usize = 0,
         start: usize = 0,
         accept: usize = 0,
 
         fn addState(b: *Self) Error!usize {
-            if (b.n_states >= MAX_NFA) return Error.TooComplex;
+            if (b.n_states >= NS) return Error.TooComplex;
             const id = b.n_states;
             b.n_states += 1;
             return id;
         }
 
         fn addEps(b: *Self, from: usize, to: usize) Error!void {
-            if (b.n_edges >= MAX_EDGES) return Error.TooComplex;
+            if (b.n_edges >= NE) return Error.TooComplex;
             b.e_from[b.n_edges] = @intCast(from);
             b.e_to[b.n_edges] = @intCast(to);
             b.e_kind[b.n_edges] = .eps;
@@ -97,7 +121,7 @@ pub fn Nfa(comptime cap: ?usize) type {
         /// An .eps epsilon that also records `pos` into capture slot `slot`.
         /// Transparent to the DFA (it treats every .eps edge as epsilon).
         fn addSaveEps(b: *Self, from: usize, to: usize, slot: i32) Error!void {
-            if (b.n_edges >= MAX_EDGES) return Error.TooComplex;
+            if (b.n_edges >= NE) return Error.TooComplex;
             b.e_from[b.n_edges] = @intCast(from);
             b.e_to[b.n_edges] = @intCast(to);
             b.e_kind[b.n_edges] = .eps;
@@ -107,7 +131,7 @@ pub fn Nfa(comptime cap: ?usize) type {
         }
 
         fn addLookEdge(b: *Self, from: usize, to: usize, kind: u8) Error!void {
-            if (b.n_edges >= MAX_EDGES) return Error.TooComplex;
+            if (b.n_edges >= NE) return Error.TooComplex;
             b.e_from[b.n_edges] = @intCast(from);
             b.e_to[b.n_edges] = @intCast(to);
             b.e_kind[b.n_edges] = .look;
@@ -118,7 +142,7 @@ pub fn Nfa(comptime cap: ?usize) type {
         }
 
         fn addSetEdge(b: *Self, from: usize, to: usize, set: [32]u8) Error!void {
-            if (b.n_edges >= MAX_EDGES or b.n_sets >= MAX_SETS) return Error.TooComplex;
+            if (b.n_edges >= NE or b.n_sets >= NST) return Error.TooComplex;
             b.sets[b.n_sets] = set;
             b.e_from[b.n_edges] = @intCast(from);
             b.e_to[b.n_edges] = @intCast(to);

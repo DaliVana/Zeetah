@@ -972,6 +972,20 @@ pub const Regex = struct {
             return RegexError.PatternTooComplex;
         };
 
+        // Runtime NFA beyond the eager tables' fixed ceiling (`Nfa(null)` is
+        // sized to the larger runtime ceilings). Only a capture-free, look-free
+        // *regular* pattern can be served — by the heap lazy DFA, which computes
+        // states on demand (the eager `full_dfa` size-guards itself to
+        // `.exploded` for such an NFA). Captures / look would need the bounded
+        // backtracker + one-pass scratch, which stay fixed at `MAX_NFA`, so they
+        // report the typed `PatternTooComplex` — same contract as before the
+        // ceiling was raised, never a crash. (Backref / atomic already returned
+        // via the HIR tree backtracker above, which has no NFA-size ceiling.)
+        if (nfa.n_states > thompson.MAX_NFA or nfa.n_edges > thompson.MAX_EDGES) {
+            if (ng0 != 0 or props.has_look) return RegexError.PatternTooComplex;
+            return try buildLazyRegex(allocator, &nfa, null, owned, flags, h.anchored_start, h.anchored_end, ng0, gnames0);
+        }
+
         const gnames = gnames0;
         const ng = ng0;
 

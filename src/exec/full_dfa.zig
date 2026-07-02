@@ -439,6 +439,10 @@ fn findOrAdd(lists: *[MAX_DFA][MAX_NFA]u16, lens: *[MAX_DFA]usize, n: *usize, wa
 pub fn computeReverse(comptime cap: ?usize, nfa: *const thompson.Nfa(cap)) Dfa256 {
     @setEvalBranchQuota(4_000_000);
 
+    // Fixed-scratch guard (see `compute`): an over-`MAX_NFA` runtime NFA routes
+    // to the lazy engine, never here.
+    if (nfa.n_states > MAX_NFA or nfa.n_edges > MAX_EDGES) return emptyDfa256(.exploded);
+
     // Reversed NFA: flip every edge and swap start↔accept. A conditional `look`
     // edge has no meaningful reverse here — bail (caller keeps the forward path).
     var rev = nfa.*;
@@ -489,7 +493,7 @@ pub fn computeReverse(comptime cap: ?usize, nfa: *const thompson.Nfa(cap)) Dfa25
     var start_buf: [MAX_NFA]u16 = undefined;
     var dummy_acc = false;
     const start_seeds = [_]u16{@intCast(rev.start)};
-    const start_len = dfa_build.closure(&eps_to, &eps_off, SENTINEL, &start_seeds, &start_buf, &dummy_acc);
+    const start_len = dfa_build.closure(MAX_NFA, MAX_EDGES, &eps_to, &eps_off, SENTINEL, &start_seeds, &start_buf, &dummy_acc);
     // Canonical key for `findOrAdd`: the no-cut closure is pure reachability, so
     // the same NFA-set can arrive in different DFS orders — sort to dedup it to
     // ONE reverse-DFA state (mirrors `lazy_memo.rintern`). Without this, spurious
@@ -527,7 +531,7 @@ pub fn computeReverse(comptime cap: ?usize, nfa: *const thompson.Nfa(cap)) Dfa25
             }
             var tgt_buf: [MAX_NFA]u16 = undefined;
             var tacc = false;
-            const tgt_len = dfa_build.closure(&eps_to, &eps_off, SENTINEL, seeds[0..n_seeds], &tgt_buf, &tacc);
+            const tgt_len = dfa_build.closure(MAX_NFA, MAX_EDGES, &eps_to, &eps_off, SENTINEL, seeds[0..n_seeds], &tgt_buf, &tacc);
             std.mem.sort(u16, tgt_buf[0..tgt_len], {}, std.sort.asc(u16)); // canonical key (see start)
             const id = findOrAdd(&dfa_list, &dfa_len, &dfa_n, &tgt_buf, tgt_len) catch {
                 return emptyDfa256(.exploded);
@@ -584,6 +588,13 @@ pub fn emptyDfa256(outcome: Outcome) Dfa256 {
 pub fn compute(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), a_start: bool, a_end: bool) Dfa256 {
     @setEvalBranchQuota(4_000_000);
 
+    // The eager tables + subset-construction scratch are fixed at `MAX_NFA` /
+    // `MAX_EDGES` / `MAX_DFA` (256/1024/256). A runtime NFA can now exceed that
+    // (`Nfa(null)` is sized to the larger runtime ceilings); such an NFA is
+    // handed to the heap lazy DFA instead, so bail here *before* the CSR build
+    // would index past the fixed scratch. (Comptime NFAs are always ≤ MAX_NFA.)
+    if (nfa.n_states > MAX_NFA or nfa.n_edges > MAX_EDGES) return emptyDfa256(.exploded);
+
     const nfa_start = nfa.start;
     const nfa_accept = nfa.accept;
 
@@ -620,7 +631,7 @@ pub fn compute(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), a_start: boo
             out_list: *[MAX_NFA]u16,
             accept_flag: *bool,
         ) usize {
-            return dfa_build.closure(eps_to_, eps_off_, accept, seeds, out_list, accept_flag);
+            return dfa_build.closure(MAX_NFA, MAX_EDGES, eps_to_, eps_off_, accept, seeds, out_list, accept_flag);
         }
     };
 

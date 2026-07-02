@@ -43,8 +43,15 @@ const dfa_build = @import("dfa_build.zig");
 const lazy_memo = @import("lazy_memo.zig");
 const dense_search = @import("dense_search.zig");
 
-const MAX_NFA = thompson.MAX_NFA;
-const MAX_EDGES = thompson.MAX_EDGES;
+// The lazy DFA is the runtime home for over-`MAX_NFA` NFAs (the eager
+// `full_dfa` bails to here), so its per-search scratch is sized to the larger
+// runtime ceilings. Every search-time buffer here is `undefined` (no per-call
+// memset) except `closureRev`'s `seen`, which is cleared over `[0..n_states]`
+// only — so a bigger capacity is free for the common small-NFA lazy pattern.
+// The CSR is heap-allocated to the NFA's *actual* edge/state counts (below), so
+// small patterns keep their small footprint.
+const MAX_NFA = thompson.MAX_NFA_RUNTIME;
+const MAX_EDGES = thompson.MAX_EDGES_RUNTIME;
 
 // Mutable per-search scratch + the frozen dense form now live in their own
 // files; re-exported here so consumers keep using `lazy_dfa.{LazyMemo,
@@ -93,25 +100,31 @@ pub const LazyProg = struct {
         // buffers already taken (a single struct-literal of `try alloc`s leaks
         // every prior allocation if a later one fails). On success the errdefers
         // are disarmed by the normal return; `buildCsr`/`classify` are infallible.
-        const eps_to = try allocator.alloc(u16, MAX_EDGES);
+        // Size the CSR to the NFA's *actual* edge/state counts (not the fixed
+        // ceiling): a small NFA routed here (eager-DFA blow-up) keeps its small
+        // footprint, a large one gets exactly what it needs, and the `[0..
+        // n_states]` clear bound in `dfa_build.closure` stays tight either way.
+        const ne = nfa.n_edges;
+        const no = nfa.n_states + 1;
+        const eps_to = try allocator.alloc(u16, ne);
         errdefer allocator.free(eps_to);
-        const eps_off = try allocator.alloc(usize, MAX_NFA + 1);
+        const eps_off = try allocator.alloc(usize, no);
         errdefer allocator.free(eps_off);
-        const cnt_to = try allocator.alloc(u16, MAX_EDGES);
+        const cnt_to = try allocator.alloc(u16, ne);
         errdefer allocator.free(cnt_to);
-        const cnt_set = try allocator.alloc(u16, MAX_EDGES);
+        const cnt_set = try allocator.alloc(u16, ne);
         errdefer allocator.free(cnt_set);
-        const cnt_off = try allocator.alloc(usize, MAX_NFA + 1);
+        const cnt_off = try allocator.alloc(usize, no);
         errdefer allocator.free(cnt_off);
-        const reps_to = try allocator.alloc(u16, MAX_EDGES);
+        const reps_to = try allocator.alloc(u16, ne);
         errdefer allocator.free(reps_to);
-        const reps_off = try allocator.alloc(usize, MAX_NFA + 1);
+        const reps_off = try allocator.alloc(usize, no);
         errdefer allocator.free(reps_off);
-        const rcnt_from = try allocator.alloc(u16, MAX_EDGES);
+        const rcnt_from = try allocator.alloc(u16, ne);
         errdefer allocator.free(rcnt_from);
-        const rcnt_set = try allocator.alloc(u16, MAX_EDGES);
+        const rcnt_set = try allocator.alloc(u16, ne);
         errdefer allocator.free(rcnt_set);
-        const rcnt_off = try allocator.alloc(usize, MAX_NFA + 1);
+        const rcnt_off = try allocator.alloc(usize, no);
         errdefer allocator.free(rcnt_off);
         var self = LazyProg{
             .allocator = allocator,
@@ -225,6 +238,8 @@ pub const LazyProg = struct {
     /// memoized search's cold-transition path keeps a flat call shape.
     inline fn closure(self: *const LazyProg, seeds: []const u16, out: []u16, acc: *bool) usize {
         return dfa_build.closure(
+            MAX_NFA,
+            MAX_EDGES,
             self.eps_to,
             self.eps_off,
             @intCast(self.nfa.accept),
@@ -237,7 +252,10 @@ pub const LazyProg = struct {
     /// Reverse epsilon-closure over the flipped CSR. Pure reachability (no
     /// priority cut). `*hit` ⇔ forward start state reachable.
     fn closureRev(self: *const LazyProg, seeds: []const u16, out: []u16, hit: *bool) usize {
-        var seen = [_]bool{false} ** MAX_NFA;
+        // Capacity is the runtime ceiling; clear only the live states so a big
+        // buffer costs no extra per-call memset (n_states ≤ this NFA's count).
+        var seen: [MAX_NFA]bool = undefined;
+        @memset(seen[0..self.nfa.n_states], false);
         var len: usize = 0;
         var stack: [MAX_EDGES]u16 = undefined;
         const fwd_start: u16 = @intCast(self.nfa.start);
