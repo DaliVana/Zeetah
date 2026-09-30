@@ -197,7 +197,8 @@ test "core: reverse-inner req_lit on/off agree on findAll (differential)" {
         var h = hir.Hir(null).initRuntime();
         defer h.deinit(a);
         parser.parse(null, &h, a, p, .{}) catch continue;
-        var nfa = thompson.build(null, &h) catch continue;
+        var nfa = thompson.buildAlloc(a, &h) catch continue;
+        defer nfa.deinit(a);
         var d = full_dfa.compute(null, &nfa, h.anchored_start, h.anchored_end);
         if (d.outcome != .ok) continue;
         const rl = seq_extract.requiredLiteralBack(null, &h) orelse continue;

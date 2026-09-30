@@ -430,6 +430,9 @@ _ = try re.isMatch("aaaaaaaaaaaaaaaaX"); // fast, linear — no error, no hang
   (`MAX_DEPTH = 16384`). Exceeding either returns a typed
   **`error.MatchBudgetExceeded` at match time** — the .NET-style runtime
   contract, never a hang. (Distinct from the compile-time `PatternTooComplex`.)
+  The only other match-time error is **`error.Internal`**, the engine's own bug
+  signal (an internal invariant was violated) — never expected; please report
+  the pattern and input if you ever see it.
 
 ```zig
 // Non-regular catastrophe (inside a lookahead): bounded at MATCH time.

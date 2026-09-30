@@ -61,15 +61,32 @@ pub const SplitAlt = struct {
         a_end: bool,
         seek: ?*const seek_mod.Seek,
     ) Error!?Span {
+        return self.runFrom(input, 0, a_start, a_end, seek);
+    }
+
+    /// Leftmost-first match at/after absolute `from` over the FULL `input`.
+    /// The tree-backtracker segments run via `runFrom` (absolute), so a
+    /// look-behind / `\b` / `^` at a resume point sees the real preceding
+    /// byte; the DFA segments are look-free (`dfaEligible`), so running them
+    /// anchored on `input[s..]` is exact.
+    pub fn runFrom(
+        self: *const SplitAlt,
+        input: []const u8,
+        from: usize,
+        a_start: bool,
+        a_end: bool,
+        seek: ?*const seek_mod.Seek,
+    ) Error!?Span {
+        if (a_start and from > 0) return null; // `^`/`\A` only matches at 0
         // `$`-anchored fast-negative (same as `backtrack.runFrom`): one O(n)
         // reverse pass over the over-approximation rejects the whole search when
         // no suffix ends at `input.len`, before the per-start backtracker scan.
         if (a_end and !a_start) {
             if (seek) |sd| {
-                if (sd.rejectsAnchoredEnd(input, 0)) return null;
+                if (sd.rejectsAnchoredEnd(input, from)) return null;
             }
         }
-        var s: usize = 0;
+        var s: usize = from;
         while (s <= input.len) : (s += 1) {
             if (!a_start) {
                 if (seek) |sd| {
@@ -83,9 +100,9 @@ pub const SplitAlt = struct {
                         return Span{ .start = s, .end = s + sp.end };
                 } else {
                     var bt = backtrack.Backtracker.init(seg.bt_hir.?, true, a_end, 0, null, null);
-                    var slots: [2]i32 = undefined;
-                    if (try bt.run(input[s..], slots[0..2])) |sp|
-                        return Span{ .start = s, .end = s + sp.end };
+                    var slots: [2]hir.Slot = undefined;
+                    if (try bt.runFrom(input, s, slots[0..2])) |sp|
+                        return Span{ .start = s, .end = sp.end };
                 }
             }
             if (a_start) return null;
@@ -136,7 +153,8 @@ fn buildRunDfa(
         root = dst.addNode(a, .{ .tag = .alt, .a = root, .b = rb }) catch return null;
     }
     dst.root = root;
-    const nfa = thompson.build(null, &dst) catch return null;
+    var nfa = thompson.buildAlloc(a, &dst) catch return null;
+    defer nfa.deinit(a);
     const d = full_dfa.compute(null, &nfa, true, a_end); // anchored at scan pos
     if (d.outcome != .ok) return null;
     const heap = a.create(full_dfa.Dfa256) catch return null;

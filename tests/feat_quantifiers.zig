@@ -118,23 +118,25 @@ test "bounded {m,}: open-ended" {
     try std.testing.expect(!try rx.isMatch("a"));
 }
 
-test "bounded: parser ceiling raised 64 -> 1000; two layered guards" {
+test "bounded: repetition counts — two layered guards (runtime ceilings)" {
     const a = std.testing.allocator;
-    // Phase A raised the *parser* MAX_REPEAT 64 -> 1000, so {65} (rejected
-    // before) now compiles. A second, independent guard — the NFA/DFA size
-    // ceiling — still rejects large expansions as PatternTooComplex. Both are
-    // typed contract errors (never a crash); the contract is "small counts
-    // compile, over-parser-ceiling is NotImplemented, big-but-in-budget is
-    // PatternTooComplex".
-    for ([_][]const u8{ "a{64}", "a{65}" }) |p| {
+    // Two independent guards, both typed contract errors (never a crash): the
+    // parser's repeat-count ceiling (runtime 65535, PCRE2's maximum — the
+    // comptime `Pattern` keeps 1000) ⇒ NotImplemented, and the runtime NFA
+    // size ceiling (`thompson.MAX_NFA_RUNTIME`) ⇒ PatternTooComplex. Counts in
+    // between compile: past the eager DFA they run on the lazy DFA.
+    for ([_][]const u8{ "a{64}", "a{65}", "a{300}", "a{1001}", "a{0,1001}", "[0-9A-Za-z_-]{20,1024}" }) |p| {
         var ok = try Regex.compile(a, p);
-        ok.deinit();
+        defer ok.deinit();
+        try std.testing.expect(try ok.isMatch("x" ++ "a" ** 1100));
     }
-    // Over the parser ceiling: specifically NotImplemented.
-    try std.testing.expectError(error.NotImplemented, Regex.compile(a, "a{1001}"));
-    try std.testing.expectError(error.NotImplemented, Regex.compile(a, "a{0,1001}"));
-    // In parser budget but past the DFA size guard: typed, not a crash.
-    try std.testing.expectError(error.PatternTooComplex, Regex.compile(a, "a{300}"));
+    // Over the runtime parser ceiling: specifically NotImplemented.
+    try std.testing.expectError(error.NotImplemented, Regex.compile(a, "a{65536}"));
+    try std.testing.expectError(error.NotImplemented, Regex.compile(a, "a{0,65536}"));
+    // In parser budget but past the runtime NFA ceiling (~40 K states).
+    try std.testing.expectError(error.PatternTooComplex, Regex.compile(a, "a{20000}"));
+    // The comptime path keeps its 1000 ceiling (a `@compileError` there).
+    try std.testing.expect(!regex.compilesAtComptime("a{1001}", false, false));
 }
 
 // Migrated from the retired tests/meta_phase6.zig "known boundaries" gate.

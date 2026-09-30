@@ -174,7 +174,8 @@ pub fn build(allocator: std.mem.Allocator, h: *const H) ?*Plan {
         var oh = H.initRuntime();
         defer oh.deinit(allocator);
         oh.root = copyReg(&oh, allocator, h, nd.a) catch continue;
-        var nfa = thompson.build(null, &oh) catch continue;
+        var nfa = thompson.buildAlloc(allocator, &oh) catch continue;
+        defer nfa.deinit(allocator);
         var d = full_dfa.compute(null, &nfa, true, false); // anchored start
         if (d.outcome != .ok) continue;
         // Retain the island right-sized (packed) rather than the fat 128 KB
@@ -213,15 +214,15 @@ fn diffOnOff(a: std.mem.Allocator, p: []const u8, ins: []const []const u8, must_
     for (ins) |in| {
         var off = backtrack.Backtracker.init(&h, h.anchored_start, h.anchored_end, 8, null, null);
         var on = backtrack.Backtracker.init(&h, h.anchored_start, h.anchored_end, 8, null, plan);
-        var so: [2 * (hir.MAX_GROUPS + 1)]i32 = undefined;
-        var sn: [2 * (hir.MAX_GROUPS + 1)]i32 = undefined;
+        var so: [2 * (hir.MAX_GROUPS + 1)]hir.Slot = undefined;
+        var sn: [2 * (hir.MAX_GROUPS + 1)]hir.Slot = undefined;
         const ro = off.run(in, so[0..18]) catch null;
         const rn = on.run(in, sn[0..18]) catch null;
         try std.testing.expectEqual(ro == null, rn == null);
         if (ro) |rspan| {
             try std.testing.expectEqual(rspan.start, rn.?.start);
             try std.testing.expectEqual(rspan.end, rn.?.end);
-            try std.testing.expectEqualSlices(i32, so[0..18], sn[0..18]);
+            try std.testing.expectEqualSlices(hir.Slot, so[0..18], sn[0..18]);
         }
     }
 }

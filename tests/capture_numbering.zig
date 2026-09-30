@@ -28,17 +28,17 @@ const CapCheck = struct {
     /// The `.cap` indices form the contiguous set {1..cap_nodes} (no phantom/gap).
     contiguous: bool,
     /// `parseCaptures` reported names, by 1-based group index.
-    names: [hir.MAX_GROUPS + 1]?[]const u8,
+    names: [hir.MAX_GROUPS_RUNTIME + 1]?[]const u8,
 };
 
 fn check(pattern: []const u8) !CapCheck {
     var h = hir.Hir(null).initRuntime();
     defer h.deinit(std.testing.allocator);
-    var names = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1);
+    var names = [_]?[]const u8{null} ** (hir.MAX_GROUPS_RUNTIME + 1);
     var ng: usize = 0;
     parser.parseCaptures(null, &h, std.testing.allocator, pattern, .{}, &ng, &names) catch return error.ParseFailed;
 
-    var seen = [_]bool{false} ** (hir.MAX_GROUPS + 1);
+    var seen = [_]bool{false} ** (hir.MAX_GROUPS_RUNTIME + 1);
     var count: usize = 0;
     var maxi: usize = 0;
     for (h.nodes.items) |nd| {

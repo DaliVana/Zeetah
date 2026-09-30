@@ -22,6 +22,12 @@ const std = @import("std");
 ///                             budget. Distinct from `PatternTooComplex`.
 /// Either:
 ///   - `OutOfMemory`       — an allocation failed.
+///   - `Internal`          — an engine invariant was violated (two engines
+///                           disagreed about a match, or a pattern reached an
+///                           engine that cannot run it). Never expected; it is
+///                           a bug in zeetah — please report the pattern and
+///                           input. Reported as a typed error rather than a
+///                           silently wrong answer or an `unreachable`.
 pub const RegexError = error{
     EmptyPattern,
     InvalidPattern,
@@ -29,6 +35,7 @@ pub const RegexError = error{
     PatternTooComplex,
     MatchBudgetExceeded,
     OutOfMemory,
+    Internal,
 };
 
 test "RegexError is exactly the returnable set (alpha-freeze guard)" {
@@ -37,5 +44,5 @@ test "RegexError is exactly the returnable set (alpha-freeze guard)" {
     // post-alpha is breaking; adding one is not. If you intentionally add one,
     // bump this count.
     const set = @typeInfo(RegexError).error_set.?;
-    try std.testing.expectEqual(@as(usize, 6), set.len);
+    try std.testing.expectEqual(@as(usize, 7), set.len);
 }

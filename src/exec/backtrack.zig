@@ -89,7 +89,7 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
         /// test before the (dominant-cost) tree walk. `null` ⇒ no filter.
         line_first: ?[32]u8 = null,
         input: []const u8 = &.{},
-        slots: [2 * (hir.MAX_GROUPS + 1)]i32 = undefined,
+        slots: [2 * (hir.MAX_GROUPS + 1)]hir.Slot = undefined,
         match_end: usize = 0,
         steps: u64 = 0,
         budget: u64 = 0,
@@ -247,8 +247,12 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
                     const su: usize = @intCast(s);
                     const w: usize = @as(usize, @intCast(e)) - su;
                     if (pos + w > self.input.len) return false;
-                    if (!std.mem.eql(u8, self.input[pos .. pos + w], self.input[su .. su + w]))
-                        return false;
+                    const a = self.input[pos .. pos + w];
+                    const b = self.input[su .. su + w];
+                    // `(?i)` backref: the group's text in any (ASCII) case, the
+                    // same folding `(?i)` applies to literals and classes.
+                    const same = if (nd.fold) std.ascii.eqlIgnoreCase(a, b) else std.mem.eql(u8, a, b);
+                    if (!same) return false;
                     return self.cont(pos + w, k);
                 },
                 // Out-of-line: its slot-snapshot buffer would otherwise enlarge
@@ -342,7 +346,7 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
         /// switch so its slot-snapshot buffer doesn't inflate every `m` frame.
         fn matchAtomic(self: *Self, body: NodeRef, pos: usize, k: *const Cont) Error!bool {
             const live = 2 * (self.n_groups + 1);
-            var snap: [2 * (hir.MAX_GROUPS + 1)]i32 = undefined;
+            var snap: [2 * (hir.MAX_GROUPS + 1)]hir.Slot = undefined;
             @memcpy(snap[0..live], self.slots[0..live]);
             const acc: Cont = .accept;
             if (try self.m(body, pos, &acc)) {
@@ -417,7 +421,7 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
         /// Leftmost (leftmost-first) match + capture slots. `slots_out`
         /// (caller-sized `2*(n_groups+1)`) gets group spans (-1 = absent).
         /// `error.Budget` on step-limit (→ `MatchBudgetExceeded`).
-        pub fn run(self: *Self, input: []const u8, slots_out: []i32) Error!?Span {
+        pub fn run(self: *Self, input: []const u8, slots_out: []hir.Slot) Error!?Span {
             return self.runFrom(input, 0, slots_out);
         }
 
@@ -430,7 +434,7 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
         /// comptime `Pattern` look path (`pattern.zig`) calls this so its
         /// non-overlapping iteration is correct for line/word-boundary anchors.
         /// `run` is `runFrom(…, 0, …)`. Returned span is in absolute coords.
-        pub fn runFrom(self: *Self, input: []const u8, from: usize, slots_out: []i32) Error!?Span {
+        pub fn runFrom(self: *Self, input: []const u8, from: usize, slots_out: []hir.Slot) Error!?Span {
             self.input = input;
             self.budget = BUDGET_BASE + @as(u64, input.len + 1) * BUDGET_PER_BYTE; // O(n) work bound
             // `$`-anchored fast-negative: one O(n) reverse pass over the regular
@@ -492,7 +496,7 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
         /// start satisfies `^` (s == 0 or `input[s-1] == '\n'`), and every such
         /// position is visited; the body may still consume past a `\n` (a `\s`
         /// that matches newline only affects the END, not the start).
-        fn lineStartScan(self: *Self, from: usize, slots_out: []i32) Error!?Span {
+        fn lineStartScan(self: *Self, from: usize, slots_out: []hir.Slot) Error!?Span {
             const input = self.input;
             var s = from;
             // `s == 0` short-circuits, so the right disjunct is only reached when

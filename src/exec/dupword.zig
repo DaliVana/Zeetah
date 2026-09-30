@@ -31,6 +31,7 @@ pub const DupWord = struct {
     class: [32]u8, // CLASS bitmap (the `+` body, e.g. [A-Za-z])
     sep: [32]u8, // separator bitmap (e.g. ' ')
     group: u32, // capturing group index (1-based) the backref names
+    fold: bool = false, // the backref was parsed under `(?i)`: ASCII-fold compare
 
     /// Leftmost match at/after absolute `from`, or null. Also reports the
     /// captured token span via `g_start`/`g_end` out-params (group `group`).
@@ -56,7 +57,11 @@ pub const DupWord = struct {
             if (e >= n or !cc.hasBit(&self.sep, input[e])) continue;
             const t = e + 1; // second token start
             if (t + w > n) continue;
-            if (!std.mem.eql(u8, input[s..e], input[t .. t + w])) continue;
+            const same = if (self.fold)
+                std.ascii.eqlIgnoreCase(input[s..e], input[t .. t + w])
+            else
+                std.mem.eql(u8, input[s..e], input[t .. t + w]);
+            if (!same) continue;
 
             g_start.* = s;
             g_end.* = e;
@@ -114,7 +119,7 @@ pub fn buildAt(comptime cap: ?usize, h: *const hir.Hir(cap)) ?DupWord {
     const clsn = h.node(plusn.a);
     if (clsn.tag != .set) return null;
 
-    var dw = DupWord{ .class = undefined, .sep = undefined, .group = g };
+    var dw = DupWord{ .class = undefined, .sep = undefined, .group = g, .fold = br.fold };
     dw.class = h.setBitmap(clsn.set_idx);
     // `findCap`'s `\b` handling assumes the CLASS run is made of word chars
     // ([A-Za-z0-9_]) — that is what makes the run length unique per start and
@@ -170,7 +175,7 @@ test "dupword: recognises the shape and matches the backtracker exactly" {
         const got = dw.findCap(in, 0, &gs, &ge);
 
         var bt = backtrack.Backtracker.init(&h, h.anchored_start, h.anchored_end, 1, null, null);
-        var slots: [4]i32 = undefined;
+        var slots: [4]hir.Slot = undefined;
         const want = bt.run(in, slots[0..4]) catch null;
 
         try std.testing.expectEqual(want == null, got == null);
@@ -178,8 +183,8 @@ test "dupword: recognises the shape and matches the backtracker exactly" {
             try std.testing.expectEqual(ws.start, got.?.start);
             try std.testing.expectEqual(ws.end, got.?.end);
             // group 1 span must match the backtracker's slots[2],slots[3]
-            try std.testing.expectEqual(slots[2], @as(i32, @intCast(gs)));
-            try std.testing.expectEqual(slots[3], @as(i32, @intCast(ge)));
+            try std.testing.expectEqual(slots[2], @as(hir.Slot, @intCast(gs)));
+            try std.testing.expectEqual(slots[3], @as(hir.Slot, @intCast(ge)));
         }
     }
 }

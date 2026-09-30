@@ -1201,3 +1201,38 @@ test "comptime Pattern.startsWith: anchored-prefix test" {
     try std.testing.expect(Hello.startsWith("hello big world"));
     try std.testing.expect(!Hello.startsWith("say hello world"));
 }
+
+// `.split_alt` (top-level alternation mixing regular and lookaround/backref
+// branches; runtime-only engine) had no cross-front-end coverage. Its
+// iteration now resumes in absolute coordinates, so a look-behind / `\b` in a
+// tree-backtracker segment sees the real byte before each resume point. Every
+// match span of the non-overlapping iteration must equal the comptime
+// `Pattern` (whole-pattern tree backtracker).
+fn splitAltAgree(comptime p: []const u8, in: []const u8) !void {
+    const a = std.testing.allocator;
+    const P = regex.Pattern(p, .{});
+    var rx = try Regex.compile(a, p);
+    defer rx.deinit();
+    try std.testing.expectEqualStrings("split_alt", @tagName(rx.kind));
+    try std.testing.expectEqual(P.count(in), try rx.count(in));
+    const pa = try P.findAll(a, in);
+    defer a.free(pa);
+    const ra = try rx.findAll(a, in);
+    defer a.free(ra);
+    try std.testing.expectEqual(pa.len, ra.len);
+    for (pa, ra) |pm, rm| {
+        try std.testing.expectEqual(pm.start, rm.start);
+        try std.testing.expectEqual(pm.end, rm.end);
+    }
+}
+
+test "comptime Pattern <-> runtime Regex agree: split_alt (mixed regular / lookaround alternation)" {
+    try splitAltAgree("\\s+(?!\\S)|\\s+", "a  b   \n  c ");
+    try splitAltAgree("[0-9]+|(?<=x)[a-z]+", "12xab 3 xcd4");
+    try splitAltAgree("(?<=a)b|cc", "ab abcc bb acb");
+    try splitAltAgree("\\w+(?=!)|[0-9]+", "hi! 42 yo! 7");
+    // Look-behind at a resume point: the second `b` follows the `b` just
+    // matched, not a synthetic start-of-text.
+    try splitAltAgree("(?<!b)b|zz", "bbbzzb");
+    try splitAltAgree("(?<=^|,)[a-z]+|;", "ab,cd;ef,;g");
+}

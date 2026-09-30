@@ -942,6 +942,10 @@ fn CaptureSupport(comptime built: Built) type {
         /// is comptime-dead). Its `findLeftmost` is differential-pinned to the
         /// `core.findLeftmost(&Dfa256, …)` it replaces (exact-fit compression).
         const cdfa = if (op_dfa_usable) compress(op_dfa) else {};
+        /// The one-pass walker's per-state out-edge index, baked ONCE at
+        /// comptime and sized to exactly this NFA (`.rodata`, a few hundred
+        /// bytes) instead of a counting sort per `captures` call.
+        const op_idx = if (op_dfa_usable) onepass.SizedIndex(nfa.n_states, nfa.n_edges).build(NN, &nfa) else {};
         /// Reverse DFA (`computeReverse`) for the unanchored `$` class: the O(n)
         /// span source that replaces `cdfa.findLeftmost`'s per-offset restart on
         /// the capture path (the comptime peer of the runtime `nextSpanFrom`
@@ -1011,7 +1015,7 @@ fn CaptureSupport(comptime built: Built) type {
         }
 
         /// Materialize a `Caps` from filled `slots` (`slots[0..2]` = whole span).
-        fn slotsToCaps(input: []const u8, slots: []const i32) Caps {
+        fn slotsToCaps(input: []const u8, slots: []const hir.Slot) Caps {
             // Precondition: every caller fills slots[0..2] with the real whole-match
             // span (start ≤ end, both ≥ 0) before calling. Group 0 is `@intCast` below
             // with no per-group guard (unlike groups 1..NG), so assert it here — an
@@ -1038,7 +1042,7 @@ fn CaptureSupport(comptime built: Built) type {
         /// comptime API can't surface that; the runtime maps it to
         /// `MatchBudgetExceeded`).
         pub fn capturesFrom(input: []const u8, from: usize) ?Caps {
-            var slots: [2 * (hir.MAX_GROUPS + 1)]i32 = undefined;
+            var slots: [2 * (hir.MAX_GROUPS + 1)]hir.Slot = undefined;
             const nslots = 2 * (NG + 1);
             if (comptime built.strat == .line_dfa) {
                 // Locate the whole-match span with the line-DFA (skips non-
@@ -1068,7 +1072,7 @@ fn CaptureSupport(comptime built: Built) type {
                     @memset(slots[0..nslots], -1);
                     slots[0] = @intCast(span.start);
                     slots[1] = @intCast(span.end);
-                    if (onepass.fill(NN, &nfa, input, span, slots[0..nslots]))
+                    if (onepass.fillWith(NN, &nfa, &op_idx, input, span, slots[0..nslots]))
                         return slotsToCaps(input, slots[0..nslots]);
                 }
                 var bt = BT.init(&cap_h, cap_h.anchored_start, cap_h.anchored_end, NG, null, null);
@@ -1085,7 +1089,7 @@ fn CaptureSupport(comptime built: Built) type {
                 @memset(slots[0..nslots], -1);
                 slots[0] = @intCast(span.start);
                 slots[1] = @intCast(span.end);
-                if (onepass.fill(NN, &nfa, input, span, slots[0..nslots]))
+                if (onepass.fillWith(NN, &nfa, &op_idx, input, span, slots[0..nslots]))
                     return slotsToCaps(input, slots[0..nslots]);
                 // mis-gated (should not happen for op_ok); fall through to bt.
             }
@@ -1378,7 +1382,7 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
                     bt.line_anchor = true;
                     bt.line_first = built.line_first;
                 }
-                var slots: [2 * (hir.MAX_GROUPS + 1)]i32 = undefined;
+                var slots: [2 * (hir.MAX_GROUPS + 1)]hir.Slot = undefined;
                 const sp = (bt.runFrom(input, from, slots[0 .. 2 * (n_groups + 1)]) catch return null) orelse return null;
                 return .{ .start = sp.start, .end = sp.end };
             }
@@ -1542,6 +1546,9 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
         return struct {
             pub const has_dfa = true;
             pub fn nextSpanFrom(input: []const u8, from: usize) ?search.Span {
+                // A folded `^`/`\A` only matches at 0 (never re-anchor at a
+                // resume point) — mirrors the runtime `nextSpanFrom` guard.
+                if (built.dfa.a_start and from > 0) return null;
                 return edge_look.nextFrom(&core_dfa, &spec, input, from);
             }
 
@@ -1745,6 +1752,10 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             /// source of truth `find`/`count`/`findAll` + the lazy verbs share;
             /// the `switch (mode)` folds to the one strategy at comptime.
             pub fn nextSpanFrom(input: []const u8, from: usize) ?search.Span {
+                // A folded `^`/`\A` only matches at 0: the arms below resume on
+                // `input[from..]`, which would re-anchor at every resume point
+                // (`^abc` on "abcabc" counted 2) — mirrors the runtime guard.
+                if (m.a_start and from > 0) return null;
                 return switch (mode) {
                     .dfa => blk: {
                         // Unanchored `$`-anchored: one O(n) reverse pass instead

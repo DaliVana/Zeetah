@@ -6,13 +6,19 @@
 //! `dfa`, with `lazy_dfa` for DFA-explosion, `dense_search` for the
 //! frozen-dense unanchored single pass, `class_span` for trivial `class+`,
 //! and `boundary_lits` for `\b(?:lit|lit|…)\b` keyword alternations);
-//! captures resolve via a one-pass fast path or `exec/bounded_bt.zig`; the
-//! non-regular tier (lookaround / backref) runs on `exec/backtrack.zig`
-//! (whole-pattern `backtrack`, per-segment `split_alt`, or `bt_look` for
-//! plain assertions) under a step budget that surfaces as
-//! `RegexError.MatchBudgetExceeded`. Still-unmodelled surface
+//! plain look-assertions (`\b \B ^ $ (?m) \A \z`) run on the look-aware
+//! `lazy_dfa` (or a line / reverse-end DFA fast path; `\Z` on the `bt_look`
+//! bounded backtracker); NFA searches whose backtracker window would exceed
+//! its budget fall back to `exec/pikevm.zig`; captures are two-phase — the
+//! search engine finds the span, then a one-pass fast path or
+//! `exec/bounded_bt.zig` (PikeVM past the budget) rebuilds the slots over just
+//! that span; the non-regular tier (lookaround / backref) runs on
+//! `exec/backtrack.zig` (whole-pattern `backtrack` or per-segment `split_alt`)
+//! under a step budget that surfaces as `RegexError.MatchBudgetExceeded`. Still-unmodelled surface
 //! (Unicode `\b`, POSIX classes, `(?m)`/`(?s)` interactions) is reported as
-//! `RegexError.NotImplemented` rather than silently mis-handled.
+//! `RegexError.NotImplemented` rather than silently mis-handled, and a violated
+//! engine invariant (an engine disagreement) as `RegexError.Internal` rather
+//! than an `unreachable` or a silently wrong answer.
 
 const std = @import("std");
 const common = @import("common.zig");
@@ -31,6 +37,8 @@ const properties = @import("properties.zig");
 const prefilter = @import("prefilter.zig");
 const seq_extract = @import("exec/seq_extract.zig");
 const bounded_bt = @import("exec/bounded_bt.zig");
+const pikevm = @import("exec/pikevm.zig");
+const nfa_index = @import("exec/nfa_index.zig");
 const backtrack = @import("exec/backtrack.zig");
 const seek_mod = @import("exec/seek.zig");
 const split_alt = @import("exec/split_alt.zig");
@@ -61,16 +69,9 @@ const MetaKind = enum { literal, dfa, lit_prefix, reverse_suffix, bt_look, backt
 /// the 1024-node `prefilter.AhoCorasick`; the comptime arm trims the table.
 const BLits = seq_extract.BoundaryMatcher(prefilter.AhoCorasick);
 
-/// Shift every set capture slot (`>= 0`) and leave unset slots (`-1`) alone,
-/// converting offsets that were computed over `input[pos..]` back to absolute
-/// `input` coordinates. A no-op when `pos == 0`.
-fn shiftSlots(slots: []i32, pos: usize) void {
-    if (pos == 0) return;
-    const p: i32 = @intCast(pos);
-    for (slots) |*s| {
-        if (s.* >= 0) s.* += p;
-    }
-}
+/// Capture-group names by group index (group 0 = whole match), sized to the
+/// runtime group ceiling (`hir.MAX_GROUPS_RUNTIME`).
+const GNames = [hir.MAX_GROUPS_RUNTIME + 1]?[]const u8;
 
 /// Parse a leading run of ASCII digits as a group index, saturating well
 /// below `usize` overflow (a 7-digit run already dwarfs `MAX_GROUPS`, so it
@@ -205,7 +206,7 @@ pub const Regex = struct {
     /// the capture engine's automaton. `gnames[g]` is group g's `(?<name>)`
     /// name (aliases `pattern`), or null.
     n_groups: usize = 0,
-    gnames: [hir.MAX_GROUPS + 1]?[]const u8 = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1),
+    gnames: GNames = [_]?[]const u8{null} ** (hir.MAX_GROUPS_RUNTIME + 1),
     /// Owned HIR for the `.backtrack` path (backref / lookaround run on the
     /// tree backtracker, which walks the HIR, not the NFA).
     bt_hir: ?*hir.Hir(null) = null,
@@ -242,6 +243,15 @@ pub const Regex = struct {
     /// `O(n_states·input.len)` bitset per match, making unanchored look-pattern
     /// search O(n²) (a multiline `^…$` ran at ~0.1 MB/s).
     bt_pool: ?*cache_mod.Pool(bounded_bt.BtScratch) = null,
+    /// Pooled PikeVM scratch (O(n_states) memory): the fallback for any NFA
+    /// search or capture reconstruction whose bounded-backtracker window would
+    /// exceed `bounded_bt.VISITED_BUDGET_BYTES`. Present whenever `nfa` is
+    /// retained for look-assertions or captures (with `bt_pool`).
+    pike_pool: ?*cache_mod.Pool(pikevm.PikeScratch) = null,
+    /// The retained NFA's per-state out-edge index (priority order), built
+    /// ONCE here and borrowed by every bounded-backtracker / PikeVM search
+    /// (`exec/nfa_index.zig`). Present iff the NFA scratch pools are.
+    nfa_idx: ?*nfa_index.EdgeIndex = null,
 
     /// `.dense_search`: lever-A frozen dense unanchored search DFA (the
     /// gate-verified lazy automaton materialised to flat tables — O(n)
@@ -277,7 +287,8 @@ pub const Regex = struct {
         const saved = h.root;
         h.root = core_ref;
         defer h.root = saved;
-        var nfa = thompson.build(null, h) catch return null;
+        var nfa = thompson.buildAlloc(allocator, h) catch return null;
+        defer nfa.deinit(allocator);
         var d = full_dfa.compute(null, &nfa, h.anchored_start, false);
         if (d.outcome != .ok) return null;
         d.required = seq_extract.requiredByte(null, h);
@@ -297,14 +308,10 @@ pub const Regex = struct {
         a_start: bool,
         a_end: bool,
         ng: usize,
-        gnames: [hir.MAX_GROUPS + 1]?[]const u8,
+        gnames: GNames,
     ) !Regex {
-        const nh = nheap orelse blk: {
-            const p = try allocator.create(thompson.Nfa(null));
-            p.* = nfa_local.*;
-            break :blk p;
-        };
-        errdefer if (nheap == null) allocator.destroy(nh);
+        const nh = nheap orelse try heapClone(allocator, nfa_local);
+        errdefer if (nheap == null) freeHeapNfa(allocator, nh);
         const lz = try makeLazyProg(allocator, nh, a_start, a_end);
         errdefer {
             lz.prog.deinit();
@@ -343,7 +350,7 @@ pub const Regex = struct {
         a_start: bool,
         a_end: bool,
         ng: usize,
-        gnames: [hir.MAX_GROUPS + 1]?[]const u8,
+        gnames: GNames,
     ) !Regex {
         // Build-time NFA reads (the one-pass detector, the freeze oracle) only
         // need a valid NFA *during this call* — use the caller's transient
@@ -395,12 +402,8 @@ pub const Regex = struct {
         // The lazy engine reads `nfa.sets` at SEARCH time, so unlike the dense
         // path it must retain the NFA on the heap for the engine's lifetime
         // (reuse the capture copy when present, else make one now).
-        const nh = nheap orelse blk: {
-            const p = try allocator.create(thompson.Nfa(null));
-            p.* = nfa_local.*;
-            break :blk p;
-        };
-        errdefer if (nheap == null) allocator.destroy(nh);
+        const nh = nheap orelse try heapClone(allocator, nfa_local);
+        errdefer if (nheap == null) freeHeapNfa(allocator, nh);
         const lz = try makeLazyProg(allocator, nh, a_start, a_end);
         errdefer {
             lz.prog.deinit();
@@ -424,6 +427,35 @@ pub const Regex = struct {
         };
     }
 
+    /// Attach the lazy DFA to a `.lit_prefix` `Regex` as the single-pass
+    /// fallback for `litPrefixMetered`. Lazy (states built on demand), not a
+    /// frozen dense table: the fallback only runs on adversarial input, so
+    /// compile pays just the CSR build (freezing cost up to ~140 µs per
+    /// pattern). It reads the NFA at search time, so it retains `nheap` or a
+    /// fresh heap copy (freed by `deinit`).
+    fn attachSinglePass(self: *Regex, allocator: std.mem.Allocator, nfa: *const thompson.Nfa(null), nheap: ?*thompson.Nfa(null), a_start: bool, a_end: bool) !void {
+        const nh = nheap orelse try heapClone(allocator, nfa);
+        errdefer if (nheap == null) freeHeapNfa(allocator, nh);
+        const lz = try makeLazyProg(allocator, nh, a_start, a_end);
+        self.nfa = nh;
+        self.lazy = lz.prog;
+        self.lazy_pool = lz.pool;
+    }
+
+    /// A heap-allocated, independently owned deep copy of `nfa` (the engine
+    /// retains it; the compile-local NFA is freed when compilation ends).
+    fn heapClone(allocator: std.mem.Allocator, nfa: *const thompson.Nfa(null)) !*thompson.Nfa(null) {
+        const p = try allocator.create(thompson.Nfa(null));
+        errdefer allocator.destroy(p);
+        p.* = try nfa.clone(allocator);
+        return p;
+    }
+
+    fn freeHeapNfa(allocator: std.mem.Allocator, p: *thompson.Nfa(null)) void {
+        p.deinit(allocator);
+        allocator.destroy(p);
+    }
+
     /// Heap-allocate the immutable `LazyProg` + its thread-safe `LazyMemo`
     /// pool over `nh` (kept alive for their lifetime by the caller).
     fn makeLazyProg(
@@ -434,12 +466,59 @@ pub const Regex = struct {
     ) !struct { prog: *lazy_dfa.LazyProg, pool: *cache_mod.Pool(lazy_dfa.LazyMemo) } {
         const prog = try allocator.create(lazy_dfa.LazyProg);
         errdefer allocator.destroy(prog);
-        prog.* = try lazy_dfa.LazyProg.init(allocator, nh, a_start, a_end);
+        prog.* = lazy_dfa.LazyProg.init(allocator, nh, a_start, a_end) catch |e| switch (e) {
+            // Every caller routes `\Z` NFAs elsewhere (`lookSupported`); a
+            // typed error — never `unreachable` — if that routing ever slips.
+            error.LookUnsupported => return RegexError.Internal,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
         errdefer prog.deinit();
         const pool = try allocator.create(cache_mod.Pool(lazy_dfa.LazyMemo));
         errdefer allocator.destroy(pool);
         pool.* = cache_mod.Pool(lazy_dfa.LazyMemo).init(allocator);
         return .{ .prog = prog, .pool = pool };
+    }
+
+    /// The pooled per-search scratch of the NFA engines (bounded backtracker +
+    /// PikeVM) plus the NFA's shared edge index, created up front by
+    /// `compileWithFlags` when the NFA is retained.
+    const NfaPools = struct {
+        bt: *cache_mod.Pool(bounded_bt.BtScratch),
+        pike: *cache_mod.Pool(pikevm.PikeScratch),
+        idx: *nfa_index.EdgeIndex,
+
+        fn create(allocator: std.mem.Allocator, nfa: *const thompson.Nfa(null)) !NfaPools {
+            const bt = try allocator.create(cache_mod.Pool(bounded_bt.BtScratch));
+            errdefer allocator.destroy(bt);
+            bt.* = cache_mod.Pool(bounded_bt.BtScratch).init(allocator);
+            const pike = try allocator.create(cache_mod.Pool(pikevm.PikeScratch));
+            errdefer allocator.destroy(pike);
+            pike.* = cache_mod.Pool(pikevm.PikeScratch).init(allocator);
+            const idx = try allocator.create(nfa_index.EdgeIndex);
+            errdefer allocator.destroy(idx);
+            idx.* = try nfa_index.EdgeIndex.build(allocator, nfa);
+            return .{ .bt = bt, .pike = pike, .idx = idx };
+        }
+
+        /// Undo `create` before any engine took ownership (the pools are empty).
+        fn destroy(self: NfaPools, allocator: std.mem.Allocator) void {
+            allocator.destroy(self.bt);
+            allocator.destroy(self.pike);
+            self.idx.deinit(allocator);
+            allocator.destroy(self.idx);
+        }
+    };
+
+    /// Hand the pre-created NFA scratch pools + edge index to a built engine
+    /// (infallible).
+    fn withPools(r: Regex, pools: ?NfaPools) Regex {
+        var out = r;
+        if (pools) |p| {
+            out.bt_pool = p.bt;
+            out.pike_pool = p.pike;
+            out.nfa_idx = p.idx;
+        }
+        return out;
     }
 
     pub fn compile(allocator: std.mem.Allocator, pattern: []const u8) !Regex {
@@ -458,7 +537,7 @@ pub const Regex = struct {
     /// `.dfa_edge_look`: peel `concat(regular_core, trailing_width1_look)`, run
     /// `core` on a linear DFA + an O(1) edge verify instead of demoting the whole
     /// pattern to the tree backtracker. Capture-free. Caller gates `ng == 0`.
-    fn tryEdgeLook(allocator: std.mem.Allocator, h: *hir.Hir(null), owned: []const u8, flags: common.CompileFlags, gnames: [hir.MAX_GROUPS + 1]?[]const u8) ?Regex {
+    fn tryEdgeLook(allocator: std.mem.Allocator, h: *hir.Hir(null), owned: []const u8, flags: common.CompileFlags, gnames: GNames) ?Regex {
         if (edge_look.recognize(null, h)) |rec| {
             if (buildEdgeLookDfa(allocator, h, rec.core)) |coredfa| {
                 return Regex{
@@ -468,6 +547,7 @@ pub const Regex = struct {
                     .kind = .dfa_edge_look,
                     .dfa = coredfa,
                     .el_spec = rec.spec,
+                    .bt_a_start = h.anchored_start,
                     .n_groups = 0,
                     .gnames = gnames,
                 };
@@ -480,7 +560,7 @@ pub const Regex = struct {
     /// regular / non-regular branches runs each regular run on an anchored DFA
     /// and only the non-regular branches on the tree backtracker (leftmost-first
     /// preserved by source order). Caller gates `ng == 0`.
-    fn trySplitAlt(allocator: std.mem.Allocator, h: *hir.Hir(null), owned: []const u8, flags: common.CompileFlags, gnames: [hir.MAX_GROUPS + 1]?[]const u8) ?Regex {
+    fn trySplitAlt(allocator: std.mem.Allocator, h: *hir.Hir(null), owned: []const u8, flags: common.CompileFlags, gnames: GNames) ?Regex {
         if (split_alt.build(allocator, h, h.anchored_end)) |sa| {
             return Regex{
                 .allocator = allocator,
@@ -502,7 +582,7 @@ pub const Regex = struct {
     /// O(n) forward scan instead of the per-position tree backtracker. Narrow
     /// recogniser, differential-tested against that backtracker. Caller gates
     /// `ng == 1`.
-    fn tryDupWord(allocator: std.mem.Allocator, h: *hir.Hir(null), owned: []const u8, flags: common.CompileFlags, gnames: [hir.MAX_GROUPS + 1]?[]const u8) !?Regex {
+    fn tryDupWord(allocator: std.mem.Allocator, h: *hir.Hir(null), owned: []const u8, flags: common.CompileFlags, gnames: GNames) !?Regex {
         if (dupword.build(h)) |d| {
             const e = try allocator.create(dupword.DupWord);
             e.* = d;
@@ -523,7 +603,7 @@ pub const Regex = struct {
     /// Transfers the HIR off the caller's stack into a heap copy `hh` (clearing
     /// `h_owned` so the caller's deferred `deinit` is a no-op) and runs the tree
     /// backtracker over it. Compiles + runs; step-budget → `MatchBudgetExceeded`.
-    fn buildBacktrack(allocator: std.mem.Allocator, h: *hir.Hir(null), h_owned: *bool, owned: []const u8, flags: common.CompileFlags, ng: usize, gnames: [hir.MAX_GROUPS + 1]?[]const u8) !Regex {
+    fn buildBacktrack(allocator: std.mem.Allocator, h: *hir.Hir(null), h_owned: *bool, owned: []const u8, flags: common.CompileFlags, ng: usize, gnames: GNames) !Regex {
         const hh = try allocator.create(hir.Hir(null));
         hh.* = h.*;
         h.nodes = .empty;
@@ -547,7 +627,7 @@ pub const Regex = struct {
     /// `.boundary_lits`: `\b(?:lit|…)\b` literal alternation — regular but a big
     /// keyword list blows the naive NFA's `MAX_NFA`, so run Aho-Corasick locate +
     /// O(1) `\b` verify (no NFA). Caller gates `ng == 0` (reports no submatches).
-    fn tryBoundaryLits(allocator: std.mem.Allocator, h: *hir.Hir(null), owned: []const u8, flags: common.CompileFlags, gnames: [hir.MAX_GROUPS + 1]?[]const u8) !?Regex {
+    fn tryBoundaryLits(allocator: std.mem.Allocator, h: *hir.Hir(null), owned: []const u8, flags: common.CompileFlags, gnames: GNames) !?Regex {
         if (seq_extract.boundaryLiterals(null, h)) |bl| {
             var needles: [seq_extract.MAX_BL][]const u8 = undefined;
             for (0..bl.n) |i| needles[i] = bl.alt(i);
@@ -617,7 +697,7 @@ pub const Regex = struct {
     /// fixed literal makes the whole thing decline (→ the original error,
     /// unchanged). Case-insensitive is declined (a `(?i)` literal is a set, not
     /// a byte). Caller gates `ng == 0`.
-    fn tryLiteralAltRaw(allocator: std.mem.Allocator, pattern: []const u8, flags: common.CompileFlags, gnames: [hir.MAX_GROUPS + 1]?[]const u8) !?Regex {
+    fn tryLiteralAltRaw(allocator: std.mem.Allocator, pattern: []const u8, flags: common.CompileFlags, gnames: GNames) !?Regex {
         if (flags.case_insensitive) return null;
 
         var branches: std.ArrayList([]const u8) = .empty;
@@ -675,10 +755,7 @@ pub const Regex = struct {
     /// two optional fast-path DFAs: a line-DFA for `(?m)^body$` and a reverse-end
     /// DFA for `(?m)<class>+$` (defuses the `bt_look` O(n²) restart). Always
     /// applies when `props.has_look`. Consumes `nheap` (the retained NFA).
-    fn buildBtLook(allocator: std.mem.Allocator, h: *hir.Hir(null), nheap: ?*thompson.Nfa(null), props: properties.Properties, owned: []const u8, flags: common.CompileFlags, ng: usize, gnames: [hir.MAX_GROUPS + 1]?[]const u8) !Regex {
-        const bt_pool = try allocator.create(cache_mod.Pool(bounded_bt.BtScratch));
-        errdefer allocator.destroy(bt_pool);
-        bt_pool.* = cache_mod.Pool(bounded_bt.BtScratch).init(allocator);
+    fn buildBtLook(allocator: std.mem.Allocator, h: *hir.Hir(null), nheap: ?*thompson.Nfa(null), props: properties.Properties, owned: []const u8, flags: common.CompileFlags, ng: usize, gnames: GNames) !Regex {
         var line_dfa: ?*full_dfa.PackedDfa = null;
         var line_has_dollar = false;
         errdefer if (line_dfa) |p| {
@@ -701,6 +778,32 @@ pub const Regex = struct {
         if (ng == 0) {
             if (props.rev_end) |_| rev_end_dfa = buildRevEndDfa(allocator, h);
         }
+        // No specialised fast path: the look-aware lazy DFA (O(n) memoized
+        // single pass + reverse start, looks evaluated from the byte context —
+        // see `lazy_dfa` "Look-assertions") instead of the per-start-position
+        // backtracker. Kept on `bt_look`: `\Z` (two bytes of lookahead), and a
+        // leading `(?m)^` — its line-start scan (memchr to each line + a
+        // first-byte reject) skips whole lines, ~8× faster than a byte-at-a-time
+        // DFA on validation shapes like `(?m)^\d{9}[\dXx]$`. Captures: span from
+        // the DFA, slots over the span.
+        if (line_dfa == null and rev_end_dfa == null and props.bounds.start != .line and
+            lazy_dfa.LazyProg.lookSupported(nheap.?))
+        {
+            const lz = try makeLazyProg(allocator, nheap.?, h.anchored_start, h.anchored_end);
+            return Regex{
+                .allocator = allocator,
+                .pattern = owned,
+                .flags = flags,
+                .kind = .lazy_dfa,
+                .nfa = nheap,
+                .lazy = lz.prog,
+                .lazy_pool = lz.pool,
+                .bt_a_start = h.anchored_start,
+                .bt_a_end = h.anchored_end,
+                .n_groups = ng,
+                .gnames = gnames,
+            };
+        }
         return Regex{
             .allocator = allocator,
             .pattern = owned,
@@ -717,7 +820,6 @@ pub const Regex = struct {
             .rev_end_kind = if (rev_end_dfa != null) props.rev_end.? else .unanchored,
             .n_groups = ng,
             .gnames = gnames,
-            .bt_pool = bt_pool,
         };
     }
 
@@ -726,7 +828,7 @@ pub const Regex = struct {
     /// automaton). Single contiguous range only: a sparse class with long gaps
     /// (`[0-9]+`) wins big; a dense/short-run class (`\w+`) loses to the DFA's
     /// tight per-byte loop, so everything else keeps the DFA.
-    fn tryClassSpan(allocator: std.mem.Allocator, h: *hir.Hir(null), owned: []const u8, flags: common.CompileFlags, ng: usize, gnames: [hir.MAX_GROUPS + 1]?[]const u8) ?Regex {
+    fn tryClassSpan(allocator: std.mem.Allocator, h: *hir.Hir(null), owned: []const u8, flags: common.CompileFlags, ng: usize, gnames: GNames) ?Regex {
         if (h.anchored_start or h.anchored_end or ng != 0 or h.saw_lazy) return null;
         const rootn = h.node(h.root);
         if (!((rootn.tag == .plus or rootn.tag == .star) and rootn.greedy)) return null;
@@ -838,7 +940,7 @@ pub const Regex = struct {
     /// shared `planner.resolve` route. `op_onepass` gates the zero-alloc one-pass
     /// capture reconstruction. The dense `$`-anchored / floor-cluster reroutes
     /// were already taken by the caller; this is the eager-table tail.
-    fn buildRegularDfa(allocator: std.mem.Allocator, d: *full_dfa.Dfa256, nfa: *const thompson.Nfa(null), nheap: ?*thompson.Nfa(null), owned: []const u8, flags: common.CompileFlags, ng: usize, gnames: [hir.MAX_GROUPS + 1]?[]const u8, route: planner.Route, props: properties.Properties, a_start: bool, a_end: bool) !Regex {
+    fn buildRegularDfa(allocator: std.mem.Allocator, d: *full_dfa.Dfa256, nfa: *const thompson.Nfa(null), nheap: ?*thompson.Nfa(null), owned: []const u8, flags: common.CompileFlags, ng: usize, gnames: GNames, route: planner.Route, props: properties.Properties, a_start: bool, a_end: bool) !Regex {
         // One-pass capture gate: a one-pass pattern with groups reconstructs
         // slots in a single allocation-free forward pass (`nfa` retained because
         // `need_nfa = needs_captures or has_look`).
@@ -880,10 +982,17 @@ pub const Regex = struct {
             .backtrack => return RegexError.NotImplemented, // errdefers free owned/nheap
             .lit_prefix => |seq| {
                 const heap = try full_dfa.packHeap(allocator, d);
+                errdefer {
+                    heap.deinit(allocator);
+                    allocator.destroy(heap);
+                }
                 self.dfa = heap;
                 if (core.buildLiteral(&seq)) |td| {
                     self.kind = .lit_prefix;
                     self.teddy = td;
+                    // Unbounded tail ⇒ a failing candidate can scan far: attach
+                    // the single-pass fallback `litPrefixMetered` switches to.
+                    if (props.max_len == null) try self.attachSinglePass(allocator, nfa, nheap, a_start, a_end);
                 } else self.kind = .dfa;
             },
             .dfa => {
@@ -921,7 +1030,7 @@ pub const Regex = struct {
         var h = hir.Hir(null).initRuntime();
         var h_owned = true; // false once ownership is transferred to a heap copy
         defer if (h_owned) h.deinit(allocator);
-        var gnames0 = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1);
+        var gnames0 = [_]?[]const u8{null} ** (hir.MAX_GROUPS_RUNTIME + 1);
         var ng0: usize = 0;
         // `parseCaptures` is the single source of truth for capture numbering +
         // names (replaces the old standalone `scanGroups` second grammar).
@@ -955,6 +1064,10 @@ pub const Regex = struct {
         // mirror the comptime `pattern.zig` `buildAll` cascade. .NET model:
         // compiles and runs, step-budget → MatchBudgetExceeded (never a hang).
         if (props.requires_backtracking) {
+            // The tree backtracker's slot storage (and its per-atomic snapshot,
+            // on the stack) is sized to the comptime group ceiling; the larger
+            // runtime ceiling is for the NFA engines only.
+            if (ng0 > hir.MAX_GROUPS) return RegexError.PatternTooComplex;
             if (ng0 == 0) if (tryEdgeLook(allocator, &h, owned, flags, gnames0)) |r| return r;
             if (ng0 == 0) if (trySplitAlt(allocator, &h, owned, flags, gnames0)) |r| return r;
             if (ng0 == 1) if (try tryDupWord(allocator, &h, owned, flags, gnames0)) |r| return r;
@@ -963,14 +1076,22 @@ pub const Regex = struct {
 
         if (ng0 == 0) if (try tryBoundaryLits(allocator, &h, owned, flags, gnames0)) |r| return r;
 
-        var nfa = thompson.build(null, &h) catch {
-            // The naive NFA overflowed `MAX_NFA`. A pure-literal alternation that
-            // parsed but is too big for the NFA is still trivially regular —
-            // route it to the heap-trie `.literal_alt` engine. Any other shape
-            // returns null here ⇒ `PatternTooComplex`, unchanged.
-            if (ng0 == 0) if (try tryLiteralAltRaw(allocator, owned, flags, gnames0)) |r| return r;
-            return RegexError.PatternTooComplex;
+        var nfa = thompson.buildAlloc(allocator, &h) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                // The NFA overflowed its runtime ceilings. A pure-literal
+                // alternation too big for it is still trivially regular — route
+                // it to the heap-trie `.literal_alt` engine. Any other shape
+                // returns null here ⇒ `PatternTooComplex`, unchanged.
+                if (ng0 == 0) if (try tryLiteralAltRaw(allocator, owned, flags, gnames0)) |r| return r;
+                return RegexError.PatternTooComplex;
+            },
         };
+        // The local NFA is freed at the end of compilation unless its slices
+        // move into the retained heap copy (`nheap`); after the move the local
+        // only aliases them (valid for the rest of this call).
+        var nfa_owned = true;
+        defer if (nfa_owned) nfa.deinit(allocator);
 
         const gnames = gnames0;
         const ng = ng0;
@@ -982,12 +1103,23 @@ pub const Regex = struct {
             try allocator.create(thompson.Nfa(null))
         else
             null;
-        errdefer if (nheap) |p| allocator.destroy(p);
-        if (nheap) |p| p.* = nfa;
+        errdefer if (nheap) |p| {
+            p.deinit(allocator);
+            allocator.destroy(p);
+        };
+        if (nheap) |p| {
+            p.* = nfa; // move: `nheap` owns the slices now
+            nfa_owned = false;
+        }
+        // NFA-engine scratch pools (backtracker + PikeVM) for the retained NFA:
+        // allocated before any engine is built so attaching them to the built
+        // `Regex` (`withPools`) cannot fail after ownership has moved.
+        const pools: ?NfaPools = if (need_nfa) try NfaPools.create(allocator, nheap.?) else null;
+        errdefer if (pools) |p| p.destroy(allocator);
 
-        if (props.has_look) return try buildBtLook(allocator, &h, nheap, props, owned, flags, ng, gnames);
+        if (props.has_look) return withPools(try buildBtLook(allocator, &h, nheap, props, owned, flags, ng, gnames), pools);
 
-        if (tryClassSpan(allocator, &h, owned, flags, ng, gnames)) |r| return r;
+        if (tryClassSpan(allocator, &h, owned, flags, ng, gnames)) |r| return withPools(r, pools);
 
         var d = full_dfa.compute(null, &nfa, h.anchored_start, h.anchored_end);
         if (d.outcome != .ok) {
@@ -998,7 +1130,7 @@ pub const Regex = struct {
             // coverage for patterns the eager table could not hold —
             // never a wrong answer, never a rejection. Captures (if any)
             // still resolve via `nfa` in `captures()` (bounded-bt path).
-            return try buildLazyRegex(allocator, &nfa, nheap, owned, flags, h.anchored_start, h.anchored_end, ng, gnames);
+            return withPools(try buildLazyRegex(allocator, &nfa, nheap, owned, flags, h.anchored_start, h.anchored_end, ng, gnames), pools);
         }
         // Necessary-condition memchr prefilter (keeps unanchored "required
         // literal absent" inputs linear instead of O(n²)). Carried into every
@@ -1020,13 +1152,13 @@ pub const Regex = struct {
         // dense build. The full rationale and the exclusion-by-construction
         // guards live in `denseRoute` — one definition, one test point.
         if (denseRoute(route, props, &d, h.anchored_start, h.anchored_end)) {
-            return try buildDenseRegex(allocator, &nfa, nheap, owned, flags, h.anchored_start, h.anchored_end, ng, gnames);
+            return withPools(try buildDenseRegex(allocator, &nfa, nheap, owned, flags, h.anchored_start, h.anchored_end, ng, gnames), pools);
         }
         // Everything else with an eager dense table stays on the O(1)/byte
         // `core.findLeftmost` (the lazy single-pass is for `.lazy_dfa` — exploded
         // patterns with no dense table). Pack it and route via the shared
         // `planner.resolve` into a literal / reverse-suffix / lit-prefix / DFA.
-        return try buildRegularDfa(allocator, &d, &nfa, nheap, owned, flags, ng, gnames, route, props, h.anchored_start, h.anchored_end);
+        return withPools(try buildRegularDfa(allocator, &d, &nfa, nheap, owned, flags, ng, gnames, route, props, h.anchored_start, h.anchored_end), pools);
     }
 
     pub fn deinit(self: *Regex) void {
@@ -1043,7 +1175,7 @@ pub const Regex = struct {
             p.deinit(self.allocator);
             self.allocator.destroy(p);
         }
-        if (self.nfa) |p| self.allocator.destroy(p);
+        if (self.nfa) |p| freeHeapNfa(self.allocator, p);
         if (self.bt_hir) |p| {
             p.deinit(self.allocator);
             self.allocator.destroy(p);
@@ -1062,6 +1194,14 @@ pub const Regex = struct {
             p.deinit(); // frees all pooled BtScratch
             self.allocator.destroy(p);
         }
+        if (self.pike_pool) |p| {
+            p.deinit(); // frees all pooled PikeScratch
+            self.allocator.destroy(p);
+        }
+        if (self.nfa_idx) |p| {
+            p.deinit(self.allocator);
+            self.allocator.destroy(p);
+        }
         if (self.lazy) |p| {
             p.deinit();
             self.allocator.destroy(p);
@@ -1078,20 +1218,21 @@ pub const Regex = struct {
         }
     }
 
-    /// `.bt_look` leftmost span. The visited bitset is borrowed from a
-    /// per-`Regex` pool and reused across the whole non-overlapping iteration
-    /// (`nextSpanFrom` calls this once per match): the buffer is zeroed once
-    /// and each `matchAt` clears only the words it touched, so the full
-    /// `findAll`/`count` is O(n·m), not the O(n²) the old per-match
-    /// allocate-and-`@memset` produced. ReDoS-proof (still O(n·m) worst case).
-    fn btLook(self: *const Regex, input: []const u8) !?core.Span {
+    /// `.bt_look` leftmost-first span at/after absolute `from`. Runs over the
+    /// FULL `input` (absolute coordinates), so a look-behind at `from` sees the
+    /// real preceding byte. The visited bitset is borrowed from a per-`Regex`
+    /// pool and reused across the whole non-overlapping iteration, covering only
+    /// the window `[from, input.len]`; each start attempt clears only the words
+    /// it touched, so `findAll`/`count` is O(n·m). ReDoS-proof.
+    fn btLookFrom(self: *const Regex, input: []const u8, from: usize) !?core.Span {
+        if (!bounded_bt.fits(self.nfa.?.n_states, input.len - from)) return self.pikeFind(input, from);
         const pool = self.bt_pool.?;
         const sc = try pool.get();
         defer pool.put(sc);
-        const n_pos1 = input.len + 1;
-        try sc.ensure((self.nfa.?.n_states * n_pos1 + 63) / 64);
-        var bt = bounded_bt.BoundedBt.initWith(self.nfa.?, self.bt_a_start, self.bt_a_end, sc, n_pos1);
-        const s = (try bt.findLeftmost(input)) orelse return null;
+        const n_pos1 = input.len - from + 1;
+        try sc.ensureWindow(self.nfa.?.n_states, n_pos1);
+        var bt = bounded_bt.BoundedBt.initWith(self.nfa.?, self.nfa_idx.?.*, self.bt_a_start, self.bt_a_end, sc, from, n_pos1);
+        const s = (try bt.findLeftmostFrom(input, from)) orelse return null;
         return core.Span{ .start = s.start, .end = s.end };
     }
 
@@ -1105,12 +1246,15 @@ pub const Regex = struct {
         // Fast path FIRST: the line-DFA scan needs none of the NFA scratch, so
         // take it before paying the O(n) `(state,pos)` bitset `ensure` below.
         if (self.line_dfa) |dfa| return self.lineDfaScan(dfa, input, from);
+        // Over the backtracker's visited budget: the PikeVM evaluates the
+        // leading `(?m)^` itself, so an unanchored search finds the same match.
+        if (!bounded_bt.fits(self.nfa.?.n_states, input.len - from)) return self.pikeFind(input, from);
         const pool = self.bt_pool.?;
         const sc = try pool.get();
         defer pool.put(sc);
-        const n_pos1 = input.len + 1;
-        try sc.ensure((self.nfa.?.n_states * n_pos1 + 63) / 64);
-        var bt = bounded_bt.BoundedBt.initWith(self.nfa.?, self.bt_a_start, self.bt_a_end, sc, n_pos1);
+        const n_pos1 = input.len - from + 1;
+        try sc.ensureWindow(self.nfa.?.n_states, n_pos1);
+        var bt = bounded_bt.BoundedBt.initWith(self.nfa.?, self.nfa_idx.?.*, self.bt_a_start, self.bt_a_end, sc, from, n_pos1);
         const s = (try bt.findLineStart(input, from, if (self.bt_line_first) |*set| set else null)) orelse return null;
         return core.Span{ .start = s.start, .end = s.end };
     }
@@ -1132,7 +1276,8 @@ pub const Regex = struct {
         var oh = hir.Hir(null).initRuntime();
         defer oh.deinit(allocator);
         oh.root = hir.cloneSubtree(null, null, &oh, allocator, h, h.root, true) catch return null;
-        var nfa = thompson.build(null, &oh) catch return null;
+        var nfa = thompson.buildAlloc(allocator, &oh) catch return null;
+        defer nfa.deinit(allocator);
         const d = full_dfa.compute(null, &nfa, false, false);
         if (d.outcome != .ok) return null;
         const heap = full_dfa.packHeap(allocator, &d) catch return null;
@@ -1148,7 +1293,8 @@ pub const Regex = struct {
         var oh = hir.Hir(null).initRuntime();
         defer oh.deinit(allocator);
         oh.root = hir.cloneSubtree(null, null, &oh, allocator, h, h.root, true) catch return null;
-        var nfa = thompson.build(null, &oh) catch return null;
+        var nfa = thompson.buildAlloc(allocator, &oh) catch return null;
+        defer nfa.deinit(allocator);
         const d = full_dfa.computeReverse(null, &nfa);
         if (d.outcome != .ok) return null;
         const heap = full_dfa.packHeap(allocator, &d) catch return null;
@@ -1169,11 +1315,13 @@ pub const Regex = struct {
 
     /// `.backtrack` leftmost span (backref/lookaround tree backtracker). The
     /// step budget surfaces as `RegexError.MatchBudgetExceeded` (.NET model).
-    fn btRun(self: *const Regex, input: []const u8) !?core.Span {
+    fn btRunFrom(self: *const Regex, input: []const u8, from: usize) !?core.Span {
         var bt = backtrack.Backtracker.init(self.bt_hir.?, self.bt_a_start, self.bt_a_end, self.n_groups, self.seek, self.del);
-        var slots: [bounded_bt.MAX_SLOTS]i32 = undefined;
-        const sp = bt.run(input, slots[0 .. 2 * (self.n_groups + 1)]) catch
-            return RegexError.MatchBudgetExceeded;
+        var slots: [bounded_bt.MAX_SLOTS]hir.Slot = undefined;
+        // Absolute coordinates: looks at `from` see the real preceding byte.
+        const sp = bt.runFrom(input, from, slots[0 .. 2 * (self.n_groups + 1)]) catch |e| switch (e) {
+            error.Budget => return RegexError.MatchBudgetExceeded,
+        };
         const s = sp orelse return null;
         return core.Span{ .start = s.start, .end = s.end };
     }
@@ -1181,9 +1329,10 @@ pub const Regex = struct {
     /// `.split_alt` leftmost span (top-level alternation: regular runs on
     /// anchored DFAs, non-regular branches on the tree backtracker, source
     /// order preserved). Budget surfaces as `MatchBudgetExceeded` (.NET model).
-    fn splitRun(self: *const Regex, input: []const u8) !?core.Span {
-        return self.split_plan.?.run(input, self.bt_a_start, self.bt_a_end, self.seek) catch
-            return RegexError.MatchBudgetExceeded;
+    fn splitRunFrom(self: *const Regex, input: []const u8, from: usize) !?core.Span {
+        return self.split_plan.?.runFrom(input, from, self.bt_a_start, self.bt_a_end, self.seek) catch |e| switch (e) {
+            error.Budget => return RegexError.MatchBudgetExceeded,
+        };
     }
 
     /// `.lazy_dfa` leftmost span (eager DFA blew `MAX_DFA`; same automaton
@@ -1197,7 +1346,11 @@ pub const Regex = struct {
         const pool = self.lazy_pool.?;
         const m = try pool.get();
         defer pool.put(m);
-        return self.lazy.?.isMatchFast(m, input);
+        return self.lazy.?.isMatchFast(m, input) catch |e| switch (e) {
+            // Cache thrash: the memo is not paying for itself.
+            error.LazyGaveUp => (try self.lazyFallback(m, input, 0)) != null,
+            else => return e,
+        };
     }
 
     /// `.lazy_dfa` leftmost span resuming at absolute `from` — the memoized
@@ -1208,7 +1361,21 @@ pub const Regex = struct {
         const pool = self.lazy_pool.?;
         const m = try pool.get();
         defer pool.put(m);
-        const s = (try self.lazy.?.findLeftmostFrom(m, input, from)) orelse return null;
+        const r = self.lazy.?.findLeftmostFrom(m, input, from) catch |e| switch (e) {
+            // Cache thrash: the memo is not paying for itself.
+            error.LazyGaveUp => return self.lazyFallback(m, input, from),
+            else => return e,
+        };
+        const s = r orelse return null;
+        return core.Span{ .start = s.start, .end = s.end };
+    }
+
+    /// After the lazy DFA gives up (thrash): the PikeVM when the engine keeps
+    /// NFA scratch pools (every look / capture pattern), else the classic
+    /// per-position restart (look-free patterns only — always correct).
+    fn lazyFallback(self: *const Regex, m: *lazy_dfa.LazyMemo, input: []const u8, from: usize) !?core.Span {
+        if (self.pike_pool != null) return self.pikeFind(input, from);
+        const s = (try self.lazy.?.findLeftmostRestart(m, input, from)) orelse return null;
         return core.Span{ .start = s.start, .end = s.end };
     }
 
@@ -1229,7 +1396,10 @@ pub const Regex = struct {
         return switch (self.kind) {
             .literal => core.literalIsMatchT(&self.teddy.?, input),
             .dfa => core.isMatch(self.dfa.?, input),
-            .lit_prefix => core.litPrefixIsMatch(self.dfa.?, &self.teddy.?, input),
+            .lit_prefix => if (self.dsearch != null or self.lazy != null)
+                (try self.litPrefixMetered(input, 0)) != null
+            else
+                core.litPrefixIsMatch(self.dfa.?, &self.teddy.?, input),
             .reverse_suffix => core.literalIsMatchT(&self.teddy.?, input) and
                 core.isMatch(self.dfa.?, input),
             .bt_look => if (self.rev_end_dfa) |rd|
@@ -1237,9 +1407,9 @@ pub const Regex = struct {
             else if (self.bt_line_anchor)
                 (try self.btLookLineScan(input, 0)) != null
             else
-                (try self.btLook(input)) != null,
-            .backtrack => (try self.btRun(input)) != null,
-            .split_alt => (try self.splitRun(input)) != null,
+                (try self.btLookFrom(input, 0)) != null,
+            .backtrack => (try self.btRunFrom(input, 0)) != null,
+            .split_alt => (try self.splitRunFrom(input, 0)) != null,
             .lazy_dfa => try self.lazyIsMatch(input),
             .dense_search => self.dsearch.?.isMatch(input),
             .class_span => self.csIsMatch(input),
@@ -1261,8 +1431,8 @@ pub const Regex = struct {
     /// (capture-free). The positional-resume peer of `find` — mirrors
     /// `capturesFrom` for the capture-bearing path. `pos` must be
     /// `<= input.len`; the returned span is in absolute `input` coordinates.
-    /// (As with `findAll`, a leading `^`/`\b`/look-behind on the slice-based
-    /// engines treats `pos` as start-of-text.)
+    /// Every engine sees the real bytes around `pos` (look-assertions and a
+    /// folded `^` never treat `pos` as a synthetic start-of-text).
     pub fn findFrom(self: *const Regex, input: []const u8, pos: usize) !?Match {
         const s = (try self.nextSpanFrom(input, pos)) orelse return null;
         return wholeMatch(input, s.start, s.end);
@@ -1282,15 +1452,13 @@ pub const Regex = struct {
     /// `pos` must be `<= input.len`. Caller owns the result —
     /// `defer m.?.deinit(allocator)`.
     ///
-    /// The slice-based engines (`backtrack`, `bounded_bt` fallback) run over
-    /// `input[pos..]` and have their span/slots shifted back to absolute
-    /// coordinates — exactly the offset convention `nextSpanFrom` already uses
-    /// for non-overlapping iteration, so capture iteration and `findAll` see
-    /// the same match set. (Consequence: as with `findAll`, a leading `^`/`\b`/
-    /// look-behind sees `pos` as start-of-text on those engines.)
+    /// NFA-backed patterns find the span with `nextSpanFrom` and rebuild the
+    /// slots over just that span (so capture iteration and `findAll` see the
+    /// same match set); the tree `.backtrack` engine resumes at absolute `pos`.
     pub fn capturesFrom(self: *const Regex, allocator: std.mem.Allocator, input: []const u8, pos: usize) !?Match {
+        if (self.bt_a_start and pos > 0) return null; // see `nextSpanFrom`
         const nslots = 2 * (self.n_groups + 1);
-        var slots: [bounded_bt.MAX_SLOTS]i32 = undefined;
+        var slots: [bounded_bt.MAX_SLOTS]hir.Slot = undefined;
         var span: core.Span = undefined;
         if (self.kind == .dup_word) {
             var gs: usize = 0;
@@ -1307,72 +1475,39 @@ pub const Regex = struct {
             span = .{ .start = sp.start, .end = sp.end };
         } else if (self.kind == .backtrack) {
             var bt = backtrack.Backtracker.init(self.bt_hir.?, self.bt_a_start, self.bt_a_end, self.n_groups, self.seek, self.del);
-            const sp = (bt.run(input[pos..], slots[0..nslots]) catch return RegexError.MatchBudgetExceeded) orelse return null;
-            span = .{ .start = sp.start + pos, .end = sp.end + pos };
-            shiftSlots(slots[0..nslots], pos);
+            // Absolute coordinates (no re-slicing, no slot shifting).
+            const r = bt.runFrom(input, pos, slots[0..nslots]) catch |e| switch (e) {
+                error.Budget => return RegexError.MatchBudgetExceeded,
+            };
+            const sp = r orelse return null;
+            span = .{ .start = sp.start, .end = sp.end };
         } else if (self.nfa != null and self.n_groups > 0) {
-            // One-pass fast path: span from the DFA (O(n)), slots via a single
-            // allocation-free deterministic pass. `bounded_bt` is the
-            // always-correct fallback if the pattern is not truly one-pass
-            // (the deterministic walk bails ⇒ `fill` returns false).
-            done: {
-                // Line-anchored capture pattern: the line-DFA (via
-                // `nextSpanFrom`) locates the whole-match span fast — skipping
-                // non-matching lines — then capture slots are reconstructed
-                // with the bounded backtracker over JUST that line span (scratch
-                // sized to one line, not the whole input — the latter is what
-                // makes the generic fallback O(n) per match). The span is a line
-                // (a line start `s` and `$`/EOF end), so both-anchoring the
-                // backtracker on the slice reproduces the same leftmost-first
-                // captures. `nextSpanFrom` is exact ⇒ no span ahead ⇒ no match.
-                if (self.line_dfa != null) {
-                    const sp = (try self.nextSpanFrom(input, pos)) orelse return null; // absolute
-                    var bt = try bounded_bt.BoundedBt.init(allocator, self.nfa.?, true, true, sp.end - sp.start);
-                    defer bt.deinit();
-                    _ = (try bt.captures(input[sp.start..sp.end], slots[0..nslots])) orelse return null;
-                    shiftSlots(slots[0..nslots], sp.start);
-                    slots[0] = @intCast(sp.start);
-                    slots[1] = @intCast(sp.end);
-                    span = sp;
-                    break :done;
-                }
-                if (self.op_onepass) {
-                    const sp = (try self.nextSpanFrom(input, pos)) orelse return null; // absolute
-                    @memset(slots[0..nslots], -1);
-                    slots[0] = @intCast(sp.start);
-                    slots[1] = @intCast(sp.end);
-                    if (onepass.fill(null, self.nfa.?, input, .{ .start = sp.start, .end = sp.end }, slots[0..nslots])) {
-                        span = sp;
-                        break :done;
-                    }
-                }
-                // Reverse-pass engines (`.dense_search`/`.lazy_dfa` — the
-                // unanchored `$` class + the floor cluster): `nextSpanFrom`
-                // already finds the whole-match span in ONE O(n) pass (the
-                // reverse `findAnchoredEnd` for `$`), so reconstruct slots over
-                // JUST that span — like the line-DFA path above. Without this a
-                // non-one-pass `(a+)+$`-with-groups capture would drop to the
-                // whole-input bounded backtracker below and stay O(n²) (worse,
-                // catastrophic) on adversarial input, even though `find`/`isMatch`
-                // are O(n). The span is the exact match, so both-anchoring the
-                // backtracker over the slice reproduces the leftmost-first slots.
-                if (self.kind == .dense_search or self.kind == .lazy_dfa) {
-                    const sp = (try self.nextSpanFrom(input, pos)) orelse return null; // absolute
-                    var bt = try bounded_bt.BoundedBt.init(allocator, self.nfa.?, true, true, sp.end - sp.start);
-                    defer bt.deinit();
-                    _ = (try bt.captures(input[sp.start..sp.end], slots[0..nslots])) orelse return null;
-                    shiftSlots(slots[0..nslots], sp.start);
-                    slots[0] = @intCast(sp.start);
-                    slots[1] = @intCast(sp.end);
-                    span = sp;
-                    break :done;
-                }
-                var bt = try bounded_bt.BoundedBt.init(allocator, self.nfa.?, self.bt_a_start, self.bt_a_end, input.len);
-                defer bt.deinit();
-                const sp = (try bt.captures(input[pos..], slots[0..nslots])) orelse return null;
-                span = .{ .start = sp.start + pos, .end = sp.end + pos };
-                shiftSlots(slots[0..nslots], pos);
-            }
+            // Two-phase captures (RE2 / rust-regex `meta` shape): the search
+            // engine (`nextSpanFrom` — DFA, lazy DFA, line-DFA, bounded bt, …)
+            // finds the exact leftmost-first span in absolute coordinates, then
+            // the slots are reconstructed over JUST that span. The first
+            // priority path from `sp.start` that accepts at `sp.end` is the path
+            // a direct search takes, so the slots are identical — while the
+            // capture engine's cost is bounded by the match, never the haystack
+            // (the old whole-input fallback re-sized its visited bitset to
+            // `n_states × input.len` on every call: O(n) per match).
+            const sp = (try self.nextSpanFrom(input, pos)) orelse return null; // absolute
+            span = sp;
+            // One-pass fast path: slots via a single allocation-free
+            // deterministic pass (bails ⇒ `fill` false ⇒ general reconstruction).
+            const one_pass = self.op_onepass and blk: {
+                @memset(slots[0..nslots], -1);
+                slots[0] = @intCast(sp.start);
+                slots[1] = @intCast(sp.end);
+                // The Regex's shared edge index (built once with the NFA) — no
+                // per-call counting sort.
+                const span_op: onepass.Span = .{ .start = sp.start, .end = sp.end };
+                break :blk if (self.nfa_idx) |ix|
+                    onepass.fillWith(null, self.nfa.?, ix, input, span_op, slots[0..nslots])
+                else
+                    onepass.fill(null, self.nfa.?, input, span_op, slots[0..nslots]);
+            };
+            if (!one_pass) try self.spanSlots(allocator, input, sp, slots[0..nslots]);
         } else {
             // No capture groups: only the whole-match span is meaningful.
             const sp = (try self.nextSpanFrom(input, pos)) orelse return null;
@@ -1400,11 +1535,111 @@ pub const Regex = struct {
         };
     }
 
+    /// Reconstruct the capture slots of a KNOWN leftmost-first match `sp` over
+    /// the full `input` (looks at the span edges see the real neighbours). The
+    /// bounded backtracker's window is just the span, borrowed from the pool
+    /// when the engine has one.
+    ///
+    /// The search engine's span is always a match of the same NFA, so the
+    /// capture engine always reproduces it. If that invariant ever broke (an
+    /// engine disagreement — the class of bug `nfa_fuzz` hunts), this returns
+    /// `RegexError.Internal`: a typed, testable signal in every build mode,
+    /// never a silent all-`null` capture a caller could mistake for "no group
+    /// participated".
+    fn spanSlots(self: *const Regex, allocator: std.mem.Allocator, input: []const u8, sp: core.Span, slots: []hir.Slot) !void {
+        const nfa = self.nfa.?;
+        const n_pos1 = sp.end - sp.start + 1;
+        const ok = if (!bounded_bt.fits(nfa.n_states, n_pos1 - 1) and self.pike_pool != null)
+            try self.pikeSpanSlots(input, sp, slots)
+        else if (self.bt_pool) |pool| blk: {
+            const sc = try pool.get();
+            defer pool.put(sc);
+            try sc.ensureWindow(nfa.n_states, n_pos1);
+            var bt = bounded_bt.BoundedBt.initWith(nfa, self.nfa_idx.?.*, false, false, sc, sp.start, n_pos1);
+            break :blk try bt.spanCaptures(input, sp.start, sp.end, slots);
+        } else blk: {
+            var bt = try bounded_bt.BoundedBt.initRange(allocator, nfa, false, false, sp.start, n_pos1 - 1);
+            defer bt.deinit();
+            break :blk try bt.spanCaptures(input, sp.start, sp.end, slots);
+        };
+        if (!ok) return RegexError.Internal;
+    }
+
+    /// `.lit_prefix` with an unbounded tail (`abc.*z`): Teddy-locate each
+    /// prefix occurrence and verify with the anchored DFA — the fast path —
+    /// while METERING the bytes failed candidates scan. Each failure can scan
+    /// to the end of its run, so on a prefix-dense haystack whose tail never
+    /// completes (`"abc"×N + "\nz"`) the per-candidate restart is
+    /// O(occurrences × n). Once the waste exceeds a constant multiple of the
+    /// progress made, the rest of this search runs on the single-pass engine
+    /// (frozen dense or lazy DFA) from the current candidate: no restarts, O(n).
+    /// Budget ∝ progress (not remaining input), so iteration stays linear too.
+    /// Benign inputs (candidates that match, or fail fast) never trip it.
+    fn litPrefixMetered(self: *const Regex, input: []const u8, pos: usize) !?core.Span {
+        const d = self.dfa.?;
+        const t = &self.teddy.?;
+        var from = pos;
+        var waste: usize = 0;
+        var next_req: ?usize = null; // see `search.litPrefixFind`
+        while (from <= input.len) {
+            const hit = core.literalFindT(t, input, from) orelse return null;
+            if (d.required) |r| {
+                if (next_req == null or next_req.? < hit.start)
+                    next_req = std.mem.indexOfScalarPos(u8, input, hit.start, r) orelse return null;
+            }
+            // `runFromStop` reports where the failed walk died, so the metering
+            // costs no second pass over the candidate's bytes.
+            var stop: usize = undefined;
+            if (d.runFromStop(input, hit.start, &stop)) |e| return core.Span{ .start = hit.start, .end = e };
+            waste += stop - hit.start + 1;
+            if (waste > 4 * (hit.start - pos) + 1024) return self.singlePassFrom(input, hit.start);
+            from = hit.start + 1;
+        }
+        return null;
+    }
+
+    /// Leftmost-first match at/after `from` on the single-pass fallback engine
+    /// attached to an unbounded `.lit_prefix` (`attachSinglePass`).
+    fn singlePassFrom(self: *const Regex, input: []const u8, from: usize) !?core.Span {
+        if (self.dsearch) |ds| {
+            const r = ds.findFrom(input, from) orelse return null;
+            return core.Span{ .start = r.start, .end = r.end };
+        }
+        return self.lazyRunFrom(input, from);
+    }
+
+    /// PikeVM leftmost-first span at/after absolute `from` (capture-free).
+    fn pikeFind(self: *const Regex, input: []const u8, from: usize) !?core.Span {
+        const pool = self.pike_pool.?;
+        const sc = try pool.get();
+        defer pool.put(sc);
+        var vm = try pikevm.PikeVm.init(self.nfa.?, self.nfa_idx.?.*, self.bt_a_start, self.bt_a_end, sc, 2);
+        var slots: [2]hir.Slot = undefined;
+        const s = (try vm.search(input, from, .{}, &slots)) orelse return null;
+        return core.Span{ .start = s.start, .end = s.end };
+    }
+
+    /// PikeVM slot reconstruction for the known match `sp` (accepts only at
+    /// `sp.end`: the first priority path ending there).
+    fn pikeSpanSlots(self: *const Regex, input: []const u8, sp: core.Span, slots: []hir.Slot) !bool {
+        const pool = self.pike_pool.?;
+        const sc = try pool.get();
+        defer pool.put(sc);
+        var vm = try pikevm.PikeVm.init(self.nfa.?, self.nfa_idx.?.*, false, self.bt_a_end, sc, slots.len);
+        const s = (try vm.search(input, sp.start, .{ .anchored = true, .want_end = sp.end }, slots)) orelse return false;
+        return s.end == sp.end;
+    }
+
     /// The next leftmost match span at/after absolute `pos`, in absolute
     /// `input` coordinates, or `null` if none. This is the single source of
     /// truth for non-overlapping iteration — `findAll`, the `MatchIterator`
     /// and `count` all dispatch through it, so their semantics cannot drift.
     fn nextSpanFrom(self: *const Regex, input: []const u8, pos: usize) !?core.Span {
+        // A folded `^`/`\A` (non-multiline start anchor, `bt_a_start`) only
+        // matches at offset 0. The slice-resuming engines below would otherwise
+        // see `input[pos..]` as a fresh text and re-match the anchor at every
+        // resume point (`^a` on "aaa" counted 3).
+        if (self.bt_a_start and pos > 0) return null;
         return switch (self.kind) {
             .literal => core.literalFindT(&self.teddy.?, input, pos),
             .reverse_suffix => blk: {
@@ -1419,6 +1654,7 @@ pub const Regex = struct {
                 break :blk core.Span{ .start = pos + r.start, .end = pos + r.end };
             },
             .lit_prefix => blk: {
+                if (self.dsearch != null or self.lazy != null) break :blk try self.litPrefixMetered(input, pos);
                 const r = core.litPrefixFind(self.dfa.?, &self.teddy.?, input[pos..]) orelse break :blk null;
                 break :blk core.Span{ .start = pos + r.start, .end = pos + r.end };
             },
@@ -1430,17 +1666,12 @@ pub const Regex = struct {
                 // Leading multiline `^`: enumerate line starts over the FULL
                 // input (absolute coords) instead of every position.
                 if (self.bt_line_anchor) break :blk try self.btLookLineScan(input, pos);
-                const r = (try self.btLook(input[pos..])) orelse break :blk null;
-                break :blk core.Span{ .start = pos + r.start, .end = pos + r.end };
+                // Absolute coordinates: looks at `pos` see the real preceding
+                // byte (a slice would make `pos` a synthetic start-of-text).
+                break :blk try self.btLookFrom(input, pos);
             },
-            .backtrack => blk: {
-                const r = (try self.btRun(input[pos..])) orelse break :blk null;
-                break :blk core.Span{ .start = pos + r.start, .end = pos + r.end };
-            },
-            .split_alt => blk: {
-                const r = (try self.splitRun(input[pos..])) orelse break :blk null;
-                break :blk core.Span{ .start = pos + r.start, .end = pos + r.end };
-            },
+            .backtrack => try self.btRunFrom(input, pos), // absolute
+            .split_alt => try self.splitRunFrom(input, pos), // absolute
             .lazy_dfa => try self.lazyRunFrom(input, pos), // already absolute
             .dense_search => blk: {
                 const r = self.dsearch.?.findFrom(input, pos) orelse break :blk null;
@@ -1734,4 +1965,34 @@ test "regex(meta): literal + dfa + findAll/replace/split" {
     defer rl.deinit();
     try std.testing.expect(try rl.isMatch("ab"));
     try std.testing.expect(!try rl.isMatch("ac"));
+}
+
+test "regex(meta): look search + captures past the backtracker's visited budget use the PikeVM" {
+    const a = std.testing.allocator;
+    // ~170-state look pattern × ~650 KB input ⇒ well over
+    // `bounded_bt.VISITED_BUDGET_BYTES`, so search and capture reconstruction
+    // take the PikeVM path. 8000 words of 80 letters: each is one match.
+    const pat = "\\b((?:[a-z]{2}){40})\\b";
+    const words = 8000;
+    const wlen = 80;
+    const buf = try a.alloc(u8, words * (wlen + 1));
+    defer a.free(buf);
+    for (0..words) |w| {
+        const o = w * (wlen + 1);
+        for (0..wlen) |k| buf[o + k] = @intCast('a' + (w + k) % 26);
+        buf[o + wlen] = ' ';
+    }
+    var rx = try Regex.compile(a, pat);
+    defer rx.deinit();
+    try std.testing.expect(rx.nfa != null);
+    try std.testing.expect(!bounded_bt.fits(rx.nfa.?.n_states, buf.len));
+    try std.testing.expectEqual(@as(usize, words), try rx.count(buf));
+    // A resume mid-word must not see a synthetic start-of-text: from inside
+    // word 0, the next match is word 1.
+    const m = (try rx.findFrom(buf, 3)).?;
+    try std.testing.expectEqual(@as(usize, wlen + 1), m.start);
+    var c = (try rx.capturesFrom(a, buf, 5 * (wlen + 1))).?;
+    defer c.deinit(a);
+    try std.testing.expectEqual(@as(usize, 5 * (wlen + 1)), c.groups[1].?.start);
+    try std.testing.expectEqual(@as(usize, 5 * (wlen + 1) + wlen), c.groups[1].?.end);
 }

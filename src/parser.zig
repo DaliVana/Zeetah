@@ -114,7 +114,11 @@ fn classToSet(cc: common.CharClass) [32]u8 {
     return s;
 }
 
-const MAX_REPEAT: usize = 1000; // `{m,n}` expansion cap (bigger => fallback);
+const MAX_REPEAT: usize = 1000; // comptime `{m,n}` expansion cap (bigger => fallback);
+// Runtime cap (PCRE2's quantifier maximum): the runtime HIR node ceiling
+// (`hir.MAX_NODES_RUNTIME`) is what actually bounds an expansion's size, so the
+// count itself may be as large as real patterns use (`{20,1024}`).
+const MAX_REPEAT_RUNTIME: usize = 65535;
 // the `hir.MAX_NODES` ceiling still bounds total expansion (oversized products
 // like `(a{1000}){1000}` route to `Error.TooComplex` → `PatternTooComplex`).
 const MAX_RANGES: usize = 64; // ranges per `[...]`
@@ -297,7 +301,7 @@ pub fn parseCaptures(
     src: []const u8,
     flags: ParseFlags,
     out_ng: *usize,
-    out_gnames: *[hir.MAX_GROUPS + 1]?[]const u8,
+    out_gnames: *[hir.groupsCap(cap) + 1]?[]const u8,
 ) Error!void {
     return parseInner(cap, h, allocator, src, flags, out_ng, out_gnames);
 }
@@ -309,7 +313,7 @@ fn parseInner(
     src: []const u8,
     flags: ParseFlags,
     out_ng: ?*usize,
-    out_gnames: ?*[hir.MAX_GROUPS + 1]?[]const u8,
+    out_gnames: ?*[hir.groupsCap(cap) + 1]?[]const u8,
 ) Error!void {
     if (src.len == 0) return Error.Unsupported;
 
@@ -369,6 +373,11 @@ fn parseInner(
     // end-anchor (`accept_at = len`) independently and correctly.
     h.root = root;
     h.saw_lazy = p.saw_lazy;
+    // Runtime store: bound the tree depth for the recursive walks downstream
+    // (the comptime store's node ceiling already bounds it).
+    if (cap == null) {
+        if (try h.tooDeep(allocator, hir.MAX_DEPTH_RUNTIME)) return Error.TooComplex;
+    }
 
     // Single-source-of-truth capture numbering: hand back the parser's
     // authoritative group count + `(?<name>)` names (already excludes groups
@@ -376,7 +385,7 @@ fn parseInner(
     // the standalone `scanGroups` byte-scanner used to recompute independently.
     if (out_ng) |p_ng| p_ng.* = p.n_groups;
     if (out_gnames) |g| {
-        g.* = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1);
+        g.* = [_]?[]const u8{null} ** (hir.groupsCap(cap) + 1);
         var k: usize = 0;
         while (k < p.n_names) : (k += 1) g.*[p.name_g[k]] = p.names[k];
     }
@@ -386,6 +395,10 @@ fn Parser(comptime cap: ?usize) type {
     return struct {
         const Self = @This();
         const H = hir.Hir(cap);
+        /// Per-store ceilings: the runtime heap store gets the larger runtime
+        /// group count and repeat bound (see `hir.groupsCap`, `MAX_REPEAT_RUNTIME`).
+        const GROUPS = hir.groupsCap(cap);
+        const REPEAT = if (cap == null) MAX_REPEAT_RUNTIME else MAX_REPEAT;
 
         pat: []const u8,
         i: usize = 0,
@@ -403,8 +416,8 @@ fn Parser(comptime cap: ?usize) type {
         /// name→index is re-derived in regex.zig).
         n_groups: usize = 0,
         capturing: bool = true,
-        names: [hir.MAX_GROUPS][]const u8 = undefined,
-        name_g: [hir.MAX_GROUPS]u32 = undefined,
+        names: [GROUPS][]const u8 = undefined,
+        name_g: [GROUPS]u32 = undefined,
         n_names: usize = 0,
         /// Recursive-descent nesting depth (one level per group body), guarded
         /// against stack overflow in `parseAlt`. See `MAX_PARSE_DEPTH`.
@@ -432,7 +445,7 @@ fn Parser(comptime cap: ?usize) type {
         /// captures are simply not reported, a documented Phase-D limitation).
         fn openGroup(p: *Self, name: ?[]const u8) Error!u32 {
             if (!p.capturing) return 0;
-            if (p.n_groups >= hir.MAX_GROUPS) return Error.TooComplex;
+            if (p.n_groups >= GROUPS) return Error.TooComplex;
             p.n_groups += 1;
             if (name) |nm| {
                 if (nm.len == 0) return Error.Invalid;
@@ -483,7 +496,7 @@ fn Parser(comptime cap: ?usize) type {
                 if (ch < '0' or ch > '9') break;
                 g = g * 10 + (ch - '0');
                 p.i += 1;
-                if (g > hir.MAX_GROUPS) return Error.Invalid;
+                if (g > GROUPS) return Error.Invalid;
             }
             if (g == 0) return Error.Invalid;
             // Record the highest referenced group for a post-parse validation
@@ -492,7 +505,7 @@ fn Parser(comptime cap: ?usize) type {
             // post-parse check against the final group count is correct and also
             // covers backrefs inside lookarounds.
             if (g > p.max_backref) p.max_backref = g;
-            return p.node(.{ .tag = .backref, .set_idx = g });
+            return p.node(.{ .tag = .backref, .set_idx = g, .fold = p.ci });
         }
 
         fn parseNamedBackref(p: *Self) Error!NodeRef {
@@ -507,7 +520,7 @@ fn Parser(comptime cap: ?usize) type {
             const nm = p.pat[s..p.i];
             p.i += 1;
             const g = p.lookupName(nm) orelse return Error.Invalid;
-            return p.node(.{ .tag = .backref, .set_idx = g });
+            return p.node(.{ .tag = .backref, .set_idx = g, .fold = p.ci });
         }
 
         /// `\xHH` (up to two hex digits; `\x` alone ⇒ NUL, like PCRE) or
@@ -747,7 +760,7 @@ fn Parser(comptime cap: ?usize) type {
                 min = min * 10 + (d - '0');
                 saw_min = true;
                 p.i += 1;
-                if (min > MAX_REPEAT) return Error.Unsupported;
+                if (min > REPEAT) return Error.Unsupported;
             }
             if (!saw_min) return Error.Invalid;
             var max: ?usize = min;
@@ -760,7 +773,7 @@ fn Parser(comptime cap: ?usize) type {
                             if (d < '0' or d > '9') break;
                             mx = mx * 10 + (d - '0');
                             p.i += 1;
-                            if (mx > MAX_REPEAT) return Error.Unsupported;
+                            if (mx > REPEAT) return Error.Unsupported;
                         }
                         max = mx;
                     } else max = null; // {m,}

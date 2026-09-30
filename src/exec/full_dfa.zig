@@ -256,11 +256,23 @@ pub const PackedDfa = struct {
     /// doc): one predicted branch on `has_spin`; no-spin patterns take the bare
     /// scalar loop.
     pub inline fn runFrom(self: *const PackedDfa, input: []const u8, start_pos: usize) ?usize {
-        if (self.has_spin) return self.runFromSpin(input, start_pos);
-        return self.runFromPlain(input, start_pos);
+        var stop: usize = undefined;
+        if (self.has_spin) return self.runFromSpin(input, start_pos, false, &stop);
+        return self.runFromPlain(input, start_pos, false, &stop);
     }
 
-    inline fn runFromPlain(self: *const PackedDfa, input: []const u8, start_pos: usize) ?usize {
+    /// `runFrom` that also reports where the walk STOPPED (`stop.*`): the
+    /// position of the byte that led to the DEAD sink, or `input.len`. For a
+    /// failed candidate that is exactly the bytes it scanned — what the runtime
+    /// literal-prefix search meters to bound its restart waste — at no extra
+    /// pass. The `comptime want_stop` switch leaves the plain `runFrom`
+    /// instantiations byte-identical to the tuned loops.
+    pub fn runFromStop(self: *const PackedDfa, input: []const u8, start_pos: usize, stop: *usize) ?usize {
+        if (self.has_spin) return self.runFromSpin(input, start_pos, true, stop);
+        return self.runFromPlain(input, start_pos, true, stop);
+    }
+
+    inline fn runFromPlain(self: *const PackedDfa, input: []const u8, start_pos: usize, comptime want_stop: bool, stop: *usize) ?usize {
         const shift = self.shift;
         const t = self.trans.ptr; // hoist the table base out of the loop
         var state: u16 = @intCast(self.start);
@@ -272,6 +284,7 @@ pub const PackedDfa = struct {
             if (state == 0) break; // DEAD sink
             if (self.accepting[state]) last_accept = i + 1;
         }
+        if (want_stop) stop.* = i;
         if (self.a_end) {
             if (last_accept) |e| {
                 if (e == input.len) return e;
@@ -290,7 +303,7 @@ pub const PackedDfa = struct {
     /// even with the base captured in a local stepper), so they cannot collapse to
     /// one generic without a measured throughput hit. Drift between the copies is
     /// caught by the `PackedDfa.runFrom == Dfa256.runFrom` differential test below.
-    fn runFromSpin(self: *const PackedDfa, input: []const u8, start_pos: usize) ?usize {
+    fn runFromSpin(self: *const PackedDfa, input: []const u8, start_pos: usize, comptime want_stop: bool, stop: *usize) ?usize {
         const shift = self.shift;
         const t = self.trans.ptr; // hoist the table base out of the loop
         var state: u16 = @intCast(self.start);
@@ -322,6 +335,7 @@ pub const PackedDfa = struct {
                 i += 1;
             }
         }
+        if (want_stop) stop.* = i;
         if (self.a_end) {
             if (last_accept) |e| {
                 if (e == input.len) return e;
@@ -438,6 +452,14 @@ fn findOrAdd(lists: *[MAX_DFA][MAX_NFA]u16, lens: *[MAX_DFA]usize, n: *usize, wa
 /// uses only `transitions` / `accepting` / `start` / `class_of`.
 pub fn computeReverse(comptime cap: ?usize, nfa: *const thompson.Nfa(cap)) Dfa256 {
     @setEvalBranchQuota(4_000_000);
+    if (cap == null) {
+        // The runtime NFA is slice-backed: `rev = nfa.*` below would alias and
+        // flip the caller's edges. Reverse a fixed-size copy instead (declining
+        // anything past the eager ceilings, like `compute`).
+        if (!fitsEager(nfa)) return emptyDfa256(.exploded);
+        var fixed = fixedCopy(nfa);
+        return computeReverse(MAX_NFA, &fixed);
+    }
 
     // Reversed NFA: flip every edge and swap start↔accept. A conditional `look`
     // edge has no meaningful reverse here — bail (caller keeps the forward path).
@@ -559,6 +581,25 @@ pub fn computeReverse(comptime cap: ?usize, nfa: *const thompson.Nfa(cap)) Dfa25
     return out;
 }
 
+/// Whether a runtime (slice-backed) NFA fits the eager construction's fixed
+/// `MAX_NFA` / `MAX_EDGES` / `MAX_SETS` scratch.
+pub fn fitsEager(nfa: *const thompson.Nfa(null)) bool {
+    return nfa.n_states <= MAX_NFA and nfa.n_edges <= MAX_EDGES and nfa.n_sets <= thompson.MAX_SETS;
+}
+
+/// Fixed-array copy of a runtime NFA that `fitsEager`.
+fn fixedCopy(nfa: *const thompson.Nfa(null)) thompson.Nfa(MAX_NFA) {
+    var out: thompson.Nfa(MAX_NFA) = .{ .n_states = nfa.n_states, .n_edges = nfa.n_edges, .n_sets = nfa.n_sets, .start = nfa.start, .accept = nfa.accept };
+    @memcpy(out.e_from[0..nfa.n_edges], nfa.e_from);
+    @memcpy(out.e_to[0..nfa.n_edges], nfa.e_to);
+    @memcpy(out.e_kind[0..nfa.n_edges], nfa.e_kind);
+    @memcpy(out.e_set[0..nfa.n_edges], nfa.e_set);
+    @memcpy(out.e_look[0..nfa.n_edges], nfa.e_look);
+    @memcpy(out.e_slot[0..nfa.n_edges], nfa.e_slot);
+    @memcpy(out.sets[0..nfa.n_sets], nfa.sets);
+    return out;
+}
+
 pub fn emptyDfa256(outcome: Outcome) Dfa256 {
     return .{
         .class_of = [_]u8{0} ** 256,
@@ -583,6 +624,10 @@ pub fn emptyDfa256(outcome: Outcome) Dfa256 {
 /// the runtime walk cache-friendly for *all* callers uniformly.
 pub fn compute(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), a_start: bool, a_end: bool) Dfa256 {
     @setEvalBranchQuota(4_000_000);
+    // The eager construction's scratch is sized to the small fixed ceilings; a
+    // larger runtime NFA is declined as `.exploded` (the caller routes it to
+    // the lazy DFA, which is sized per NFA).
+    if (cap == null and !fitsEager(nfa)) return emptyDfa256(.exploded);
 
     const nfa_start = nfa.start;
     const nfa_accept = nfa.accept;
@@ -846,7 +891,8 @@ test "runFromSpin == runFromPlain (differential, long self-loop runs)" {
         var h = hir.Hir(null).initRuntime();
         defer h.deinit(a);
         parser.parse(null, &h, a, p, .{}) catch continue;
-        var nfa = thompson.build(null, &h) catch continue;
+        var nfa = thompson.buildAlloc(a, &h) catch continue;
+        defer nfa.deinit(a);
         const d = compute(null, &nfa, h.anchored_start, h.anchored_end);
         if (d.outcome != .ok) continue;
         if (d.has_spin) saw_spin = true;
@@ -900,7 +946,8 @@ test "PackedDfa.runFrom == Dfa256.runFrom (pack + flat-table differential)" {
         var h = hir.Hir(null).initRuntime();
         defer h.deinit(a);
         parser.parse(null, &h, a, p, .{}) catch continue;
-        var nfa = thompson.build(null, &h) catch continue;
+        var nfa = thompson.buildAlloc(a, &h) catch continue;
+        defer nfa.deinit(a);
         const d = compute(null, &nfa, h.anchored_start, h.anchored_end);
         if (d.outcome != .ok) continue;
 
@@ -915,7 +962,26 @@ test "PackedDfa.runFrom == Dfa256.runFrom (pack + flat-table differential)" {
             for (buf) |*c| c.* = alpha[rnd.int(usize) % alpha.len];
             for (0..len + 1) |sp| {
                 try std.testing.expectEqual(d.runFrom(buf, sp), pd.runFrom(buf, sp));
-                try std.testing.expectEqual(pd.runFromPlain(buf, sp), pd.runFromSpin(buf, sp));
+                var s1: usize = undefined;
+                var s2: usize = undefined;
+                try std.testing.expectEqual(pd.runFromPlain(buf, sp, false, &s1), pd.runFromSpin(buf, sp, false, &s2));
+                // `runFromStop`: same answer, and `stop` is where a step-by-step
+                // walk first hits the DEAD sink (or `input.len`).
+                try std.testing.expectEqual(d.runFrom(buf, sp), pd.runFromStop(buf, sp, &s1));
+                try std.testing.expectEqual(pd.runFrom(buf, sp), pd.runFromPlain(buf, sp, true, &s2));
+                try std.testing.expectEqual(s1, s2);
+                try std.testing.expectEqual(pd.runFrom(buf, sp), pd.runFromSpin(buf, sp, true, &s2));
+                try std.testing.expectEqual(s1, s2);
+                var st: u16 = @intCast(pd.start);
+                var want_stop: usize = len;
+                for (buf[sp..], sp..) |b, i| {
+                    st = pd.step(st, pd.class_of[b]);
+                    if (st == 0) {
+                        want_stop = i;
+                        break;
+                    }
+                }
+                try std.testing.expectEqual(want_stop, s1);
             }
 
             // (2) one long pure self-loop run + terminator — fires the SIMD skip
@@ -925,6 +991,10 @@ test "PackedDfa.runFrom == Dfa256.runFrom (pack + flat-table differential)" {
                 buf[len - 1] = 'x';
                 for (0..len + 1) |sp| {
                     try std.testing.expectEqual(d.runFrom(buf, sp), pd.runFrom(buf, sp));
+                    var s1: usize = undefined;
+                    var s2: usize = undefined;
+                    try std.testing.expectEqual(pd.runFromPlain(buf, sp, true, &s1), pd.runFromSpin(buf, sp, true, &s2));
+                    try std.testing.expectEqual(s1, s2);
                 }
             }
         }
@@ -957,7 +1027,8 @@ test "computeReverse + reverseSearch == forward core.findLeftmost ($-anchored or
         var h = hir.Hir(null).initRuntime();
         defer h.deinit(a);
         parser.parse(null, &h, a, p, .{}) catch continue;
-        var nfa = thompson.build(null, &h) catch continue;
+        var nfa = thompson.buildAlloc(a, &h) catch continue;
+        defer nfa.deinit(a);
         const fd = compute(null, &nfa, h.anchored_start, h.anchored_end);
         if (fd.outcome != .ok) continue;
         const rd = computeReverse(null, &nfa);

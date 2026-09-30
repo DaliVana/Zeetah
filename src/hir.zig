@@ -61,7 +61,29 @@ pub const LA_BEHIND: u32 = 1;
 pub const LA_NEGATIVE: u32 = 2;
 
 /// Max capturing groups (group 0 = whole match). Slots = 2*(MAX_GROUPS+1).
+/// The comptime `Pattern` and the tree backtracker (`exec/backtrack.zig`, whose
+/// per-atomic slot snapshot lives on the stack) are sized to this.
 pub const MAX_GROUPS: usize = 32;
+/// Runtime capture-group ceiling for the NFA engines (lazy DFA, bounded
+/// backtracker, PikeVM, one-pass), whose slot buffers are sized per pattern.
+/// A runtime pattern that needs the tree backtracker still takes `MAX_GROUPS`.
+pub const MAX_GROUPS_RUNTIME: usize = 255;
+
+/// Group ceiling for a store: the runtime heap store (`cap == null`) gets
+/// `MAX_GROUPS_RUNTIME`, the comptime store `MAX_GROUPS`.
+pub fn groupsCap(comptime cap: ?usize) usize {
+    return if (cap == null) MAX_GROUPS_RUNTIME else MAX_GROUPS;
+}
+
+/// A capture-slot VALUE: a byte offset into the haystack, or -1 = unset.
+/// Pointer-width so every offset of an in-memory haystack is representable —
+/// an `i32` truncated positions past 2 GiB (a panic on safe builds; in
+/// ReleaseFast a negative value that became a huge `usize` slice index). Slot
+/// INDICES (`e_slot`, "which slot does this ε write") stay small `i32`s.
+pub const Slot = isize;
+comptime {
+    std.debug.assert(@bitSizeOf(Slot) == @bitSizeOf(usize)); // every offset fits
+}
 
 /// Zero-width assertion kinds (Rust `nfa::thompson::Look` shape).
 pub const LookKind = enum(u8) {
@@ -84,6 +106,10 @@ pub const HNode = struct {
     set_idx: u32 = 0,
     /// Epsilon priority for `star`/`plus`/`opt`: greedy vs lazy.
     greedy: bool = true,
+    /// `backref` only: compare ASCII-case-insensitively — the reference was
+    /// parsed under `(?i)`, so `(?i)(ab)\1` must match "abAB" (the group's
+    /// text in any case, like the literals/classes `(?i)` already folds).
+    fold: bool = false,
 };
 
 /// Overflow / unsupported / invalid signalling for the parser → HIR stage.
@@ -97,6 +123,17 @@ pub const Error = error{ Unsupported, TooComplex, Invalid };
 /// like the old fixed `MAX_*` sentinels.
 pub const MAX_NODES: usize = 4096;
 pub const MAX_SETS: usize = 4096;
+/// Runtime (heap `Hir(null)`) ceilings: enough for machine-generated patterns
+/// (a ~100-alternative secret scanner is ~22 K nodes / ~9 K sets) while still
+/// bounding memory (≤ 2 MiB nodes + 2 MiB sets) and `{m,n}` expansion. Sets
+/// stay ≤ 65535 so the NFA's `u16` set ids never overflow.
+pub const MAX_NODES_RUNTIME: usize = 1 << 17;
+pub const MAX_SETS_RUNTIME: usize = 65535;
+/// Runtime HIR depth ceiling. The analyses, the NFA lowering and the cloner
+/// walk the tree recursively; the old 4096-node ceiling bounded their depth
+/// implicitly, and this keeps that bound now that the node ceiling is larger
+/// (a wide pattern stays fine, a 20 000-deep `a{20000}` chain is rejected).
+pub const MAX_DEPTH_RUNTIME: usize = 4096;
 
 /// `cap == null` -> runtime store (allocator-backed); `cap == N` -> comptime
 /// store (fixed arrays, no allocator). Both expose the same method surface so
@@ -156,6 +193,30 @@ pub fn Hir(comptime cap: ?usize) type {
             }
         }
 
+        /// Whether any node lies deeper than `limit` (runtime store). Children
+        /// are always created before their parent, so one pass in index order
+        /// computes every node's height — no recursion, so the check itself is
+        /// stack-safe on exactly the trees it exists to reject.
+        pub fn tooDeep(self: *const Self, allocator: std.mem.Allocator, limit: usize) Error!bool {
+            const height = allocator.alloc(u32, self.node_count) catch return Error.TooComplex;
+            defer allocator.free(height);
+            for (0..self.node_count) |i| {
+                const nd = self.node(@intCast(i));
+                var d: u32 = 0;
+                if (nd.a != none) {
+                    std.debug.assert(nd.a < i);
+                    d = height[nd.a];
+                }
+                if (nd.b != none) {
+                    std.debug.assert(nd.b < i);
+                    d = @max(d, height[nd.b]);
+                }
+                height[i] = d + 1;
+                if (height[i] > limit) return true;
+            }
+            return false;
+        }
+
         /// Append a node, returning its ref. `allocator` is unused (and may be
         /// `undefined`) for the comptime store.
         pub fn addNode(self: *Self, allocator: std.mem.Allocator, n: HNode) Error!NodeRef {
@@ -163,7 +224,7 @@ pub fn Hir(comptime cap: ?usize) type {
                 if (self.node_count >= c or self.node_count >= MAX_NODES) return Error.TooComplex;
                 self.nodes[self.node_count] = n;
             } else {
-                if (self.node_count >= MAX_NODES) return Error.TooComplex;
+                if (self.node_count >= MAX_NODES_RUNTIME) return Error.TooComplex;
                 self.nodes.append(allocator, n) catch return Error.TooComplex;
             }
             const id: NodeRef = @intCast(self.node_count);
@@ -177,7 +238,7 @@ pub fn Hir(comptime cap: ?usize) type {
                 if (self.set_count >= c or self.set_count >= MAX_SETS) return Error.TooComplex;
                 self.sets[self.set_count] = bitmap;
             } else {
-                if (self.set_count >= MAX_SETS) return Error.TooComplex;
+                if (self.set_count >= MAX_SETS_RUNTIME) return Error.TooComplex;
                 self.sets.append(allocator, bitmap) catch return Error.TooComplex;
             }
             const id: u32 = @intCast(self.set_count);
@@ -225,7 +286,7 @@ pub fn cloneSubtree(
             if (relax_irregular) return dst.addNode(a, .{ .tag = .empty });
             return switch (nd.tag) {
                 // look / backref are leaves (set_idx = LookKind / group).
-                .look, .backref => dst.addNode(a, .{ .tag = nd.tag, .set_idx = nd.set_idx }),
+                .look, .backref => dst.addNode(a, .{ .tag = nd.tag, .set_idx = nd.set_idx, .fold = nd.fold }),
                 // look_around carries a sub-expression.
                 else => dst.addNode(a, .{
                     .tag = .look_around,
