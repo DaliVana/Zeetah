@@ -1,5 +1,6 @@
 //! Full-DFA construction: byte-equivalence-class compression + leftmost-first
-//! subset construction (with the leftmost-first accept cut) + Moore
+//! subset construction (with the leftmost-first accept cut — except for an
+//! end-anchored `a_end` table, where it is unsound and unnecessary) + Moore
 //! partition-refinement minimization + the unanchored-search start-byte
 //! prefilter.
 //!
@@ -100,7 +101,8 @@ pub const Dfa256 = struct {
     /// input until the DEAD sink (state 0) or end of input, tracking the last
     /// accepting position reached (the leftmost-first end for the surviving
     /// lineage — the priority cut is baked in at construction). With `a_end`,
-    /// only an accepting prefix that consumes through `input.len` qualifies.
+    /// only an accepting prefix that consumes through `input.len` qualifies (and
+    /// the table is built without the cut — see `compute`).
     ///
     /// This is the single search primitive the generic prefilter layer
     /// (`exec/search.zig`) drives; it mirrors the comptime `comptime_dfa.Dfa.runFrom`,
@@ -656,16 +658,32 @@ pub fn compute(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), a_start: boo
 
     // Priority-ordered ε-closure + accept cut: shared with the lazy engine
     // (`exec/dfa_build.zig`). Local alias keeps the call sites terse.
+    //
+    // With `a_end` the cut is OFF. Every match must end at `input.len`, so a
+    // match is fixed by its start and priority can never pick a different one —
+    // the cut would only drop threads that can still reach the end
+    // (`^(?:a|aa)$` on "aa": once `a` accepts, the cut keeps only that thread
+    // and the walk dies before the second `a`, so "aa" was rejected). The
+    // `a_end` DFA is therefore the plain language DFA: pure-reachability
+    // closures, sorted into a canonical key (as `computeReverse`), accepting
+    // iff the set contains the NFA accept.
+    const NO_CUT: u16 = std.math.maxInt(u16); // never a real state
     const Cl = struct {
         inline fn build(
             eps_to_: *const [MAX_EDGES]u16,
             eps_off_: *const [MAX_NFA + 1]usize,
             accept: u16,
+            no_cut: bool,
             seeds: []const u16,
             out_list: *[MAX_NFA]u16,
             accept_flag: *bool,
         ) usize {
-            return dfa_build.closure(eps_to_, eps_off_, accept, seeds, out_list, accept_flag);
+            if (!no_cut) return dfa_build.closure(eps_to_, eps_off_, accept, seeds, out_list, accept_flag);
+            var unused = false;
+            const len = dfa_build.closure(eps_to_, eps_off_, NO_CUT, seeds, out_list, &unused);
+            std.mem.sort(u16, out_list[0..len], {}, std.sort.asc(u16));
+            accept_flag.* = std.mem.indexOfScalar(u16, out_list[0..len], accept) != null;
+            return len;
         }
     };
 
@@ -674,7 +692,7 @@ pub fn compute(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), a_start: boo
     var start_buf: [MAX_NFA]u16 = undefined;
     var start_acc = false;
     const start_seeds = [_]u16{@intCast(nfa_start)};
-    const start_len = Cl.build(&eps_to, &eps_off, @intCast(nfa_accept), &start_seeds, &start_buf, &start_acc);
+    const start_len = Cl.build(&eps_to, &eps_off, @intCast(nfa_accept), a_end, &start_seeds, &start_buf, &start_acc);
     const start_id = findOrAdd(&dfa_list, &dfa_len, &dfa_n, &start_buf, start_len) catch {
         return emptyDfa256(.exploded);
     };
@@ -706,7 +724,7 @@ pub fn compute(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), a_start: boo
             }
             var tgt_buf: [MAX_NFA]u16 = undefined;
             var tgt_acc = false;
-            const tgt_len = Cl.build(&eps_to, &eps_off, @intCast(nfa_accept), seeds[0..n_seeds], &tgt_buf, &tgt_acc);
+            const tgt_len = Cl.build(&eps_to, &eps_off, @intCast(nfa_accept), a_end, seeds[0..n_seeds], &tgt_buf, &tgt_acc);
             const id = findOrAdd(&dfa_list, &dfa_len, &dfa_n, &tgt_buf, tgt_len) catch {
                 return emptyDfa256(.exploded);
             };

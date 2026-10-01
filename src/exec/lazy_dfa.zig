@@ -247,16 +247,12 @@ pub const LazyProg = struct {
     pub fn findLeftmostFrom(self: *const LazyProg, m: *LazyMemo, input: []const u8, from: usize) !?Span {
         try self.prep(m);
         if (self.look) return self.findLeftmostFromL(m, input, from);
+        // `$`/`\z`-anchored (with or without `^`): one reverse pass, see
+        // `anchoredEndFrom`. It also replaces the per-position `restartFrom` —
+        // O(n²) on non-matching `class+$` input (`a+$`, `\s+$`, `(a+)+$`, …).
+        if (self.a_end) return self.anchoredEndFrom(m, input, from);
         if (self.a_start)
             return self.restartFrom(m, input, from);
-        // `$`/`\z`-anchored: the `Σ*?` forward injection runs to `input.len`
-        // and an accepting *final* state means the pattern matches a suffix
-        // ending there; one reverse pass then recovers the leftmost start.
-        // This replaces the per-position `restartFrom` — O(n²) on non-matching
-        // `class+$` input (`a+$`, `\s+$`, `(a+)+$`, …) — with one forward + one
-        // reverse pass (the anti-ReDoS fix for the `$` family).
-        if (self.a_end)
-            return self.findAnchoredEndFrom(m, input, from);
 
         // A flush (cache full) keeps the scan going: every step returns an id
         // interned in the CURRENT generation, so the walk simply continues from
@@ -364,6 +360,19 @@ pub const LazyProg = struct {
         return .{ .start = r.start, .end = input.len };
     }
 
+    /// The leftmost match at/after `from` of a `$`/`\z`-anchored pattern, with
+    /// or without a folded `^`. Every match ends at `input.len`, so a match is
+    /// fixed by its start: this is pure reverse reachability. The forward walk
+    /// can't decide it — its leftmost-first accept cut drops threads that would
+    /// still reach the end (`^(?:a|aa)$` on "aa": once `a` accepts, the cut
+    /// keeps only that thread). Under `^` the only candidate starts at 0. The
+    /// classic-mode peer of the `a_end` branch of `findLeftmostFromL`.
+    fn anchoredEndFrom(self: *const LazyProg, m: *LazyMemo, input: []const u8, from: usize) !?Span {
+        const sp = (try self.findAnchoredEndFrom(m, input, from)) orelse return null;
+        if (self.a_start and sp.start != 0) return null;
+        return sp;
+    }
+
     /// Memoized single-pass existence check (stops at the first accept; no
     /// greedy extend, no reverse pass). With `$`/`\z` only an accept *at*
     /// `input.len` counts, so existence reduces to the reverse-reachability
@@ -371,10 +380,9 @@ pub const LazyProg = struct {
     pub fn isMatchFast(self: *const LazyProg, m: *LazyMemo, input: []const u8) !bool {
         try self.prep(m);
         if (self.look) return self.isMatchL(m, input);
+        if (self.a_end) return (try self.anchoredEndFrom(m, input, 0)) != null;
         if (self.a_start)
             return (try self.restartFrom(m, input, 0)) != null;
-        if (self.a_end)
-            return (try self.findAnchoredEndFrom(m, input, 0)) != null;
         var gu = GiveUp{ .gen = m.gen, .mark = 0 };
         var sid = try self.startState(m);
         if (m.accept.items[sid]) return true;
@@ -393,6 +401,7 @@ pub const LazyProg = struct {
     pub fn findLeftmost(self: *const LazyProg, m: *LazyMemo, input: []const u8) !?Span {
         try self.prep(m);
         if (self.look) return self.findLeftmostFromL(m, input, 0);
+        if (self.a_end) return self.anchoredEndFrom(m, input, 0);
         if (self.a_start) {
             if (try self.runFrom(m, input, 0)) |e| return .{ .start = 0, .end = e };
             return null;
@@ -409,6 +418,7 @@ pub const LazyProg = struct {
     }
 
     fn restartFrom(self: *const LazyProg, m: *LazyMemo, input: []const u8, from: usize) !?Span {
+        if (self.a_end) return self.anchoredEndFrom(m, input, from);
         if (self.a_start) {
             if (from != 0) return null;
             if (try self.runFrom(m, input, 0)) |e| return .{ .start = 0, .end = e };

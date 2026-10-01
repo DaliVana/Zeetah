@@ -305,7 +305,7 @@ reproduce it via the [comparison harness](docs/BENCHMARKS.md#the-comparison-harn
 |---------|--------|--------|
 | Literals | `abc`, `123` | ✅ |
 | Quantifiers | `*`, `+`, `?`, `{n}`, `{m,n}` | ✅ counts > 1000 → `NotImplemented`; very large in-budget counts → `PatternTooComplex` |
-| Lazy quantifiers | `*?`, `+?`, `??`, `{m,n}?` | ✅ lazy **+ end-anchor** (`a*?$`) runs on the backtracker (match-budget bounded) |
+| Lazy quantifiers | `*?`, `+?`, `??`, `{m,n}?` | ✅ including lazy **+ end-anchor** (`a*?$`), on the DFA path |
 | Possessive quantifiers | `*+`, `++`, `?+`, `{m,n}+` | ✅ lower to atomic groups; run on the backtracker (match-budget bounded)¹ |
 | Alternation | `a\|b\|c` | ✅ |
 | Predefined classes | `\d \w \s \D \W \S` | ✅ (including inside `[…]`) |

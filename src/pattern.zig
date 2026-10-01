@@ -22,10 +22,9 @@ const search = @import("exec/search.zig");
 const seq_extract = @import("exec/seq_extract.zig");
 const edge_look = @import("exec/edge_look.zig");
 const line_dfa = @import("exec/line_dfa.zig");
-const backtrack = @import("exec/backtrack.zig");
+const compiled_bt = @import("exec/compiled_bt.zig");
 const seek_mod = @import("exec/seek.zig");
 const class_span = @import("exec/class_span.zig");
-const delegate = @import("exec/delegate.zig");
 const dupword = @import("exec/dupword.zig");
 
 const Match = @import("match.zig").Match;
@@ -34,14 +33,14 @@ const Captures = @import("match.zig").Captures;
 const wholeMatch = @import("match.zig").wholeMatch;
 const advanceEmpty = @import("match.zig").advanceEmpty;
 
-/// A comptime-known placeholder `Allocator` for the seek/delegate `Plan` fields
-/// on the **comptime** path. Those plans bake their DFAs into `.rodata` and
+/// A comptime-known placeholder `Allocator` for the seek `Plan` fields on the
+/// **comptime** path. Those plans bake their DFAs into `.rodata` and
 /// never allocate (no `deinit`, no `realloc`, no `locate` path touches the
 /// allocator), so the field only needs a well-typed value. Crucially — unlike
 /// `std.heap.page_allocator` — this references no OS page-size machinery, so the
 /// comptime `Pattern` compiles for **freestanding / bare-metal** targets. On
 /// e.g. `thumb-freestanding` (no `page_size_min`), naming `page_allocator` here
-/// is a hard `@compileError`, which previously made every seek/delegate-using
+/// is a hard `@compileError`, which previously made every seek-using
 /// pattern (`\w+`, atomic groups, required-literal patterns) fail to build for
 /// embedded. `alloc` returns null and resize/remap/free are no-ops; if the
 /// comptime path ever did allocate through this, it would fail safe rather than
@@ -71,44 +70,24 @@ fn Compressed(comptime m: full_dfa.Dfa256) type {
 /// Compress a comptime `full_dfa.Dfa256` into its exact-fit `Compressed(m)` =
 /// `comptime_dfa.Dfa(m.n_states, m.n_classes)` form for baking into `.rodata`.
 /// Used for the main matcher DFA (the `use_dfa` arm below calls `compress(m)`)
-/// and the seek / delegate / edge-look prefilter DFAs on the comptime path —
-/// each would otherwise bake a full 131 KB `Dfa256` (the dominant flash cost for
-/// backtracker-tier patterns — atomic groups, lookaround, back-references — on
-/// embedded targets). Thin wrapper over `compressTo`, which is the single source
-/// of truth for the `Dfa256`→baked field mapping (surplus/padding columns
-/// `[nk..Stride)` filled with `DEAD` so the baked `.rodata` is fully
-/// initialized).
+/// and the seek / edge-look / capture prefilter DFAs on the comptime path —
+/// each would otherwise bake a full 131 KB `Dfa256`. This is the ONE place the
+/// `Dfa256`→baked field mapping lives (padding columns `[nk..Stride)` are
+/// filled with `DEAD` so the baked `.rodata` is fully initialized); the
+/// decompressors (`comptime_dfa.Dfa.runFrom` / `findLeftmost` / `step`) read
+/// those fields back identically.
 fn compress(comptime m: full_dfa.Dfa256) Compressed(m) {
-    return compressTo(Compressed(m), m);
-}
-
-/// Like `compress`, but into a CALLER-CHOSEN (possibly larger) target type
-/// `T = comptime_dfa.Dfa(NS, NK)` with `NS ≥ m.n_states`, `NK ≥ m.n_classes`.
-/// Used for delegate islands: a `Pattern` may have several islands of differing
-/// minimized dimensions, so they are all baked into one homogeneous `[N]T`
-/// array sized to the per-pattern max — letting a single `delegate.Plan` /
-/// matcher serve them all while still costing `[NS][NK]` `.rodata` instead of
-/// a 131 KB `Dfa256` each. Surplus states/classes are filled with `DEAD` (never
-/// reached: each island's own `class_of` emits only its `0..n_classes`, and its
-/// live states are `0..n_states`). This is the ONE place the `Dfa256`→baked
-/// field mapping lives; the decompressors (`comptime_dfa.Dfa.runFrom` /
-/// `findLeftmost` / `step`) read those fields back identically.
-fn compressTo(comptime T: type, comptime m: full_dfa.Dfa256) T {
+    const T = Compressed(m);
     @setEvalBranchQuota(4_000_000);
     var t: T = undefined;
     t.class_of = m.class_of;
     t.start = @intCast(m.start);
     t.anchored_start = m.a_start;
     t.anchored_end = m.a_end;
-    var i: usize = 0;
-    while (i < T.NumStates) : (i += 1) {
-        t.accepting[i] = i < m.n_states and m.accepting[i];
-        var k: usize = 0;
-        while (k < T.Stride) : (k += 1) {
-            t.transitions[i][k] = if (i < m.n_states and k < m.n_classes)
-                @intCast(m.trans[i][k])
-            else
-                comptime_dfa.DEAD;
+    for (0..T.NumStates) |i| {
+        t.accepting[i] = m.accepting[i];
+        for (0..T.Stride) |k| {
+            t.transitions[i][k] = if (k < m.n_classes) @intCast(m.trans[i][k]) else comptime_dfa.DEAD;
         }
     }
     t.start_bytes = m.start_bytes;
@@ -125,12 +104,7 @@ fn compressTo(comptime T: type, comptime m: full_dfa.Dfa256) T {
     // `full_dfa.runFromSpin` has — closing the comptime-vs-runtime DFA gap.
     t.has_spin = m.has_spin and !SPIN_FORCE_OFF;
     t.stay_sets = m.stay_sets;
-    {
-        var s: usize = 0;
-        while (s < T.NumStates) : (s += 1) {
-            t.stay_idx[s] = if (s < m.n_states) m.stay_idx[s] else comptime_dfa.SPIN_NONE;
-        }
-    }
+    for (0..T.NumStates) |s| t.stay_idx[s] = m.stay_idx[s];
     return t;
 }
 
@@ -173,8 +147,8 @@ const MAX_DFA: usize = 256;
 // whose FIRST-set excludes that byte (and which is non-nullable) cannot begin a
 // match there. We bake a `[256]` candidate-mask table from each branch's
 // FIRST-set (`properties.firstBytes` — the SAME sound over-approximation the
-// prefilter paths use) and thread it into the backtracker; see
-// `backtrack.AltDispatch`. This is also the charclass codegen (Task B) of each
+// prefilter paths use) and hand it to the compiled backtracker (`Opts.alt_table`
+// in `exec/compiled_bt.zig`). This is also the charclass codegen (Task B) of each
 // branch's leading byte: the per-branch leading classes are decomposed and
 // fused into one O(1) table lookup, replacing N per-branch `hasBit` probes.
 
@@ -197,12 +171,12 @@ const LINE_SCAN_ENABLED = true;
 
 /// Widest top-level alternation the dispatch handles (one `AltMask` bit per
 /// branch). Wider alternations fall back to the whole-root walk.
-const MAX_ALT_BRANCHES = @bitSizeOf(backtrack.AltMask);
+const MAX_ALT_BRANCHES = @bitSizeOf(compiled_bt.AltMask);
 
 const AltInfo = struct {
     n: usize, // dispatched branch count (0 ⇒ no dispatch)
     branches: [MAX_ALT_BRANCHES]hir.NodeRef,
-    table: [256]backtrack.AltMask,
+    table: [256]compiled_bt.AltMask,
 };
 
 /// Flatten a left-leaning `.alt` chain (`alt(alt(b0,b1),b2)` → `[b0,b1,b2]`) in
@@ -232,7 +206,7 @@ fn flattenAlt(comptime cap: ?usize, h: *const hir.Hir(cap), ref: hir.NodeRef, ou
 /// match `m(root)` would.
 fn altDispatchInfo(comptime cap: ?usize, h: *const hir.Hir(cap)) AltInfo {
     @setEvalBranchQuota(1_000_000); // 256 bytes × up to 64 branches of table fill
-    var info: AltInfo = .{ .n = 0, .branches = undefined, .table = [_]backtrack.AltMask{0} ** 256 };
+    var info: AltInfo = .{ .n = 0, .branches = undefined, .table = [_]compiled_bt.AltMask{0} ** 256 };
     if (h.root == hir.none or h.node(h.root).tag != .alt) return info;
     var n: usize = 0;
     flattenAlt(cap, h, h.root, &info.branches, &n);
@@ -240,7 +214,7 @@ fn altDispatchInfo(comptime cap: ?usize, h: *const hir.Hir(cap)) AltInfo {
     for (0..n) |i| {
         var bm = [_]u8{0} ** 32;
         const fr = properties.firstBytes(cap, h, info.branches[i], &bm);
-        const bit = @as(backtrack.AltMask, 1) << @intCast(i);
+        const bit = @as(compiled_bt.AltMask, 1) << @intCast(i);
         if (!fr.ok or fr.nullable) {
             for (0..256) |b| info.table[b] |= bit;
         } else {
@@ -251,6 +225,51 @@ fn altDispatchInfo(comptime cap: ?usize, h: *const hir.Hir(cap)) AltInfo {
     }
     info.n = n;
     return info;
+}
+
+/// The comptime backtracking engine over a baked HIR: the HIR compiled to a
+/// specialized matcher (`compiled_bt.Compiled`) plus the first-byte
+/// alternation dispatch (`AltInfo`). One `runFrom` for every comptime call site
+/// (the `.backtrack` arm's scan and `CaptureSupport`'s slot fills). `captures`
+/// selects the slot-filling instantiation; the whole-match scan passes `false`
+/// (slots are then written only for a backreference).
+fn BtEngine(comptime NN: usize, comptime baked: hir.Hir(NN), comptime NG: usize, comptime captures: bool) type {
+    const alt_info = if (ALT_DISPATCH_ENABLED) altDispatchInfo(NN, &baked) else AltInfo{ .n = 0, .branches = undefined, .table = [_]compiled_bt.AltMask{0} ** 256 };
+    const alt_branches: [alt_info.n]hir.NodeRef = blk: {
+        var a: [alt_info.n]hir.NodeRef = undefined;
+        for (0..alt_info.n) |i| a[i] = alt_info.branches[i];
+        break :blk a;
+    };
+    const Matcher = compiled_bt.Compiled(NN, baked, .{
+        .n_groups = NG,
+        .captures = captures,
+        .alt_branches = &alt_branches,
+        .alt_table = alt_info.table,
+    });
+    return struct {
+        /// Dispatched top-level branch count (>0 ⇒ dispatch engaged).
+        pub const alt_branch_count: usize = alt_info.n;
+
+        /// Line-start enumeration config for a `(?m)^…` scan (`first` is the
+        /// optional one-byte line filter).
+        pub const Line = struct { first: ?[32]u8 };
+
+        /// Leftmost match at/after absolute `from` over the full input.
+        pub fn runFrom(
+            input: []const u8,
+            from: usize,
+            slots: []hir.Slot,
+            seek: ?*const seek_mod.Seek,
+            line: ?Line,
+        ) compiled_bt.Error!?search.Span {
+            var m = Matcher.init(seek);
+            if (line) |l| {
+                m.line_anchor = true;
+                m.line_first = l.first;
+            }
+            return m.runFrom(input, from, slots);
+        }
+    };
 }
 
 // Task B (per-set single-byte charclass codegen — inline range compares instead
@@ -326,15 +345,16 @@ const Built = struct {
     rev_dfa: full_dfa.Dfa256 = undefined,
     rev_ok: bool = false,
     /// `.line_dfa` arm: `dfa` holds the looks-stripped body DFA of a
-    /// `(?m)^body$` / `(?m)^body` line validator. `line_has_dollar` ⇒ verify the
-    /// body end lands on the line terminator; `line_first` is the body's
-    /// non-nullable leading-byte set (per-line reject filter), `null` if none.
-    line_has_dollar: bool = false,
+    /// `(?m)^body$` / `(?m)^body` line validator — forward, or REVERSE for
+    /// `line_mode == .whole_line` (see `exec/line_dfa.zig`); `line_first` is
+    /// the body's non-nullable leading-byte set (per-line reject filter), `null`
+    /// if none.
+    line_mode: line_dfa.Mode = .prefix,
     line_first: ?[32]u8 = null,
     /// `.backtrack` arm: the pattern is leading-line-anchored (`(?m)^…`, i.e.
     /// `props.bounds.start == .line`) but did NOT qualify for the regular
-    /// `.line_dfa` fast path (e.g. its body can match `\n`, or an alt+`$`
-    /// priority-cut), so the backtracker enumerates line starts (using
+    /// `.line_dfa` fast path (e.g. its body can match `\n`, or has a look
+    /// other than the line anchors), so the backtracker enumerates line starts (using
     /// `line_first` as the per-line reject filter) instead of scanning every byte.
     line_anchor: bool = false,
     /// `.rev_end` arm: `dfa` holds the REVERSE body DFA (`full_dfa.computeReverse`)
@@ -355,8 +375,6 @@ const Built = struct {
 /// `thompson.build`/`full_dfa.compute` the regular arm uses, so it bakes a
 /// `Dfa256` value at comptime — the heap-free analogue of runtime
 /// `seek.build`'s Dfa256 path (same guard set):
-///   * `lazy && anchored_end` — the over-approx inherits the lazy-vs-`$`
-///     accept-cut flaw ⇒ `locate` could skip past the true start (unsound);
 ///   * anchored — nothing to skip to;
 ///   * nullable approximation (start state accepts) — matches everywhere ⇒
 ///     can never skip;
@@ -382,7 +400,6 @@ fn containsBackref(comptime cap: ?usize, h: *const hir.Hir(cap), ref: hir.NodeRe
 
 fn overApproxDfa(h: *const hir.Hir(HIR_CAP)) ?full_dfa.Dfa256 {
     @setEvalBranchQuota(8_000_000); // deep alternations recurse clone/build
-    if (h.saw_lazy and h.anchored_end) return null;
     // `$`-anchored + backref: the forward a_end locate would skip past real
     // match starts (see `containsBackref`). No sound forward seek exists for
     // this shape; the comptime tree backtracker scans from 0 (correct, budget-
@@ -425,11 +442,12 @@ fn lineDfaDfa(h: *const hir.Hir(HIR_CAP)) ?full_dfa.Dfa256 {
     return od;
 }
 
-/// REVERSE body DFA for a `properties.revEndAnchored` pattern (comptime peer of
-/// runtime `regex.buildRevEndDfa`): clone the HIR relaxing every look to `ε`
-/// (strips the trailing `$`/`\Z`), Thompson-build, and `computeReverse`. `null`
-/// on any build/ceiling failure (or a reverse explosion) ⇒ caller keeps the
-/// backtracker. Mirror of `lineDfaDfa`, reversed for the end anchor.
+/// REVERSE body DFA for a `properties.revEndAnchored` pattern or a `whole_line`
+/// line shape (comptime peer of runtime `regex.buildRevEndDfa`): clone the HIR
+/// relaxing every look to `ε` (strips the `^`/`$`/`\Z` anchors), Thompson-build,
+/// and `computeReverse` (no priority cut). `null` on any build/ceiling failure
+/// (or a reverse explosion) ⇒ caller keeps the backtracker. Mirror of
+/// `lineDfaDfa`, reversed.
 fn revEndDfa(h: *const hir.Hir(HIR_CAP)) ?full_dfa.Dfa256 {
     @setEvalBranchQuota(8_000_000);
     var oh = hir.Hir(HIR_CAP).initComptime();
@@ -448,59 +466,6 @@ fn revEndDfa(h: *const hir.Hir(HIR_CAP)) ?full_dfa.Dfa256 {
 fn lbSet(comptime cap: ?usize, h: *const hir.Hir(cap)) ?class_span.Ranges {
     const bm = seq_extract.requiredLeadingLookbehindSet(cap, h) orelse return null;
     return class_span.Ranges.fromBitmap(bm);
-}
-
-/// Max delegated islands baked per comptime `.backtrack` pattern (mirrors
-/// `delegate.MAX_ISLANDS`; surplus islands just stay on the tree-walk path).
-const MAX_DELEGATE: usize = 32;
-
-/// Result of the comptime delegate scan: `n` regular-island anchored DFAs
-/// (`dfas[0..n]`) rooted at HIR refs `refs[0..n]`. Baked as a `Pattern`-struct
-/// const so each `&dfas[i]` is a stable `.rodata` pointer the baked
-/// `delegate.Plan` can hold (mirroring the runtime heap `Plan`, but value-baked).
-const DelegateBake = struct {
-    refs: [MAX_DELEGATE]hir.NodeRef = [_]hir.NodeRef{hir.none} ** MAX_DELEGATE,
-    dfas: [MAX_DELEGATE]full_dfa.Dfa256 = undefined,
-    n: usize = 0,
-};
-
-/// Comptime analogue of `delegate.build`: find concat-internal regular islands
-/// (the `.a` spine child that is a delegatable, unbounded-repetition,
-/// ≥1-min-length subtree) and compile each to an anchored `Dfa256` with the
-/// SAME zero-allocator `thompson.build`/`full_dfa.compute` the regular arm uses
-/// — so the island DFAs bake into `.rodata` (no heap `Plan`). The classifier
-/// (`delegate.delegatable`/`hasUnboundedRep`/`minLen`) is shared verbatim with
-/// the runtime, so the soundness argument (greedy/no-alt/no-cap island ⇒ its
-/// unique greedy-maximal parse == the DFA's leftmost-longest end == the
-/// tree-walker's first attempt) holds identically. Island refs are in the baked
-/// HIR's numbering (the bake copies nodes 1:1), so the backtracker's
-/// `dfaFor(nd.a)` lookup matches. `n == 0` ⇒ no delegation, pure tree-walk.
-fn delegateIslands(comptime cap: ?usize, h: *const hir.Hir(cap)) DelegateBake {
-    @setEvalBranchQuota(8_000_000); // deep alternations recurse the classifiers
-    var out = DelegateBake{};
-    if (h.root == hir.none) return out;
-    var ref: hir.NodeRef = 0;
-    const n_nodes: hir.NodeRef = @intCast(h.node_count);
-    while (ref < n_nodes and out.n < MAX_DELEGATE) : (ref += 1) {
-        const nd = h.node(ref);
-        if (nd.tag != .concat) continue;
-        if (!delegate.delegatable(cap, h, nd.a)) continue;
-        if (delegate.minLen(cap, h, nd.a) < 1) continue; // nullable ⇒ no work saved
-        if (!delegate.hasUnboundedRep(cap, h, nd.a)) continue; // fixed run ⇒ not worth a DFA
-        // Extract the island into its own anchored DFA (faithful clone — the
-        // island is already regular, so relax=false). Build into a same-cap
-        // comptime store with the zero-allocator pipeline; `oh` only needs to
-        // hold the island, but sizing it at `HIR_CAP` keeps the type uniform.
-        var oh = hir.Hir(HIR_CAP).initComptime();
-        oh.root = hir.cloneSubtree(HIR_CAP, cap, &oh, undefined, h, nd.a, false) catch continue;
-        var onfa = thompson.build(HIR_CAP, &oh) catch continue;
-        const d = full_dfa.compute(HIR_CAP, &onfa, true, false); // anchored start
-        if (d.outcome != .ok) continue;
-        out.refs[out.n] = nd.a;
-        out.dfas[out.n] = d;
-        out.n += 1;
-    }
-    return out;
 }
 
 /// Run the whole pipeline at comptime: parse -> Hir -> Thompson NFA ->
@@ -557,13 +522,15 @@ fn tryBoundaryLitsBuilt(h: *hir.Hir(HIR_CAP), ng: usize, gnames: GroupNames) ?Bu
 
 /// `.line_dfa`: `(?m)^body$` / `(?m)^body` with a regular `\n`-free body matches
 /// each line with ONE looks-stripped DFA pass (comptime peer of the runtime
-/// `.bt_look` line-DFA). Captures are fine — the DFA locates the span. No `ng`
-/// gate (checked before the backtracker fallback so the `^`/`$` looks don't
-/// route there via `has_look`).
+/// `.bt_look` line-DFA): the forward body DFA, or for an alternation/lazy body
+/// with `$` the reverse body DFA as a whole-line membership test. Captures are
+/// fine — the DFA locates the span. No `ng` gate (checked before the
+/// backtracker fallback so the `^`/`$` looks don't route there via `has_look`).
 fn tryLineDfaBuilt(h: *hir.Hir(HIR_CAP), props: properties.Properties, ng: usize, gnames: GroupNames) ?Built {
     if (properties.lineAnchoredRegular(HIR_CAP, h)) |shape| {
-        if (lineDfaDfa(h)) |d| {
-            return .{ .dfa = d, .outcome = .ok, .strat = .line_dfa, .hir = h.*, .n_groups = ng, .gnames = gnames, .line_has_dollar = shape.has_dollar, .line_first = props.line_first };
+        const mode = line_dfa.Mode.of(shape);
+        if (if (mode == .whole_line) revEndDfa(h) else lineDfaDfa(h)) |d| {
+            return .{ .dfa = d, .outcome = .ok, .strat = .line_dfa, .hir = h.*, .n_groups = ng, .gnames = gnames, .line_mode = mode, .line_first = props.line_first };
         }
     }
     return null;
@@ -690,8 +657,9 @@ fn buildAll(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) 
     };
     // Route to the comptime tree backtracker BEFORE `thompson.build`. This
     // covers two groups the DFA path cannot represent:
-    //   * `requires_backtracking` — backref / lookaround / atomic / possessive /
-    //     `lazy && anchored_end` (mirrors the runtime `regex.zig` dispatch).
+    //   * `requires_backtracking` — backref / lookaround / atomic / possessive
+    //     (mirrors the runtime `regex.zig` dispatch). Lazy + `$` is regular
+    //     and stays on the no-cut end-anchored DFA.
     //   * `has_look` — `\b \B`, `(?m)^ $`, `\A \z \Z`: conditional-epsilon
     //     look-assertions the DFA can't fold. The runtime sends these to a
     //     SEPARATE `.bt_look` engine (NFA + visited bitset); the comptime path
@@ -903,7 +871,6 @@ fn CaptureSupport(comptime built: Built) type {
         for (src_h.set_count..NN) |s| t.sets[s] = [_]u8{0} ** 32;
         break :blk t;
     };
-    const BT = backtrack.BacktrackerG(NN);
 
     // ── One-pass capture fast path (mirrors the runtime `op_onepass`) ──
     // For a REGULAR capture pattern that is "one-pass" (deterministic ε-closure,
@@ -992,28 +959,15 @@ fn CaptureSupport(comptime built: Built) type {
             return if (cap_seek) |*sv| sv else null;
         }
 
-        // First-byte alternation dispatch on the CAPTURE path — the same baked
-        // table the whole-match `.backtrack` arm uses (baked here independently,
-        // like `cap_seek` parallels the arm's `bt_seek`; the two structs can't
-        // share a const). Lets a non-regular *alt-with-captures* pattern's
-        // slot-fill walk prune branches per start byte too. `null` (non-alt root
-        // or disabled) keeps the whole-root walk. The one-pass / line-DFA /
-        // reverse capture paths anchor the backtracker at a known start (not an
-        // alt root), so in practice this only engages the general scanning
-        // fallback — exactly where it helps; threading it everywhere is
-        // correctness-neutral (dispatch is leftmost-first-preserving and the
-        // same `m`/`cap` machinery fills slots).
-        const cap_alt_info = if (ALT_DISPATCH_ENABLED) altDispatchInfo(NN, &baked) else AltInfo{ .n = 0, .branches = undefined, .table = [_]backtrack.AltMask{0} ** 256 };
-        const cap_alt_branches: [cap_alt_info.n]hir.NodeRef = blk: {
-            var a: [cap_alt_info.n]hir.NodeRef = undefined;
-            for (0..cap_alt_info.n) |i| a[i] = cap_alt_info.branches[i];
-            break :blk a;
-        };
-        const cap_alt_table: [256]backtrack.AltMask = cap_alt_info.table;
-        const cap_alt_disp: backtrack.AltDispatch = .{ .branches = &cap_alt_branches, .table = &cap_alt_table };
-        inline fn capAltDispPtr() ?*const backtrack.AltDispatch {
-            return if (cap_alt_info.n > 0) &cap_alt_disp else null;
-        }
+        // The slot-filling backtracker (compiled or interpreted, see
+        // `BtEngine`). It carries the same first-byte alternation dispatch the
+        // whole-match `.backtrack` arm uses, so a non-regular *alt-with-captures*
+        // pattern's slot-fill walk prunes branches per start byte too. The
+        // one-pass / line-DFA / reverse capture paths anchor it at a known start
+        // (not an alt root), so in practice dispatch only engages the general
+        // scanning fallback — exactly where it helps; it is correctness-neutral
+        // (dispatch is leftmost-first-preserving and fills the same slots).
+        const CapBt = BtEngine(NN, baked, NG, true);
 
         /// Materialize a `Caps` from filled `slots` (`slots[0..2]` = whole span).
         fn slotsToCaps(input: []const u8, slots: []const hir.Slot) Caps {
@@ -1052,12 +1006,18 @@ fn CaptureSupport(comptime built: Built) type {
                 // Locate the whole-match span with the line-DFA (skips non-
                 // matching lines at DFA speed), then fill group slots with the
                 // capture backtracker anchored at that line start — it matches
-                // immediately there, so the cost is one tree-walk per match, not
+                // immediately there, so the cost is one backtracking pass per match, not
                 // a per-position scan. Mirrors the runtime line-DFA capture path.
-                const sp = line_dfa.nextFrom(&line_body, built.line_has_dollar, if (line_first_const) |*fs| fs else null, input, from) orelse return null;
-                var bt = BT.init(&cap_h, cap_h.anchored_start, cap_h.anchored_end, NG, null, null);
-                bt.alt_disp = capAltDispPtr();
-                _ = (bt.runFrom(input, sp.start, slots[0..nslots]) catch return null) orelse return null;
+                const sp = line_dfa.nextFrom(&line_body, built.line_mode, if (line_first_const) |*fs| fs else null, input, from) orelse return null;
+                // The backtracker is leftmost-first from `sp.start` and the
+                // line anchors pin the end, so it must reproduce the DFA's span
+                // exactly. Anything else means the engines disagree, or the
+                // step budget tripped there and the scan rolled on to a LATER
+                // line — its slots would not lie inside `sp`. Report no match
+                // rather than mis-attributed groups (the runtime peer
+                // `spanSlots` returns `RegexError.Internal` here).
+                const got = (CapBt.runFrom(input, sp.start, slots[0..nslots], null, null) catch return null) orelse return null;
+                if (got.start != sp.start or got.end != sp.end) return null;
                 slots[0] = @intCast(sp.start);
                 slots[1] = @intCast(sp.end);
                 return slotsToCaps(input, slots[0..nslots]);
@@ -1079,9 +1039,9 @@ fn CaptureSupport(comptime built: Built) type {
                     if (onepass.fillWith(NN, &nfa, &op_idx, input, span, slots[0..nslots]))
                         return slotsToCaps(input, slots[0..nslots]);
                 }
-                var bt = BT.init(&cap_h, cap_h.anchored_start, cap_h.anchored_end, NG, null, null);
-                bt.alt_disp = capAltDispPtr();
-                _ = (bt.runFrom(input, span.start, slots[0..nslots]) catch return null) orelse return null;
+                // Same span agreement check as the line-DFA path above.
+                const got = (CapBt.runFrom(input, span.start, slots[0..nslots], null, null) catch return null) orelse return null;
+                if (got.start != span.start or got.end != span.end) return null;
                 slots[0] = @intCast(span.start);
                 slots[1] = @intCast(span.end);
                 return slotsToCaps(input, slots[0..nslots]);
@@ -1098,14 +1058,12 @@ fn CaptureSupport(comptime built: Built) type {
                 // mis-gated (should not happen for op_ok); fall through to bt.
             }
             // NOTE: this capture fallback intentionally does NOT enable the
-            // line-start enumeration (`bt.line_anchor`) the whole-match
+            // line-start enumeration (`line_anchor`) the whole-match
             // `nextSpanFrom` uses — a capturing `(?m)^(…)$` backtrack pattern
             // fills slots via the per-position scan here (correct, just not
             // line-accelerated). Captures on such a shape are rare and the
             // whole-match find/count path (the benchmarked one) is accelerated.
-            var bt = BT.init(&cap_h, cap_h.anchored_start, cap_h.anchored_end, NG, capSeekPtr(), null);
-            bt.alt_disp = capAltDispPtr();
-            const sp = (bt.runFrom(input, from, slots[0..nslots]) catch return null) orelse return null;
+            const sp = (CapBt.runFrom(input, from, slots[0..nslots], capSeekPtr(), null) catch return null) orelse return null;
             slots[0] = @intCast(sp.start);
             slots[1] = @intCast(sp.end);
             return slotsToCaps(input, slots[0..nslots]);
@@ -1194,12 +1152,13 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
     }
 
     // Non-regular tier: backref / lookaround / atomic / possessive / `lazy$`
-    // run on the comptime-baked tree backtracker — no DFA table (`has_dfa =
-    // false`). Handled before the DFA-state-budget logic below: the empty
-    // placeholder `built.dfa` would otherwise look "small enough" and divert
-    // into the `use_dfa` arm. The HIR is trimmed to its exact node count here
-    // (mirroring how the DFA arm sizes `Dfa(ns,nk)`) so a tiny pattern bakes a
-    // tiny `.rodata` table rather than the 2048-slot `HIR_CAP` store.
+    // run on the comptime backtracker — the HIR compiled to code
+    // (`exec/compiled_bt.zig`), no DFA table (`has_dfa = false`). Handled
+    // before the DFA-state-budget logic below: the empty placeholder
+    // `built.dfa` would otherwise look "small enough" and divert into the
+    // `use_dfa` arm. The HIR is trimmed to its exact node count here so code
+    // generation works on the minimal comptime value; the HIR itself is not
+    // baked into `.rodata` (only wide classes' 32-byte bitmaps are).
     if (built.strat == .backtrack) {
         const src_h = built.hir;
         const NN = src_h.node_count;
@@ -1215,50 +1174,35 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             t.saw_lazy = src_h.saw_lazy;
             for (0..NN) |i| t.nodes[i] = src_h.nodes[i];
             for (0..src_h.set_count) |s| t.sets[s] = src_h.sets[s];
-            // Pad unused set slots so the baked `.rodata` is fully defined
+            // Pad unused set slots so the comptime value is fully defined
             // (#sets ≤ #nodes, so `[set_count..NN]` is the padding range).
             for (src_h.set_count..NN) |s| t.sets[s] = [_]u8{0} ** 32;
             break :blk t;
         };
-        const BT = backtrack.BacktrackerG(NN);
         return struct {
             pub const has_dfa = false;
-            /// Step-2 trim proof: the baked HIR's exact node count, NOT the
-            /// `HIR_CAP` = 2048 build ceiling. A tiny non-regular pattern bakes a
-            /// tiny `.rodata` table (`@sizeOf(Hir(bt_node_count))`), not ~98 KB.
+            /// The trimmed HIR's exact node count (NOT the `HIR_CAP` = 2048
+            /// build ceiling) — the size of what the code generator compiles.
             pub const bt_node_count = NN;
-            const h = baked;
             const n_groups = NG;
             const gnames = built.gnames;
             const a_start = baked.anchored_start;
-            const a_end = baked.anchored_end;
 
-            // First-byte alternation dispatch (Tasks A+B), baked into `.rodata`
-            // and threaded into the backtracker (`bt.alt_disp`). For a top-level
-            // `.alt` root the per-position scan tries only the candidate branches
-            // for `input[start]` instead of walking all N in source order. The
-            // branch list and `[256]` mask table are comptime consts; `null`
-            // (non-alt root or disabled) keeps the whole-root walk. `alt_branch_count`
-            // (>0 ⇒ dispatch engaged) is the differential-test engagement proof,
-            // analogous to `bt_node_count` / `ac_node_count`.
-            const alt_info = if (ALT_DISPATCH_ENABLED) altDispatchInfo(NN, &baked) else AltInfo{ .n = 0, .branches = undefined, .table = [_]backtrack.AltMask{0} ** 256 };
-            const alt_branches: [alt_info.n]hir.NodeRef = blk: {
-                var a: [alt_info.n]hir.NodeRef = undefined;
-                for (0..alt_info.n) |i| a[i] = alt_info.branches[i];
-                break :blk a;
-            };
-            const alt_table: [256]backtrack.AltMask = alt_info.table;
-            const alt_disp_val: backtrack.AltDispatch = .{ .branches = &alt_branches, .table = &alt_table };
-            pub const alt_branch_count: usize = alt_info.n;
-            inline fn altDispPtr() ?*const backtrack.AltDispatch {
-                return if (alt_info.n > 0) &alt_disp_val else null;
-            }
+            // The whole-match backtracker (compiled or interpreted, see
+            // `BtEngine`) with the first-byte alternation dispatch (Tasks A+B):
+            // for a top-level `.alt` root the per-position scan tries only the
+            // candidate branches for `input[start]` instead of walking all N in
+            // source order. `alt_branch_count` (>0 ⇒ dispatch engaged) is the
+            // differential-test engagement proof, analogous to `bt_node_count` /
+            // `ac_node_count`.
+            const Bt = BtEngine(NN, baked, NG, false);
+            pub const alt_branch_count: usize = Bt.alt_branch_count;
             /// Engagement proof for the line-start enumeration (Fix 3): true ⇒
             /// this `(?m)^…` backtrack pattern enumerates line starts instead of
             /// scanning every byte. Differential tests assert this.
             pub const line_anchor_scan: bool = LINE_SCAN_ENABLED and built.line_anchor;
             /// Comptime "seek" prefilter, baked from the HIR and threaded INTO
-            /// the backtracker (`BT.init`'s `seek` arg) so `run`'s own scan loop
+            /// the backtracker (`Bt.runFrom`'s `seek` arg) so its own scan loop
             /// applies it at *every* step — skipping interior dead regions, not
             /// just the leading prefix (the interior skip is what `count`/
             /// `findAll` need; skip-once-then-scan would leave the per-byte crawl
@@ -1315,66 +1259,12 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
                 return if (bt_seek) |*sv| sv else null;
             }
 
-            /// Comptime-baked concat-internal regular-island DELEGATION plan,
-            /// threaded into the backtracker (`BT.init`'s `del` arg). For each
-            /// island (a greedy/no-alt/no-cap regular prefix of a `concat`, e.g.
-            /// the `[A-Za-z0-9_]+` in `(?>…)@` after the cut is dropped, or a
-            /// `\p{L}+` run in the tokenizer), `run` matches it at DFA speed via
-            /// `core.matchEndFrom` instead of one CPS frame per byte, then
-            /// continues the tree-walk from the island's greedy-maximal end.
-            /// This is the comptime analogue of runtime `delegate.build`; the
-            /// island DFAs are baked into `.rodata` (no heap `Plan`).
-            ///
-            /// `del_bake` (the `Dfa256` islands) is read **only at comptime** to
-            /// produce the COMPRESSED `del_cdfas`, so the 131 KB-each `Dfa256`s
-            /// never reach `.rodata`. The islands are baked into one homogeneous
-            /// `[MAX_DELEGATE]DelIslandT` array sized to the per-pattern max
-            /// dimensions (`del_dims`), so a single `delegate.Plan` / matcher
-            /// serves them all. `del_plan.dfas[i]` are type-erased `&del_cdfas[i]`
-            /// pointers (`.rodata` consts, read-only on the `matchEnd`/`runFrom`
-            /// path; this comptime `Plan` is never `deinit`'d). `n == 0` ⇒ no
-            /// delegation, plain walk.
-            const del_bake = delegateIslands(NN, &baked);
-            const del_dims = blk: {
-                var mns: usize = 1;
-                var mnk: usize = 1;
-                for (0..del_bake.n) |i| {
-                    mns = @max(mns, del_bake.dfas[i].n_states);
-                    mnk = @max(mnk, del_bake.dfas[i].n_classes);
-                }
-                break :blk .{ .ns = mns, .nk = mnk };
-            };
-            const DelIslandT = comptime_dfa.Dfa(del_dims.ns, del_dims.nk);
-            const del_cdfas: [MAX_DELEGATE]DelIslandT = blk: {
-                var arr: [MAX_DELEGATE]DelIslandT = undefined;
-                for (0..del_bake.n) |i| arr[i] = compressTo(DelIslandT, del_bake.dfas[i]);
-                break :blk arr;
-            };
-            const delIslandMatch = struct {
-                fn f(p: *const anyopaque, input: []const u8, pos: usize) ?usize {
-                    const d: *const DelIslandT = @ptrCast(@alignCast(p));
-                    return d.runFrom(input, pos);
-                }
-            }.f;
-            const del_plan: delegate.Plan = blk: {
-                var p = delegate.Plan{ .allocator = placeholder_allocator, .n = del_bake.n };
-                for (0..del_bake.n) |i| {
-                    p.refs[i] = del_bake.refs[i];
-                    p.dfas[i] = &del_cdfas[i];
-                    p.match_fns[i] = delIslandMatch;
-                }
-                break :blk p;
-            };
-            inline fn delPtr() ?*const delegate.Plan {
-                return if (del_bake.n > 0) &del_plan else null;
-            }
-
-            /// Next leftmost span at/after absolute `from`. Runs the tree
-            /// backtracker over the FULL `input` from absolute `from`
-            /// (`runFrom`, NOT a `input[from..]` slice) so look-assertions
-            /// (`\b`, `(?m)^ $`, `\A \z \Z`) see the true preceding/following
-            /// bytes — slicing would make `from` look like start-of-text and
-            /// mis-fire `start_line`/`\b` on resumed iterations. Span is already
+            /// Next leftmost span at/after absolute `from`. Runs the backtracker
+            /// over the FULL `input` from absolute `from` (`runFrom`, NOT a
+            /// `input[from..]` slice) so look-assertions (`\b`, `(?m)^ $`,
+            /// `\A \z \Z`) see the true preceding/following bytes — slicing
+            /// would make `from` look like start-of-text and mis-fire
+            /// `start_line`/`\b` on resumed iterations. Span is already
             /// absolute. A budget exceed degrades to "no match" (this no-error
             /// API can't surface it); the runtime maps the same bound to
             /// `MatchBudgetExceeded`. Pick inputs well under the O(n) budget for
@@ -1384,14 +1274,9 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
                 // resume point once and re-anchor there (`^(?!x)` on "ab"
                 // counted 3) — mirrors the runtime `nextSpanFrom` guard.
                 if (a_start and from > 0) return null;
-                var bt = BT.init(&h, a_start, a_end, n_groups, seekPtr(), delPtr());
-                bt.alt_disp = altDispPtr();
-                if (LINE_SCAN_ENABLED and built.line_anchor) {
-                    bt.line_anchor = true;
-                    bt.line_first = built.line_first;
-                }
+                const line: ?Bt.Line = if (LINE_SCAN_ENABLED and built.line_anchor) .{ .first = built.line_first } else null;
                 var slots: [2 * (hir.MAX_GROUPS + 1)]hir.Slot = undefined;
-                const sp = (bt.runFrom(input, from, slots[0 .. 2 * (n_groups + 1)]) catch return null) orelse return null;
+                const sp = (Bt.runFrom(input, from, slots[0 .. 2 * (n_groups + 1)], seekPtr(), line) catch return null) orelse return null;
                 return .{ .start = sp.start, .end = sp.end };
             }
 
@@ -1589,15 +1474,15 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
     // shared `line_dfa.nextFrom` — one DFA pass per line, no tree backtracker.
     if (built.strat == .line_dfa) {
         const body_dfa = compress(built.dfa);
-        const has_dollar = built.line_has_dollar;
+        const mode = built.line_mode;
         const first_const: ?[32]u8 = built.line_first;
         return struct {
             pub const has_dfa = true;
             pub fn nextSpanFrom(input: []const u8, from: usize) ?search.Span {
-                return line_dfa.nextFrom(&body_dfa, has_dollar, if (first_const) |*fs| fs else null, input, from);
+                return line_dfa.nextFrom(&body_dfa, mode, if (first_const) |*fs| fs else null, input, from);
             }
             pub fn isMatch(input: []const u8) bool {
-                return line_dfa.nextFrom(&body_dfa, has_dollar, if (first_const) |*fs| fs else null, input, 0) != null;
+                return line_dfa.nextFrom(&body_dfa, mode, if (first_const) |*fs| fs else null, input, 0) != null;
             }
             pub const find = V.find;
             pub const count = V.count;
@@ -1722,7 +1607,7 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
     if (use_dfa) {
         // Bake the minimized DFA into its compact `comptime_dfa.Dfa(ns,nk)`
         // `.rodata` table via the shared `compress` (the same field mapping the
-        // seek / delegate / edge-look prefilters use), so the necessary-condition
+        // seek / edge-look / capture prefilters use), so the necessary-condition
         // prefilters (`required`/`req_lit`) and start-byte filter ride along and
         // the comptime walk consults them just like the runtime `Dfa256`.
         // When `rev_ok` (unanchored `$`-anchored class) the forward table is

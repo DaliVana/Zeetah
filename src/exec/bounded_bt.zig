@@ -24,6 +24,7 @@ const thompson = @import("../thompson.zig");
 const hir = @import("../hir.zig");
 const cc = @import("charclass.zig");
 const search = @import("search.zig");
+const line_dfa = @import("line_dfa.zig");
 const EdgeIndex = @import("nfa_index.zig").EdgeIndex;
 
 const MAX_NFA = thompson.MAX_NFA;
@@ -347,33 +348,22 @@ pub const BoundedBt = struct {
     }
 
     /// Leftmost match at/after absolute `from`, trying ONLY line-start
-    /// positions (`from` itself iff it is a line start, then every byte after a
-    /// `\n`). Sound only when every match must begin at a line start — i.e. the
-    /// pattern is unconditionally prefixed by a multiline `^` (`start_line`),
-    /// which `properties.analyzeBoundaries` proves (`bounds.start == .line`).
-    /// Absolute coordinates; line starts ascend, so the first hit is leftmost.
+    /// positions (the shared `line_dfa.scanLineStarts` enumeration with
+    /// `matchAt` as the per-line attempt). Sound only when every match must
+    /// begin at a line start — i.e. the pattern is unconditionally prefixed by
+    /// a multiline `^` (`start_line`), which `properties.analyzeBoundaries`
+    /// proves (`bounds.start == .line`). Absolute coordinates.
     pub fn findLineStart(self: *BoundedBt, input: []const u8, from: usize, first: ?*const [32]u8) std.mem.Allocator.Error!?Span {
-        var s = from;
-        // Advance `from` to the first line start at/after it.
-        if (!(s == 0 or (s <= input.len and s > 0 and input[s - 1] == '\n'))) {
-            const nl = std.mem.indexOfScalarPos(u8, input, s, '\n') orelse return null;
-            s = nl + 1;
-        }
-        while (s <= input.len) {
-            // First-byte reject: a non-nullable body can only begin on a member
-            // of `first`. `s == input.len` (trailing empty line) has no byte to
-            // test, so fall through to `matchAt`.
-            const skip = if (first) |set|
-                (s < input.len and !cc.hasBit(set, input[s]))
-            else
-                false;
-            if (!skip) {
-                if (try self.matchAt(input, s)) |e| return .{ .start = s, .end = e };
+        const Line = struct {
+            bt: *BoundedBt,
+            input: []const u8,
+
+            pub fn attempt(self_: @This(), s: usize, _: usize) std.mem.Allocator.Error!?Span {
+                if (try self_.bt.matchAt(self_.input, s)) |e| return .{ .start = s, .end = e };
+                return null;
             }
-            const nl = std.mem.indexOfScalarPos(u8, input, s, '\n') orelse return null;
-            s = nl + 1;
-        }
-        return null;
+        };
+        return line_dfa.scanLineStarts(input, from, first, Line{ .bt = self, .input = input });
     }
 
     pub fn isMatch(self: *BoundedBt, input: []const u8) std.mem.Allocator.Error!bool {
@@ -455,9 +445,9 @@ test "bounded_bt: findLineStart equals per-position scan (leading line anchor)" 
     // per-position findLeftmost.
     const pats = [_][]const u8{ "(?m)^[0-9]+", "(?m)^[0-9]{4}-[0-9]{2}", "(?m)^foo.*$" };
     const ins = [_][]const u8{
-        "",       "abc",        "123",          "\n123",
-        "x\n123", "ab\n2025-06\ncd", "no\nmatch\nhere", "123\n",
-        "\n\n42", "foo bar\nfoozz\n", "trailing\n", "foo",
+        "",       "abc",              "123",             "\n123",
+        "x\n123", "ab\n2025-06\ncd",  "no\nmatch\nhere", "123\n",
+        "\n\n42", "foo bar\nfoozz\n", "trailing\n",      "foo",
     };
     for (pats) |p| {
         var h = hir.Hir(null).initRuntime();

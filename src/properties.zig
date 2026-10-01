@@ -111,12 +111,13 @@ fn leadingLineAnchor(comptime cap: ?usize, h: *const hir.Hir(cap)) bool {
 /// Shape result for a line-anchored regular pattern (`(?m)^body$` or
 /// `(?m)^body`): the body is regular (no backref/lookaround/atomic), contains
 /// no other look than the leading `^`/optional trailing `$`, and matches no
-/// `\n`. Such a pattern is matched by a *single DFA per line* — enumerate line
-/// starts (`\n` memchr), run the looks-stripped body DFA from each, and (for
-/// `$`) accept when the longest body end lands on the line terminator. Because
-/// the body is `\n`-free, the determinized DFA's longest accept never crosses
-/// the line, so this is sound even with alternation (unlike `edge_look`).
-pub const LineShape = struct { has_dollar: bool };
+/// `\n`. Such a pattern is matched by a *single DFA pass per line* —
+/// enumerate line starts (`\n` memchr) and run the looks-stripped body DFA
+/// there (see `exec/line_dfa.zig`). `whole_line` (implies `has_dollar`): the
+/// body has an alternation or lazy quantifier, so the forward leftmost-first
+/// DFA can't decide `$`; the line is then tested for membership in L(body)
+/// with the body's reverse (no-cut) DFA.
+pub const LineShape = struct { has_dollar: bool, whole_line: bool = false };
 
 fn setHasNewline(comptime cap: ?usize, h: *const hir.Hir(cap), set_idx: u32) bool {
     const bm = h.setBitmap(set_idx);
@@ -182,16 +183,16 @@ pub fn lineAnchoredRegular(comptime cap: ?usize, h: *const hir.Hir(cap)) ?LineSh
         if (!(last.tag == .look and last.set_idx == @intFromEnum(hir.LookKind.end_line))) return null;
         has_dollar = true;
     }
-    // SOUNDNESS: the body DFA is the leftmost-first (priority-cut) DFA, so its
+    // The forward body DFA is the leftmost-first (priority-cut) DFA, so its
     // longest accept is the highest-priority match, NOT necessarily the longest
     // in the language. With `$`, an alternation/lazy body can have a shorter,
     // higher-priority accept that fails the line-end check while a longer one
-    // would pass (e.g. `(?m)^(?:a|aa)$` on "aa", or `(?m)^(?:\d{9}[\dXx]|\d{13})$`
-    // on a 13-digit line). Such bodies must stay on the backtracker. (Without
-    // `$` the priority-cut longest accept IS the leftmost-first result, so alt/
-    // lazy are fine there — this mirrors why `edge_look` rejects `.alt`.)
-    if (has_dollar and w.prio) return null;
-    return .{ .has_dollar = has_dollar };
+    // would pass (`(?m)^(?:a|aa)$` on "aa", `(?m)^(?:\d{9}[\dXx]|\d{13})$` on a
+    // 13-digit line). But with `^`, `$` and a `\n`-free body the only possible
+    // match on a line is the whole line, so such bodies are matched as
+    // `whole_line` membership instead. (Without `$` the priority-cut longest
+    // accept IS the leftmost-first result, so alt/lazy are fine there.)
+    return .{ .has_dollar = has_dollar, .whole_line = has_dollar and w.prio };
 }
 
 // --- Boundary anchors: the unified (start, end) anchor model -----------------
@@ -504,16 +505,19 @@ pub fn analyze(comptime cap: ?usize, h: *const hir.Hir(cap)) Properties {
         }
     }
 
-    // `saw_lazy && anchored_end` (`a*?$`) is regular but the DFA accept-cut
-    // can't model lazy-against-`$`, so route it to the tree backtracker too.
+    // `saw_lazy && anchored_end` (`a*?$`) is regular and takes the DFA path:
+    // the end-anchored DFAs carry no leftmost-first accept cut (`full_dfa.compute`
+    // / `lazy_dfa.anchoredEndFrom`), so the span is start-fixed and ends at the
+    // anchor regardless of greediness, and captures are reconstructed over that
+    // span by engines that honor laziness. The old "route it to the tree
+    // backtracker" rule (step-budgeted, O(n·budget)) is gone.
     // NOTE: `has_look` is deliberately NOT folded in here — the runtime keeps it
     // a separate flag so a look pattern routes to its `.bt_look` engine (NFA +
     // visited-bitset, with the line-anchor `\n`-memchr fast path), not the HIR
     // `.backtrack` tree-walker. The comptime `Pattern` (which has no `.bt_look`)
     // treats `has_look` as backtracking in `pattern.zig buildAll` instead, so
     // the change stays comptime-only and the runtime routing is untouched.
-    p.requires_backtracking = containsBacktrack(cap, h, h.root) or
-        (p.saw_lazy and p.anchored_end);
+    p.requires_backtracking = containsBacktrack(cap, h, h.root);
     p.needs_captures = containsCap(cap, h, h.root);
     p.has_look = containsLook(cap, h, h.root);
     // Unified anchor view: ONE recognizer for every (start, end) boundary. The

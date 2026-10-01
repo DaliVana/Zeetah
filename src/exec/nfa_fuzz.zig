@@ -95,6 +95,9 @@ pub const Shape = enum {
     /// Look-free random tree, then `$` — the unanchored end-anchored class
     /// the anti-ReDoS reroute sends to `dense_search`.
     end_anchored,
+    /// `^(?:…)$`, often a top-level alternation — both anchors fold into the
+    /// end-anchored eager DFA (`^(?:a|aa)$` on "aa" was once rejected there).
+    both_anchored,
     /// Random tree with lookaround / backreferences / atomic / possessive.
     nonregular,
     /// `(\bC+\b)S\1` — `dup_word`.
@@ -106,7 +109,7 @@ pub const Shape = enum {
     split_alt,
 };
 
-pub const regular_shapes = [_]Shape{ .random, .random, .random, .random, .literal_alt, .boundary_lits, .lit_prefix, .reverse_suffix, .class_span, .end_anchored };
+pub const regular_shapes = [_]Shape{ .random, .random, .random, .random, .literal_alt, .boundary_lits, .lit_prefix, .reverse_suffix, .class_span, .end_anchored, .both_anchored };
 pub const nonregular_shapes = [_]Shape{ .nonregular, .nonregular, .dup_word, .edge_look, .split_alt };
 
 pub fn pickShape(rng: *Rng, shapes: []const Shape) Shape {
@@ -283,6 +286,16 @@ pub fn generate(rng: *Rng, shape: Shape) Gen {
             g.looks_ok = false;
             g.node(3);
             g.put("$");
+        },
+        .both_anchored => {
+            g.looks_ok = false;
+            g.put("^(?:");
+            g.node(3);
+            if (rng.oneIn(2)) {
+                g.put("|");
+                g.node(3);
+            }
+            g.put(")$");
         },
         .nonregular => {
             if (rng.oneIn(5)) g.put("(?m)");
@@ -741,6 +754,20 @@ fn checkRegular(a: std.mem.Allocator, rng: *Rng, pat: []const u8, tally: *Tally,
             .lazy_look_checks = lazy_look_checks,
         };
         try checkOffsets(rng, size, in, &c);
+        // A `^…$` pattern only matches when the whole haystack is in its
+        // language, which a random input rarely is — so also try every
+        // substring as its own haystack. (`^(?:a|aa)$` rejecting "aa" in the
+        // end-anchored eager DFA hid here: every engine agreed on "no match".)
+        if (h.anchored_start and h.anchored_end and size == .short) {
+            for (0..in.len + 1) |i| for (i..in.len + 1) |j| {
+                const sub = in[i..j];
+                var sbt = try bounded_bt.BoundedBt.init(a, nfa, h.anchored_start, h.anchored_end, sub.len);
+                defer sbt.deinit();
+                var sc = c;
+                sc.bt = &sbt;
+                try sc.checkAt(sub, 0);
+            };
+        }
 
         if (lz) |*p| {
             const want0 = (try bt.findLeftmostFrom(in, 0)) != null;

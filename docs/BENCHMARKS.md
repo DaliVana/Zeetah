@@ -166,9 +166,11 @@ match maximally:
 
 Lazy quantifiers (`*?`, `+?`, `??`, `{m,n}?`) build a regular automaton like
 their greedy peers — laziness is just the ε-priority order the subset
-construction preserves. The single exception is **lazy combined with an
-end-anchor** (`a*?$`), which routes to the tree backtracker (still
-leftmost-first) and cannot be baked by the comptime `Pattern` path.
+construction preserves. That includes **lazy combined with an end-anchor**
+(`a*?$`): the end-anchored DFA drops its leftmost-first accept cut, so the
+span is start-fixed and ends at the anchor whatever the greediness (still
+leftmost-first), and the comptime `Pattern` path bakes it like any other
+regular shape.
 
 ---
 
@@ -204,7 +206,6 @@ the meta engine; this is a guide to expectations, not a contract.
 - **Backreferences** (`\1`, `\k<name>`): step-budgeted (runtime + comptime); the
   `dup_word` recognizer handles the adjacent-duplicate-word special case in a
   single linear scan instead.
-- **Lazy with an end-anchor** (`a*?$`): routes to the backtracker.
 
 These return `error.MatchBudgetExceeded` if they exceed the step/depth budget,
 so their worst case is a typed error, not a runaway.
