@@ -1,6 +1,6 @@
 //! Per-feature: zero-width assertions (Phase C) — `\b \B`, mid-pattern
-//! `^ $`, `(?m)` line anchors, mid `\A \z \Z`. These route to the bounded
-//! backtracker (the DFA does not fold look-assertions); the prescan
+//! `^ $`, `(?m)` line anchors, mid `\A \z \Z`. These run on the look-aware
+//! lazy DFA (`\Z`: the bounded backtracker / PikeVM); the prescan
 //! anchored-fast-path for a *leading* `^`/trailing `$` (no `(?m)`) is
 //! unchanged and covered by feat_anchors.zig.
 
@@ -253,4 +253,63 @@ fn refCount(lits: []const []const u8, s: []const u8) usize {
         } else p += 1;
     }
     return n;
+}
+
+// Runtime look engines vs the comptime `Pattern` (an independent
+// implementation — the HIR tree backtracker): every match span of the
+// non-overlapping iteration, the count, and the captures of the first match.
+// Pins (1) leftmost-FIRST alternation priority under look-assertions (the
+// runtime NFA engine used to take the longest branch: `\bfoo|foobar\b` on
+// "foobar" reported "foobar") and (2) absolute-coordinate resumption (a
+// look-behind at a resume position must see the real preceding byte: `\ba`
+// on "aaa" is ONE match, not three).
+fn lookAgree(comptime p: []const u8, in: []const u8, comptime ng: usize) !void {
+    const a = std.testing.allocator;
+    const P = regex.Pattern(p, .{});
+    var rx = try Regex.compile(a, p);
+    defer rx.deinit();
+    try std.testing.expectEqual(P.count(in), try rx.count(in));
+    const pa = try P.findAll(a, in);
+    defer a.free(pa);
+    const ra = try rx.findAll(a, in);
+    defer a.free(ra);
+    try std.testing.expectEqual(pa.len, ra.len);
+    for (pa, ra) |pm, rm| {
+        try std.testing.expectEqual(pm.start, rm.start);
+        try std.testing.expectEqual(pm.end, rm.end);
+    }
+    const pc = P.captures(in);
+    var rc = try rx.captures(a, in);
+    defer if (rc) |*x| x.deinit(a);
+    try std.testing.expectEqual(pc == null, rc == null);
+    if (pc) |caps| {
+        try std.testing.expectEqual(caps.get(0).?.start, rc.?.start);
+        try std.testing.expectEqual(caps.get(0).?.end, rc.?.end);
+        inline for (1..ng + 1) |g| {
+            const cg = caps.get(g);
+            const rg = rc.?.groups[g];
+            try std.testing.expectEqual(cg == null, rg == null);
+            if (cg) |c| {
+                try std.testing.expectEqual(c.start, rg.?.start);
+                try std.testing.expectEqual(c.end, rg.?.end);
+            }
+        }
+    }
+}
+
+test "boundary: look patterns are leftmost-first and resume in absolute coordinates" {
+    // leftmost-first alternation priority
+    try lookAgree("\\bfoo|foobar\\b", "foobar", 0);
+    try lookAgree("\\ba|ab\\b", "ab ab", 0);
+    try lookAgree("(\\bfoo)|(foobar\\b)", "foobar foo", 2);
+    try lookAgree("\\b(?:a|ab|abc)\\b", "abc ab a", 0);
+    try lookAgree("(?m)^(?:x|xy)$", "xy\nx\n", 0);
+    try lookAgree("\\b(a+?)(a*)\\b", "aaa", 2);
+    // absolute resumption: look-behind at the resume point
+    try lookAgree("\\ba", "aaa", 0);
+    try lookAgree("\\bab", "abab ab", 0);
+    try lookAgree("\\Ba", "aaa", 0);
+    try lookAgree("(?m)^a", "aaa\na", 0);
+    try lookAgree("\\b\\w+\\b", "one two  three", 0);
+    try lookAgree("(\\w+)\\b", "ab cd", 1);
 }

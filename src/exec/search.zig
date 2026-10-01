@@ -78,9 +78,24 @@ pub fn findViaReqLit(d: anytype, input: []const u8, rl: *const ReqLit) ?Span {
 /// Caller guarantees the pattern is not `^`-anchored (`runFrom` does not
 /// enforce `a_start`).
 pub fn litPrefixFind(d: anytype, t: *const pf.Teddy, input: []const u8) ?Span {
+    // Necessary-byte fast-negative, positional: `required` is a byte every
+    // match consumes, so a match starting at `h` has it at some position ≥ `h`.
+    // Once no occurrence remains at/after a prefix hit, no later hit can match
+    // either — stop instead of running `runFrom` at every remaining occurrence
+    // (O(occurrences × n) on `abc.*z` over "abc"×N with no `z` after). The next
+    // occurrence is found by a forward memchr cached across hits, so its cost
+    // is bounded by bytes a successful match would cover anyway. (The runtime
+    // additionally meters failed-candidate work and falls back to its
+    // single-pass engine — see `Regex.litPrefixMetered`; the comptime
+    // `.lit_prefix` arm relies on this guard alone.)
+    var next_req: ?usize = null;
     var from: usize = 0;
     while (from <= input.len) {
         const hit = t.find(input, from) orelse return null;
+        if (d.required) |r| {
+            if (next_req == null or next_req.? < hit.start)
+                next_req = std.mem.indexOfScalarPos(u8, input, hit.start, r) orelse return null;
+        }
         if (d.runFrom(input, hit.start)) |e| return .{ .start = hit.start, .end = e };
         from = hit.start + 1;
     }

@@ -134,7 +134,9 @@ Like `MatchIterator` but each yielded `Match` carries its capture `groups`
 ### `RegexError`
 
 The error set returned by compilation and matching. See
-[Error Handling](#error-handling) for the variants `compile` actually surfaces.
+[Error Handling](#error-handling) for the variants `compile` actually surfaces,
+the match-time `MatchBudgetExceeded`, and `Internal` (the engine's never-expected
+bug signal).
 
 ### `Pattern` / `PatternOptions`
 
@@ -958,6 +960,11 @@ names rather than fine-grained parser variants.
   tell "pattern too big to build" from "this haystack blew the budget".)
 - The bounded capture path is O(n·m) via a `(state, pos)` visited bitset —
   never exponential.
+- **`error.Internal`** is the engine's bug signal: an internal invariant was
+  violated (two engines disagreed about a match, or a pattern reached an engine
+  that cannot run it). It is never expected; if you see it, please report the
+  pattern and input. It exists so such a bug surfaces as a typed error rather
+  than a silently wrong answer.
 
 **Example:**
 
@@ -973,6 +980,7 @@ const regex = Regex.compile(allocator, "abc(") catch |err| switch (err) {
 // error.MatchBudgetExceeded (the per-haystack step budget), e.g.:
 //   _ = re.isMatch(adversarial) catch |e| switch (e) {
 //       error.MatchBudgetExceeded => {}, // pattern + input too expensive
+//       error.Internal => unreachable, // engine bug — never expected; please report
 //       else => return e,
 //   };
 ```

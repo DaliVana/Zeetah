@@ -18,6 +18,7 @@
 //! shape — no `min_len` / state-count heuristics (an earlier idea, dropped as
 //! unreliable).
 
+const Slot = @import("../hir.zig").Slot;
 const std = @import("std");
 const common = @import("../common.zig");
 const full_dfa = @import("full_dfa.zig");
@@ -67,6 +68,10 @@ const hasBit = common.hasBit;
 /// false ⇒ just use `bounded_bt`; true ⇒ `fill` is exact.
 pub fn isCaptureOnePass(comptime cap: ?usize, nfa: *const thompson.Nfa(cap)) bool {
     @setEvalBranchQuota(8_000_000); // comptime callers (pattern.zig) recurse deeply
+    // The walker's scratch is sized to the fixed `MAX_NFA`; a larger runtime NFA
+    // is simply not taken down the one-pass path (`fill` is only ever called
+    // when this returned true).
+    if (nfa.n_states > MAX_NFA) return false;
     var s: usize = 0;
     while (s < nfa.n_states) : (s += 1) {
         var seen = [_]bool{false} ** MAX_NFA;
@@ -119,41 +124,63 @@ const Step = union(enum) { matched, fail, consume: u16 };
 /// `span.end` (a mis-gated non-one-pass pattern, an ε-cycle, or a look edge):
 /// the caller then falls back to `bounded_bt`, which is always correct. So
 /// this is a pure speed path — never a correctness risk.
-/// Per-state out-edge index (CSR). `order[off[s]..off[s+1]]` are the edge ids
-/// leaving state `s`, in original (priority) order. Lets `epsWalk` iterate a
-/// state's own out-edges instead of rescanning all `n_edges` at every visit —
-/// the dominant cost on capture-heavy patterns (`log_parse` count-captures).
-const EdgeIndex = struct {
-    off: [MAX_NFA + 1]u16 = [_]u16{0} ** (MAX_NFA + 1),
-    order: [thompson.MAX_EDGES]u16 = undefined,
+/// Per-state out-edge index (CSR) over a fixed-capacity NFA: `order[off[s]..
+/// off[s+1]]` are the edge ids leaving state `s`, in original (priority) order.
+/// Lets `epsWalk` iterate a state's own out-edges instead of rescanning all
+/// `n_edges` at every visit — the dominant cost on capture-heavy patterns
+/// (`log_parse` count-captures). Sized to `(ns, ne)` so a comptime `Pattern`
+/// bakes exactly its NFA's index (`fillWith`), while `fill` builds a
+/// `MAX_NFA`/`MAX_EDGES`-sized one on the stack for callers without a prebuilt
+/// index. The runtime `Regex` passes its shared heap `nfa_index.EdgeIndex`
+/// instead (same field shape: `off` / `order`).
+pub fn SizedIndex(comptime ns: usize, comptime ne: usize) type {
+    return struct {
+        const Self = @This();
+        off: [ns + 1]u16 = [_]u16{0} ** (ns + 1),
+        order: [ne]u16 = undefined,
 
-    fn build(comptime cap: ?usize, nfa: *const thompson.Nfa(cap)) EdgeIndex {
-        var idx: EdgeIndex = .{};
-        // Counting sort of edge ids by from-state (stable ⇒ priority preserved).
-        var ei: usize = 0;
-        while (ei < nfa.n_edges) : (ei += 1) idx.off[nfa.e_from[ei] + 1] += 1;
-        var s: usize = 0;
-        while (s < nfa.n_states) : (s += 1) idx.off[s + 1] += idx.off[s]; // prefix sum
-        var next: [MAX_NFA]u16 = undefined;
-        s = 0;
-        while (s < nfa.n_states) : (s += 1) next[s] = idx.off[s];
-        ei = 0;
-        while (ei < nfa.n_edges) : (ei += 1) {
-            const f = nfa.e_from[ei];
-            idx.order[next[f]] = @intCast(ei);
-            next[f] += 1;
+        pub fn build(comptime cap: ?usize, nfa: *const thompson.Nfa(cap)) Self {
+            std.debug.assert(nfa.n_states <= ns and nfa.n_edges <= ne);
+            var idx: Self = .{};
+            // Counting sort of edge ids by from-state (stable ⇒ priority preserved).
+            var ei: usize = 0;
+            while (ei < nfa.n_edges) : (ei += 1) idx.off[nfa.e_from[ei] + 1] += 1;
+            var s: usize = 0;
+            while (s < nfa.n_states) : (s += 1) idx.off[s + 1] += idx.off[s]; // prefix sum
+            var next: [ns]u16 = undefined;
+            s = 0;
+            while (s < nfa.n_states) : (s += 1) next[s] = idx.off[s];
+            ei = 0;
+            while (ei < nfa.n_edges) : (ei += 1) {
+                const f = nfa.e_from[ei];
+                idx.order[next[f]] = @intCast(ei);
+                next[f] += 1;
+            }
+            return idx;
         }
-        return idx;
-    }
-};
+    };
+}
 
-pub fn fill(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), input: []const u8, span: Span, slots: []i32) bool {
+/// The full-capacity index `fill` builds per call.
+const EdgeIndex = SizedIndex(MAX_NFA, thompson.MAX_EDGES);
+
+/// `fillWith` with a per-call index (callers without a prebuilt one: tests,
+/// the differential checks). Hot callers pass their own — see `fillWith`.
+pub fn fill(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), input: []const u8, span: Span, slots: []Slot) bool {
     const idx = EdgeIndex.build(cap, nfa);
+    return fillWith(cap, nfa, &idx, input, span, slots);
+}
+
+/// `fill` over a prebuilt per-state out-edge index `idx` (a pointer to any
+/// struct with `off[s]..off[s+1]` / `order[k]` — a comptime-baked `SizedIndex`
+/// for a `Pattern`, the `Regex`'s shared heap `nfa_index.EdgeIndex` at
+/// runtime), so the index is built once per NFA, not once per capture call.
+pub fn fillWith(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), idx: anytype, input: []const u8, span: Span, slots: []Slot) bool {
     var st: u16 = @intCast(nfa.start);
     var pos: usize = span.start;
     while (true) {
         var seen = [_]bool{false} ** MAX_NFA;
-        switch (epsWalk(cap, nfa, input, pos, span.end, slots, &seen, st, &idx)) {
+        switch (epsWalk(cap, nfa, input, pos, span.end, slots, &seen, st, idx)) {
             .matched => return true,
             .fail => return false,
             .consume => |nx| {
@@ -170,10 +197,10 @@ fn epsWalk(
     input: []const u8,
     pos: usize,
     end: usize,
-    slots: []i32,
+    slots: []Slot,
     seen: *[MAX_NFA]bool,
     st: u16,
-    idx: *const EdgeIndex,
+    idx: anytype,
 ) Step {
     if (seen[st]) return .fail; // ε-revisit ⇒ not a one-pass tree ⇒ fall back
     seen[st] = true;
@@ -185,7 +212,7 @@ fn epsWalk(
         switch (nfa.e_kind[ei]) {
             .eps => {
                 const slot = nfa.e_slot[ei];
-                var old: i32 = -1;
+                var old: Slot = -1;
                 if (slot >= 0) {
                     old = slots[@intCast(slot)];
                     slots[@intCast(slot)] = @intCast(pos);
@@ -202,6 +229,45 @@ fn epsWalk(
     return .fail;
 }
 
+test "onepass: fillWith over the Regex's shared heap index == fill (per-call index)" {
+    const hir = @import("../hir.zig");
+    const parser = @import("../parser.zig");
+    const core = @import("core.zig");
+    const nfa_index = @import("nfa_index.zig");
+    const a = std.testing.allocator;
+    const pats = [_][]const u8{ "(a)(b)(c)", "(\\d{3})-(\\d{4})", "(ab)+c", "a(bc)*d", "([a-z]+)@([a-z]+)" };
+    const ins = [_][]const u8{ "abc", "x 555-1234 y", "ababc", "abcbcd", "me@host", "nope" };
+    for (pats) |p| {
+        var h = hir.Hir(null).initRuntime();
+        defer h.deinit(a);
+        try parser.parse(null, &h, a, p, .{});
+        var nfa = try thompson.buildAlloc(a, &h);
+        defer nfa.deinit(a);
+        if (!isCaptureOnePass(null, &nfa)) continue;
+        const d = full_dfa.compute(null, &nfa, h.anchored_start, h.anchored_end);
+        if (d.outcome != .ok) continue;
+        var idx = try nfa_index.EdgeIndex.build(a, &nfa);
+        defer idx.deinit(a);
+        const nslots = 2 * (std.mem.count(u8, p, "(") + 1); // every `(` above is a capture group
+        for (ins) |in| {
+            const sp = core.findLeftmost(&d, in) orelse continue;
+            var s1: [16]Slot = undefined;
+            var s2: [16]Slot = undefined;
+            @memset(s1[0..nslots], -1);
+            @memset(s2[0..nslots], -1);
+            s1[0] = @intCast(sp.start);
+            s1[1] = @intCast(sp.end);
+            s2[0] = s1[0];
+            s2[1] = s1[1];
+            const span: Span = .{ .start = sp.start, .end = sp.end };
+            const ok1 = fill(null, &nfa, in, span, s1[0..nslots]);
+            const ok2 = fillWith(null, &nfa, &idx, in, span, s2[0..nslots]);
+            try std.testing.expectEqual(ok1, ok2);
+            try std.testing.expectEqualSlices(Slot, s1[0..nslots], s2[0..nslots]);
+        }
+    }
+}
+
 test "onepass: detector is sound (signal only, never affects matching)" {
     const hir = @import("../hir.zig");
     const parser = @import("../parser.zig");
@@ -213,7 +279,8 @@ test "onepass: detector is sound (signal only, never affects matching)" {
         var h = hir.Hir(null).initRuntime();
         defer h.deinit(a);
         try parser.parse(null, &h, a, p, .{});
-        var nfa = try thompson.build(null, &h);
+        var nfa = try thompson.buildAlloc(a, &h);
+        defer nfa.deinit(a);
         const d = full_dfa.compute(null, &nfa, h.anchored_start, h.anchored_end);
         try std.testing.expect(dfaMatchIsOnePass(&d));
     }
@@ -224,7 +291,8 @@ test "onepass: detector is sound (signal only, never affects matching)" {
         var h = hir.Hir(null).initRuntime();
         defer h.deinit(a);
         try parser.parse(null, &h, a, p, .{});
-        var nfa = try thompson.build(null, &h);
+        var nfa = try thompson.buildAlloc(a, &h);
+        defer nfa.deinit(a);
         const d = full_dfa.compute(null, &nfa, h.anchored_start, h.anchored_end);
         _ = dfaMatchIsOnePass(&d); // sound by construction; just exercise it
         try std.testing.expect(core.isMatch(&d, "abc") or !core.isMatch(&d, "abc"));
@@ -252,7 +320,8 @@ test "onepass: isCaptureOnePass accepts deterministic, rejects overlap/ambiguous
         var h = hir.Hir(null).initRuntime();
         defer h.deinit(a);
         parser.parse(null, &h, a, c.p, .{}) catch continue;
-        var nfa = try thompson.build(null, &h);
+        var nfa = try thompson.buildAlloc(a, &h);
+        defer nfa.deinit(a);
         try std.testing.expectEqual(c.want, isCaptureOnePass(null, &nfa));
     }
 }
@@ -282,7 +351,8 @@ test "onepass: fill captures are byte-identical to bounded_bt (soundness gate)" 
         var h = hir.Hir(null).initRuntime();
         defer h.deinit(a);
         parser.parse(null, &h, a, p, .{}) catch continue;
-        var nfa = try thompson.build(null, &h);
+        var nfa = try thompson.buildAlloc(a, &h);
+        defer nfa.deinit(a);
         const d = full_dfa.compute(null, &nfa, h.anchored_start, h.anchored_end);
         if (d.outcome != .ok or !isCaptureOnePass(null, &nfa)) continue;
 
@@ -290,7 +360,7 @@ test "onepass: fill captures are byte-identical to bounded_bt (soundness gate)" 
             // Reference: bounded_bt (its own findLeftmost + trace recon).
             var bt = try bounded_bt.BoundedBt.init(a, &nfa, h.anchored_start, h.anchored_end, in.len);
             defer bt.deinit();
-            var ref: [bounded_bt.MAX_SLOTS]i32 = undefined;
+            var ref: [bounded_bt.MAX_SLOTS]Slot = undefined;
             const ref_span = try bt.captures(in, ref[0..]);
 
             // One-pass: span from the DFA, then deterministic fill.
@@ -299,13 +369,13 @@ test "onepass: fill captures are byte-identical to bounded_bt (soundness gate)" 
             if (dsp) |sp| {
                 try std.testing.expectEqual(ref_span.?.start, sp.start);
                 try std.testing.expectEqual(ref_span.?.end, sp.end);
-                var got: [bounded_bt.MAX_SLOTS]i32 = undefined;
+                var got: [bounded_bt.MAX_SLOTS]Slot = undefined;
                 @memset(got[0..], -1);
                 got[0] = @intCast(sp.start);
                 got[1] = @intCast(sp.end);
                 // isCaptureOnePass(true) ⇒ fill MUST resolve deterministically.
                 try std.testing.expect(fill(null, &nfa, in, .{ .start = sp.start, .end = sp.end }, got[0..]));
-                try std.testing.expectEqualSlices(i32, ref[0..bounded_bt.MAX_SLOTS], got[0..bounded_bt.MAX_SLOTS]);
+                try std.testing.expectEqualSlices(Slot, ref[0..bounded_bt.MAX_SLOTS], got[0..bounded_bt.MAX_SLOTS]);
             }
         }
     }

@@ -391,8 +391,10 @@ patterns can tell them apart:
 
 At *match* time, a backtracking pattern (backref / lookaround) can additionally
 return **`error.MatchBudgetExceeded`** when its per-haystack step budget is hit
-— distinct from the compile-time `PatternTooComplex`. The full set lives in
-`RegexError` (`zeetah.RegexError`).
+— distinct from the compile-time `PatternTooComplex`. **`error.Internal`** is
+the engine's own bug signal — an internal invariant was violated (two engines
+disagreed about a match); never expected, please report the pattern and input
+if you ever see it. The full set lives in `RegexError` (`zeetah.RegexError`).
 
 ## Compile-time patterns
 

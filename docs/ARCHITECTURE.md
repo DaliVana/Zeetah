@@ -14,11 +14,13 @@ use, and the **design decisions** (and roads deliberately not taken) behind the
 shape it has today.
 
 > **Note on terminology.** Zeetah builds a Thompson NFA as an *intermediate
-> construction step* on the way to a DFA. It does **not** match by simulating
-> the NFA with a thread pool / Pike VM. Regular patterns match by walking a
-> compiled deterministic-finite-automaton transition table, one table lookup
-> per input byte. Earlier revisions of this document described a thread-based
-> NFA simulation with `O(n·m)` matching; that is no longer how the engine works.
+> construction step* on the way to a DFA. Regular patterns match by walking a
+> compiled deterministic-finite-automaton transition table (eager, lazy, or
+> frozen-dense), one table lookup per input byte. The NFA is simulated directly
+> only in two bounded roles: the bounded backtracker (`exec/bounded_bt.zig`),
+> which rebuilds capture slots over an already-found match span, and the
+> **PikeVM** (`exec/pikevm.zig`), the O(n_states)-memory fallback for an NFA
+> search whose backtracker bitset would exceed its budget.
 
 ## Design goals
 
@@ -94,41 +96,54 @@ Key points:
 ## Two layers of routing
 
 `compile` makes its decision in two layers. Layer 1 is the runtime dispatcher
-that picks among ~12 concrete executors; Layer 2 is the pure planner that makes
+that picks among 14 concrete executors; Layer 2 is the pure planner that makes
 the regular-tier sub-decision shared with the compile-time path.
 
 ### Layer 1 — the runtime dispatcher (`regex.zig`)
 
 `Regex.compileWithFlags` classifies the analyzed pattern and selects one of
-twelve executors, tracked by the private enum `MetaKind`:
+fourteen executors, tracked by the private enum `MetaKind`:
 
 ```zig
 const MetaKind = enum {
     literal, dfa, lit_prefix, reverse_suffix, bt_look, backtrack,
     split_alt, lazy_dfa, dense_search, class_span, boundary_lits, dup_word,
+    dfa_edge_look, literal_alt,
 };
 ```
 
 | `MetaKind` | Chosen when | How it runs | Backing code |
 |------------|-------------|-------------|--------------|
 | `literal` | a single literal, or an exact literal alternation (`cat\|dog\|bird`) | SIMD substring / Teddy multi-literal scan — **no automaton** | `exec/core.zig`, `prefilter.zig` |
-| `lit_prefix` | a literal prefix ≥ 3 bytes, unanchored (`hello.*world`) | Teddy-locate the prefix, then verify with an anchored DFA | `exec/core.zig` → `exec/search.zig`, `prefilter.zig` |
+| `lit_prefix` | a literal prefix ≥ 3 bytes, unanchored (`hello.*world`) | Teddy-locate the prefix, then verify with an anchored DFA; with an unbounded tail the bytes failing candidates scan are metered (`PackedDfa.runFromStop` reports where a failed walk died — no second pass), and past a budget ∝ progress the search continues on an attached single-pass engine | `exec/core.zig` → `exec/search.zig`, `prefilter.zig` |
 | `reverse_suffix` | a selective trailing literal but a weak prefix | use the suffix as a sound fast-negative (no occurrence ⇒ no match), then a forward DFA | `exec/core.zig`, `prefilter.zig`, `exec/full_dfa.zig` |
 | `dfa` | the general regular case | eager DFA table walk (`Dfa256`) | `exec/core.zig`, `exec/full_dfa.zig`, `exec/dfa_build.zig` |
-| `dense_search` | a bare unanchored DFA of narrow shape (`min_len ≥ 4`, ≤ 16 start bytes, no required literal, not lazy) | a *frozen* dense single-pass unanchored DFA (one sweep, no per-position restart) | `exec/dense_search.zig` |
-| `lazy_dfa` | the eager DFA would exceed its state ceiling | the **same** subset construction, evaluated on demand and memoized — bit-identical results | `exec/lazy_dfa.zig`, `exec/lazy_memo.zig` |
+| `dense_search` | a bare unanchored DFA of narrow shape (`min_len ≥ 4`, ≤ 16 start bytes, no required literal, not lazy), or an unanchored `$`-anchored bare DFA | a *frozen* dense single-pass unanchored DFA + reverse start pass (one sweep, no per-position restart) | `exec/dense_search.zig` |
+| `lazy_dfa` | the eager DFA would exceed its state ceiling (or the dense freeze would); **plain look-assertions** (`\b`, `\B`, mid-pattern `^`/`$`, `(?m)` anchors, `\A`, `\z`) | the same subset construction, evaluated on demand and memoized; in *look mode* each state also carries the class of the previous byte and assertions are evaluated inside the transition (matches reported one byte late) | `exec/lazy_dfa.zig`, `exec/lazy_memo.zig` |
 | `class_span` | one greedy single contiguous-range `class+` / `class*` | SIMD member-run scan, no automaton | `exec/class_span.zig` |
 | `boundary_lits` | `\b(?:kw1\|kw2\|…)\b` keyword alternations | Aho-Corasick locate + O(1) `\b` verify | `exec/seq_extract.zig`, `prefilter.zig` |
-| `bt_look` | plain look-assertions (`\b`, `\B`, mid-pattern `^`/`$`, `(?m)` anchors) | bounded backtracker (the DFA does not fold look-assertions) | `exec/bounded_bt.zig` |
+| `bt_look` | the look-assertions the lazy DFA does not take: `\Z` (two bytes of lookahead) and a leading `(?m)^` (whose line-start scan skips whole lines) — plus the line-DFA / reverse-end-DFA fast paths | line-DFA or reverse-end DFA when built, else the bounded backtracker over line starts / every start; the PikeVM when the visited bitset would exceed its budget | `exec/bounded_bt.zig`, `exec/line_dfa.zig`, `exec/pikevm.zig` |
 | `backtrack` | lookaround / backreferences / atomic groups (incl. possessive quantifiers, which lower to atomic groups) | HIR-tree backtracker, with a `seek` over-approximation prefilter and concat-internal regular "island" delegation | `exec/backtrack.zig`, `exec/seek.zig`, `exec/delegate.zig` |
 | `split_alt` | a top-level alternation mixing regular and non-regular branches | regular branches → anchored DFAs, the rest → tree backtracker | `exec/split_alt.zig` |
 | `dup_word` | the adjacent-duplicate-word shape `(\b\w+\b)\s+\1` | a single O(n) linear scan | `exec/dupword.zig` |
+| `dfa_edge_look` | a regular, greedy, alternation-free core followed by one width-1 trailing lookaround (`\w+(?=!)`, `\d+(?<![05])`), no captures | DFA over the core with the look folded in (lookahead: one more byte, end reported one back; lookbehind: a last-byte-in-class copy of the NFA), so the leftmost-first cut only fires where the look holds | `exec/edge_look.zig` |
+| `literal_alt` | a pure-literal alternation too large for the NFA (a dictionary) | leftmost-first trie walk; tables bounded by a byte budget | `prefilter.zig` (`LiteralAltScanner`) |
 
-The first eight rows are the regular tier — they are pure finite automata or
-literal scans, and every one of them is linear in the input. The last four
-(`bt_look`, `backtrack`, `split_alt`, `dup_word`) are the non-regular and
-hybrid tiers; `split_alt` and `dup_word` are linear by construction, while
-`bt_look` and `backtrack` are governed by the step budget described below.
+The regular tier (`literal`, `lit_prefix`, `reverse_suffix`, `dfa`,
+`dense_search`, `lazy_dfa`, `class_span`, `boundary_lits`, `dfa_edge_look`,
+`literal_alt`) consists of finite automata or literal scans. `bt_look`,
+`backtrack`, `split_alt` and `dup_word` are the non-regular and hybrid tiers;
+`dup_word` is linear by construction, `bt_look` is O(n·m) (visited bitset or
+PikeVM), and `backtrack` / `split_alt` are governed by the step budget described
+below.
+
+**Captures are two-phase.** For every NFA-backed engine the search engine first
+finds the exact leftmost-first span; the capture slots are then rebuilt over
+*just that span* — by the one-pass walker when the pattern is one-pass, else by
+the bounded backtracker (or the PikeVM past its budget). The first priority path
+from the span's start that accepts at its end is exactly the path a direct
+search takes, so the slots are identical, and the capture cost is bounded by the
+match, never the haystack.
 
 ### Layer 2 — the planner (`planner.zig`)
 
@@ -155,7 +170,7 @@ pub const Strategy = union(enum) {
 };
 ```
 
-`Strategy` is the regular-tier vocabulary; the twelve-variant `MetaKind` is the
+`Strategy` is the regular-tier vocabulary; the fourteen-variant `MetaKind` is the
 real, full taxonomy that `regex.zig` works in. The `.backtrack` variant is a
 sentinel: non-regular patterns are intercepted by `regex.zig` *before* `plan` is
 ever consulted, so `plan` returning `.backtrack` never reaches the dispatch hot
@@ -190,6 +205,27 @@ Prefilters are sound by construction: they may admit false positives (which the
 real executor then rejects) but never false negatives, so they can only narrow
 the search, never change the match result.
 
+## Match semantics
+
+- **Leftmost-first** (Perl / PCRE / RE2 / Rust) in every engine: the DFA's
+  priority-ordered closure with its accept cut, the bounded backtracker's
+  priority-ordered DFS that returns at the first accept, and the PikeVM's
+  priority-ordered thread list with the same cut all pick the same match. The
+  engines are pinned to each other (and to the public API through its real
+  routing) by the random-pattern differential in `exec/nfa_fuzz.zig`, and to
+  the comptime `Pattern` by `tests/feat_api.zig` / `tests/feat_boundaries.zig`.
+- **Absolute coordinates.** Non-overlapping iteration (`findAll`, `count`,
+  iterators, `split`, `replaceAll`, `captures*From`) resumes every engine at an
+  absolute position over the *full* input — never an `input[pos..]` slice, which
+  would make the resume point look like start-of-text: a look-behind, `\b` or
+  `(?m)^` sees the real preceding byte, and a folded non-multiline `^`/`\A` can
+  only match at offset 0 (`^abc` on `"abcabc"` is one match).
+- **Case-insensitive backreferences.** Under `(?i)` a backreference matches the
+  group's text in any (ASCII) case — the same folding `(?i)` applies to
+  literals and classes — following the mode active *at the reference*.
+- **Capture slots are pointer-width** (`hir.Slot = isize`): any in-memory
+  haystack offset is representable (no 2 GiB truncation).
+
 ## Safety and the ReDoS contract
 
 Zeetah's linear-time guarantee is precise about *which* patterns receive it.
@@ -202,7 +238,22 @@ lookup per input byte, no backtracking and no thread fan-out. If the *eager* DFA
 would exceed its state ceiling during construction, the engine falls back to the
 **lazy DFA** (`exec/lazy_dfa.zig`) — the identical subset construction, built
 incrementally and memoized so that results are bit-identical to the eager table.
-The fallback is *never* to a backtracker.
+The fallback is *never* to a backtracker. A lazy DFA whose cache thrashes (≥ 3
+flushes at < ~10 bytes searched per state — the rust-regex heuristic) gives up
+to the **PikeVM**, which is O(n·m) time and O(m) memory. The forward and reverse
+memos flush independently, so the give-up watches each scan direction on its
+own (a thrashing reverse start-recovery pass is the same slow path).
+
+"O(n) per scan" is per *start attempt*: the single-pass engines (`dense_search`,
+`lazy_dfa`, the reverse `$` passes) are O(n) for the whole search, but the eager
+`dfa` / `reverse_suffix` routes restart an anchored DFA at each candidate start.
+The required-byte / required-literal prefilters, the dense routing of the
+known quadratic shapes (unanchored `$`, the narrow-start "floor cluster") and the
+metered single-pass fallback of unbounded literal-prefix tails keep the common
+and the audited adversarial cases linear; an unbounded tail on the eager route whose required byte is
+present but unreachable (`a.*z` over `"z" + "a"×n`) is still O(n²) — the
+remaining ReDoS surface of the regular tier. The comptime `.lit_prefix` arm has
+only the positional required-byte guard (no single-pass engine to route to).
 
 Consequently the classic "catastrophic" *regular* shapes are not catastrophic
 here. `(a+)+$`, `(a*)*$`, and `(.*)*$` **compile and run linearly**; they are
@@ -231,7 +282,12 @@ const MAX_DEPTH: u32 = 16_384;                         // CPS recursion guard
 When either bound is exceeded the matcher returns a typed
 `error.MatchBudgetExceeded` at **match time** — the .NET-style runtime contract.
 It never spins indefinitely. (This is distinct from the compile-time
-`error.PatternTooComplex` below.)
+`error.PatternTooComplex` below.) The only other match-time error,
+`error.Internal`, is the engine's own bug signal: an internal invariant was
+violated (the search and capture engines disagreed about a match, or a pattern
+reached an engine that cannot run it). It is never expected; the differential
+`nfa_fuzz` test exists to keep it that way, and it is a typed error rather than
+an `unreachable` or a silently wrong answer.
 
 ```zig
 // Non-regular catastrophe (the loop is inside a lookahead): bounded at match time.
@@ -243,29 +299,52 @@ _ = re.isMatch("aaaaaaaaaaaaaaaaaaaaaaaaX") catch |e| switch (e) {
 };
 ```
 
-The bounded-backtracking **capture path** (`exec/bounded_bt.zig`) is stricter
-still: it tracks a `(state, position)` visited bitset, making it strictly
-`O(n·m)` — never exponential. The two backtrackers are deliberately separate
-(see [Design decisions](#design-decisions--roads-not-taken)).
+The **bounded backtracker** (`exec/bounded_bt.zig`, capture reconstruction and
+`bt_look`) is stricter still: it tracks a `(state, position)` visited bitset over
+the searched window, making it strictly `O(n·m)` — never exponential. When that
+bitset would exceed `bounded_bt.VISITED_BUDGET_BYTES` (8 MiB, counting the
+bitset **and** its dirty-word list — exactly what the scratch allocates) the
+search runs on the **PikeVM** instead (same leftmost-first answer, O(m) memory).
+The two
+backtrackers are deliberately separate (see
+[Design decisions](#design-decisions--roads-not-taken)).
 
 ### Construction ceilings — bounded at compile
 
-To keep construction itself bounded, the engine enforces fixed ceilings while
-building a pattern. A pattern too large to build raises `error.PatternTooComplex`
-at **compile time** (not match time):
+To keep construction itself bounded, the engine enforces ceilings while
+building a pattern, checked before the allocation that relies on them. A pattern
+too large to build raises `error.PatternTooComplex` (a repetition count over the
+parser bound: `error.NotImplemented`) at **compile time**, not match time:
 
-| Ceiling | Value | Source |
-|---------|-------|--------|
-| NFA states | 256 | `thompson.MAX_NFA` |
-| NFA edges | 2048 | `thompson.MAX_EDGES` |
-| DFA states | 256 | internal `MAX_DFA` |
-| HIR nodes | 4096 | `hir.MAX_NODES` |
-| Capture groups | 32 | `hir.MAX_GROUPS` |
+| Ceiling | Runtime `Regex` | Comptime `Pattern` | Source |
+|---------|---------------:|-------------------:|--------|
+| NFA states | 32 767 | 256 | `thompson.MAX_NFA_RUNTIME` / `MAX_NFA` |
+| NFA edges | 65 535 | 1024 | `thompson.MAX_EDGES_RUNTIME` / `MAX_EDGES` |
+| NFA byte sets | 65 535 | 256 | `thompson.MAX_SETS_RUNTIME` / `MAX_SETS` |
+| Eager DFA states | 256 | 256 | internal `MAX_DFA` (runtime: over it ⇒ lazy DFA, not an error) |
+| HIR nodes / sets | 131 072 / 65 535 | 4096 / 4096 | `hir.MAX_NODES_RUNTIME` / `MAX_NODES` … |
+| HIR depth | 4096 | (bounded by nodes) | `hir.MAX_DEPTH_RUNTIME` |
+| Capture groups | 255 (32 on the tree backtracker) | 32 | `hir.MAX_GROUPS_RUNTIME` / `MAX_GROUPS` |
+| `{m,n}` bound | 65 535 | 1000 | `parser.MAX_REPEAT_RUNTIME` / `MAX_REPEAT` |
+| Literal-alternation trie tables | 64 MiB | — | `prefilter.LiteralAltScanner.MEM_LIMIT` |
 
-These are deliberate, conservative limits rather than dynamic budgets; raising
-them is an engine-design decision, not a per-call option. (The comptime
-`Pattern` path applies a tighter HIR cap and the same `MAX_DFA = 256` DFA
-ceiling, surfaced as a `@compileError` rather than a runtime error.)
+The runtime NFA is **heap-backed and sized to the pattern** (`thompson.buildAlloc`;
+exact-size slices, `deinit` / `clone`), so the larger runtime ceilings cost
+nothing for ordinary patterns. Only the engines whose scratch is sized per NFA
+take an over-`MAX_NFA` NFA — the lazy DFA, the bounded backtracker and the
+PikeVM; the eager DFA and the one-pass walker decline it (`.exploded` / not
+one-pass) and the pattern routes to the lazy DFA. The HIR depth ceiling keeps
+the recursive analyses and the NFA lowering stack-safe (a wide pattern is fine;
+a 20 000-deep `a{20000}` chain is rejected). The tree backtracker keeps the
+32-group limit because its per-atomic slot snapshot lives on the stack.
+
+These are deliberate limits rather than per-call options. The comptime path's
+smaller ceilings surface as a `@compileError`. Two further *runtime* bounds route
+rather than reject: the lazy DFA's memo holds at most 8192 states **and** 32 MiB
+of state lists per search direction (`lazy_memo.DEFAULT_CACHE_STATES` /
+`DEFAULT_CACHE_BYTES`; flushed and rebuilt on demand, with a bytes-per-state
+give-up to the PikeVM), and the bounded backtracker's 8 MiB visited budget hands
+larger searches to the PikeVM.
 
 ## Compile-time vs. runtime
 
@@ -398,16 +477,16 @@ strategy is "bake the value, reuse the executor":
   BacktrackerG(null)` alias is unchanged). `Pattern` parses to a fixed-size comptime
   HIR, **trims it to its exact node count**, and bakes that `Hir(node_count)` into
   `.rodata` — so a small non-regular pattern emits a small table, not the
-  build-ceiling-sized store. The matcher's `m`/`cont`/`loopStep` body is identical
+  build-ceiling-sized store. The matcher's `m`/`cont`/`loopSplit` body is identical
   across cap modes; `cc.lookHolds` (word boundaries, line/text anchors) is pure and
   comptime-evaluable, which is what lets look-assertions run at comptime.
 - **Captures** are materialized into an inline `Captures(ng, gnames)` value — a
   fixed `[ng+1]?Group` array, **no allocator** (the comptime peer of the runtime's
   heap `Match.groups`; `Pattern.captures(input) ?Captures` vs runtime
   `Regex.captures(a,input) !?Match`). Group **count + `(?<name>)` names** come from
-  the shared `parser.scanGroups` (lifted into `parser.zig` so both front-ends agree
-  by construction — it is a *source* scan, so a group inside a lookaround still
-  reserves its numbered/named slot). `get`/`getName` are compile-time-indexed.
+  the shared `parser.parseCaptures` (the parser itself is the single source of
+  truth, so both front-ends agree by construction and a group inside a lookaround
+  still reserves its numbered/named slot). `get`/`getName` are compile-time-indexed.
 - **The prefilters are baked too**, reusing the *zero-allocator* `full_dfa.compute`
   (the same one the DFA tier uses — the lazy/dense builders are allocator-heavy and
   were deliberately *not* ported):
@@ -421,53 +500,68 @@ strategy is "bake the value, reuse the executor":
 - **Routing** is comptime-only: `pattern.zig buildAll` dispatches on
   `requires_backtracking or has_look` *before* `thompson.build`. The shared
   `properties.requires_backtracking` deliberately omits `has_look` so the *runtime*
-  keeps its separate, faster `.bt_look` engine; the comptime path, which has no
-  `.bt_look`, folds looks into the one backtracker arm.
+  keeps its separate look engines (the look-aware lazy DFA, `.bt_look`); the
+  comptime path folds looks into the one backtracker arm.
 
 Iteration runs over the **full input in absolute coordinates** (`runFrom(input,
-from, …)`), never an `input[from..]` slice — a slice would make a resumed start look
-like start-of-text and mis-fire `start_line`/`\b`. Correctness is pinned by the
-`Pattern`⇄`Regex` differential tests in `tests/feat_api.zig` (find-family, captures,
-seek-over-gaps, and look-assertions), plus the cross-engine count gate in the
-benchmark, which now exercises the comptime path on every pattern it can build.
+from, …)`) on both front-ends — see [Match semantics](#match-semantics).
+Correctness is pinned by the `Pattern`⇄`Regex` differential tests in
+`tests/feat_api.zig` (find-family, captures, seek-over-gaps, look-assertions,
+`split_alt`) and `tests/feat_boundaries.zig`, plus the cross-engine count gate in
+the benchmark, which exercises the comptime path on every pattern it can build.
 
-### A DFA core, not a PikeVM
+### A DFA core; the PikeVM is only a fallback
 
 The proposal assumed a PikeVM-style linear-bounds finder for the regular core.
 The realized engine uses a **DFA table walk** instead: the regular-case
 correctness workhorse is the eager `Dfa256` (`exec/full_dfa.zig`,
 O(n) per scan, leftmost-first), with the bit-identical **lazy DFA**
-(`exec/lazy_dfa.zig`) as the fallback when the eager table overflows its ceiling.
-There is no NFA thread simulation at match time. In Zeetah the "slow general
-engine" to avoid is therefore the **tree backtracker**, not a PikeVM — and the
-planner's whole job is to keep patterns out of it whenever a finite automaton or
-literal scan suffices.
+(`exec/lazy_dfa.zig`) as the fallback when the eager table overflows its ceiling
+— and, in look mode, the engine for plain look-assertions. A **PikeVM**
+(`exec/pikevm.zig`) exists, but only as the memory-bounded fallback: for an NFA
+search whose backtracker bitset would exceed its budget, and for a thrashing
+look-mode lazy DFA. In Zeetah the "slow general engine" to avoid is therefore the
+**tree backtracker** — and the planner's whole job is to keep patterns out of it
+whenever a finite automaton or literal scan suffices.
 
 ### `reverse_suffix` is a fast-negative, not a reverse engine
 
 The proposal included reverse-anchored, reverse-suffix, and reverse-inner
 strategies backed by a reverse automaton, which would require a "quadratic guard"
 (a stop-offset that abandons the optimization when a reverse `.*` scan would run
-back to the haystack start, the classic `[A-Z].*bcdef…` O(m·n²) trap). **None of
-the reverse automata were built.** `reverse_suffix` instead uses the trailing
-literal *only* as a sound fast-**negative**: if the selective suffix is absent,
-the whole haystack is rejected in a single scan; otherwise a forward DFA runs.
-There is no per-suffix-hit reverse scan to make quadratic, and therefore no
-stop-offset bookkeeping anywhere in the engine. The general linear-time guarantee
-comes from the DFA core, not from reverse-scan mitigation.
+back to the haystack start, the classic `[A-Z].*bcdef…` O(m·n²) trap).
+`reverse_suffix` was **not** built that way: it uses the trailing literal *only*
+as a sound fast-**negative** — if the selective suffix is absent, the whole
+haystack is rejected in a single scan; otherwise a forward DFA runs — so there is
+no per-suffix-hit reverse scan to make quadratic.
 
-### No cross-call `Cache` pool — a frozen DFA instead
+Reverse automata **do** exist, in two other roles where they are the linear
+option rather than a quadratic risk:
 
-The proposal anticipated a lazy DFA whose transition table must persist and grow
-across calls, requiring a `regex_automata`-style pooled, mutex-guarded mutable
-`Cache`. That pool was **not** built. The regular fallback on the hot path is a
-**frozen** dense DFA (`freezeDense`) rather than a table that grows across calls,
-so there is no shared mutable cache to pool; the lazy DFA is the bit-identical
-fallback used *only* when the eager table overflows. The public API takes **no**
-`Cache` argument and allocates no cross-call scratch — `find` / `isMatch` /
-`findAll` are infallible in that respect and the runtime path inherits the
-comptime path's "nothing shared ⇒ trivially thread-safe" property. A per-call
-scratch escape hatch can be added additively later without changing the surface.
+- **start recovery** for the single-pass engines (`dense_search`, `lazy_dfa`):
+  the forward unanchored pass finds the end of the leftmost-first match, one
+  reverse pass from there finds its start;
+- **end-anchored search** (`$`, `(?m)$`, `\Z`): one reverse reachability pass
+  from each end boundary (`search.reverseSearch` / `reverseLineEnd` /
+  `reverseBeforeNl`, the `bt_look` `rev_end_dfa`, and the comptime `rev_dfa`
+  bake), replacing an O(n²) forward restart on non-matching `class+$` input.
+
+### Per-`Regex` scratch pools, a frozen DFA where possible
+
+Where the dense table fits, the single-pass engine is a **frozen** DFA
+(`freezeDense`) with no mutable state at all. The engines that need mutable
+per-search scratch — the lazy DFA's memo (`LazyMemo`), the bounded backtracker's
+visited bitset (`BtScratch`) and the PikeVM's thread lists (`PikeScratch`) —
+borrow it from a thread-safe `cache.Pool` owned by the compiled `Regex` (a
+lock-free fast slot plus a spin-locked overflow stack). The compiled `Regex`
+itself stays an immutable, shareable value: concurrent searches each borrow their
+own scratch, and a pooled memo keeps its learned states across calls (same
+program ⇒ valid amortization, RE2 / rust-regex style). The public API takes **no**
+`Cache` argument; pools are per-`Regex`, never shared between patterns. The
+NFA's per-state out-edge index (`EdgeIndex`, `exec/nfa_index.zig`) is built
+once per `Regex` next to the retained NFA and borrowed by every backtracker and
+PikeVM search — the pooled scratches hold only per-search buffers, nothing
+keyed to an NFA.
 
 ### Literal-sequence extraction is the highest-leverage layer
 
@@ -499,9 +593,10 @@ the comptime `Pattern` path.
 
 The HIR-tree backtracker (`exec/backtrack.zig`) is used *only* for the
 inherently non-regular features (backreferences, lookaround, atomic groups); the
-cheap-capture core uses the separate **bounded** backtracker
-(`exec/bounded_bt.zig`) with its `(state, pos)` visited bitset and strict
-`O(n·m)` bound. Merging the two would reintroduce ReDoS — the split is real and
+capture core uses the separate **bounded** backtracker (`exec/bounded_bt.zig`) —
+a priority-ordered DFS over the Thompson NFA with a `(state, pos)` visited
+bitset and a strict `O(n·m)` bound, returning at the first accept
+(leftmost-first). Merging the two would reintroduce ReDoS — the split is real and
 intentional, not an accident of layering.
 
 ### Ongoing tuning surfaces
@@ -509,10 +604,9 @@ intentional, not an accident of layering.
 - **Selectivity heuristics.** The prefix-vs-suffix choice and the
   "is this prefilter worth it" estimate are heuristics tuned against the in-repo
   benchmark workloads — an ongoing tuning surface, not a settled one.
-- **Match semantics.** Leftmost-first (Perl/RE2) is preserved end-to-end. Lazy
-  combined with an end-anchor (`a*?$`) routes to the runtime backtracker and is
-  still leftmost-first; it is supported at runtime but `@compileError`s under the
-  comptime `Pattern`.
+- **Match semantics.** Leftmost-first (Perl/RE2) is preserved end-to-end (see
+  [Match semantics](#match-semantics)). Lazy combined with an end-anchor (`a*?$`)
+  routes to the tree backtracker on both front-ends and is still leftmost-first.
 
 ## Module map
 
@@ -525,24 +619,28 @@ intentional, not an accident of layering.
 | `thompson.zig` | HIR → Thompson NFA (intermediate); NFA ceilings (`MAX_NFA`, `MAX_EDGES`) |
 | `regex.zig` | runtime façade + Layer-1 dispatcher (`MetaKind`) |
 | `pattern.zig` | comptime façade (`Pattern`, `PatternOptions`) |
-| `prefilter.zig` | required-byte / required-literal / first-byte-SIMD / Teddy / Aho-Corasick |
+| `prefilter.zig` | required-byte / required-literal / first-byte-SIMD / Teddy / Aho-Corasick / `LiteralAltScanner` |
 | `exec/core.zig` | runtime DFA table-walk executor + literal/prefix fast paths (drives `Dfa256`) |
 | `exec/search.zig` | table-type-agnostic prefilter search shared by the runtime `Dfa256` and the comptime `Dfa(ns,nk)` |
 | `exec/full_dfa.zig`, `exec/dfa_build.zig` | eager DFA construction (subset + minimize) → `Dfa256` |
 | `exec/comptime_dfa.zig` | static, allocation-free `Dfa(ns,nk)` baked into `.rodata` by `Pattern` |
 | `exec/dense_search.zig` | frozen single-pass unanchored DFA (`dense_search`) |
-| `exec/lazy_dfa.zig`, `exec/lazy_memo.zig` | on-demand subset construction + memo (DFA-ceiling fallback) |
-| `exec/onepass.zig` | one-pass DFA capture path |
+| `exec/lazy_dfa.zig`, `exec/lazy_memo.zig` | on-demand subset construction + memo (DFA-ceiling fallback; look mode for plain look-assertions) |
+| `exec/pikevm.zig` | NFA breadth-first simulation — the O(n_states)-memory fallback (looks + captures) |
+| `exec/nfa_index.zig` | `EdgeIndex`: per-state out-edge index of the retained NFA in priority order, built once per `Regex` and borrowed by the bounded backtracker and the PikeVM |
+| `exec/onepass.zig` | one-pass capture walker (slots over a found span); walks a prebuilt out-edge index — the `Regex`'s shared `EdgeIndex` at runtime, a comptime-baked `SizedIndex` in a `Pattern` |
+| `exec/edge_look.zig`, `exec/line_dfa.zig` | trailing width-1 look peel (`dfa_edge_look`); line-anchored body-DFA scan |
 | `exec/class_span.zig` | SIMD single-range `class+`/`class*` scan |
 | `exec/seq_extract.zig` | literal-sequence / keyword extraction (`Seq`; `boundary_lits`) |
-| `exec/backtrack.zig`, `exec/bounded_bt.zig` | HIR-tree backtracker (backref/lookaround/atomic) + bounded `O(n·m)` capture path |
+| `exec/backtrack.zig`, `exec/bounded_bt.zig` | HIR-tree backtracker (backref/lookaround/atomic) + bounded `O(n·m)` NFA backtracker (span captures, `bt_look`) |
+| `exec/nfa_fuzz.zig` | random-pattern differential test across the NFA engines and the public API |
 | `exec/seek.zig` | regular over-approximation prefilter for the backtracking tier |
 | `exec/delegate.zig` | concat-internal regular-island delegation into the backtracker |
 | `exec/split_alt.zig` | mixed regular/non-regular top-level alternation |
 | `exec/dupword.zig` | adjacent-duplicate-word linear recognizer |
 | `exec/charclass.zig` | shared character-class helpers |
 | `unicode_class.zig`, `unicode_tables.zig` | Latin-1 `\p` General_Category resolution |
-| `cache.zig`, `thread_safety.zig` | lazy-DFA memo plumbing; thread-safety helpers |
+| `cache.zig`, `thread_safety.zig` | per-`Regex` scratch pools (`cache.Pool`); thread-safety helpers |
 | `match.zig`, `common.zig`, `errors.zig`, `builder.zig` | `Match`/`Group`, shared types/flags, `RegexError`, fluent builder |
 
 ## References

@@ -85,3 +85,34 @@ test "backref: dup-word fast path only applies to a word class" {
     // assumes word chars); `\b` cannot bracket '.', so there is no match.
     try std.testing.expect(!try isM(a, "(\\b[.]+\\b) \\1", ". ."));
 }
+
+// `(?i)` backreferences compare ASCII-case-insensitively (PCRE/Perl): the
+// reference matches the group's text in any case, following the `(?i)` mode
+// active AT the backref. Both front-ends (runtime tree backtracker + `dup_word`
+// fast path; comptime `Pattern`). Previously a silent no-match.
+fn ciBackref(comptime p: []const u8, in: []const u8, want: ?[]const u8) !void {
+    const a = std.testing.allocator;
+    var rx = try Regex.compile(a, p);
+    defer rx.deinit();
+    var m = try rx.find(in);
+    defer if (m) |*x| x.deinit(a);
+    try std.testing.expectEqual(want == null, m == null);
+    if (want) |w| try std.testing.expectEqualStrings(w, m.?.slice);
+    const P = regex.Pattern(p, .{});
+    const pm = P.find(in);
+    try std.testing.expectEqual(want == null, pm == null);
+    if (want) |w| try std.testing.expectEqualStrings(w, in[pm.?.start..pm.?.end]);
+}
+
+test "backref: (?i) backreferences match the group text in any case" {
+    try ciBackref("(?i)(a)\\1", "aA", "aA");
+    try ciBackref("(?i)(ab)\\1", "abAB", "abAB");
+    try ciBackref("(?i)(\\w+) \\1", "Hello hello", "Hello hello");
+    try ciBackref("(?i)(\\b[A-Za-z]+\\b) \\1", "say The the end", "The the"); // dup_word
+    try ciBackref("(?i)(?<w>\\w+)=\\k<w>", "Key=KEY", "Key=KEY"); // named
+    try ciBackref("(a)(?i)\\1", "aA", "aA"); // (?i) active at the backref
+    // Controls: case-sensitive backrefs stay exact.
+    try ciBackref("(a)\\1", "aA", null);
+    try ciBackref("(\\b[A-Za-z]+\\b) \\1", "The the", null);
+    try ciBackref("(?i:(a))\\1", "aA", null); // (?i) scoped to the group only
+}

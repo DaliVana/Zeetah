@@ -80,6 +80,21 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
 
+    // Comptime-vs-runtime differential fuzz: every pattern of its generated
+    // corpus is a comptime `Pattern` build (~30 s of extra compile time), so
+    // it is opt-in: `zig build test -Dfuzz-comptime`.
+    if (b.option(bool, "fuzz-comptime", "Also run the comptime-vs-runtime differential fuzz (slow to compile)") orelse false) {
+        const fc = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/fuzz_comptime.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "zeetah", .module = internal_mod }},
+            }),
+        });
+        test_step.dependOn(&b.addRunArtifact(fc).step);
+    }
+
     // Doc-test: compile-and-run the snippets mirrored from README.md /
     // docs/EXAMPLES.md so the documented API (and the Zig allocator idiom the
     // examples show) can never silently rot. Part of `zig build test`, and also

@@ -207,7 +207,8 @@ pub fn build(allocator: std.mem.Allocator, h: *const H) ?*Seek {
     // modsec) keeps the filter, where the dense engine genuinely skips.
     if (properties.nonSelectiveApprox(null, &oh, oh.root)) return null;
 
-    var nfa = thompson.build(null, &oh) catch return null;
+    var nfa = thompson.buildAlloc(allocator, &oh) catch return null;
+    defer nfa.deinit(allocator);
 
     // `$`/`\z`-anchored over-approximation: every real match must end at
     // `input.len`, so a single O(n) REVERSE pass over the relaxation is a sound

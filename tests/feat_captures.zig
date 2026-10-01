@@ -93,6 +93,67 @@ test "captures: repetition keeps the last iteration" {
     try expectCaps(a, "(foo|bar)+", "foobarfoo", "foobarfoo", &.{.{ .s = "foo" }});
 }
 
+test "captures: a group under a counted repetition reports its last iteration" {
+    const a = std.testing.allocator;
+    // Found by `nfa_fuzz`: the `{m,n}` expansion's copies used to drop the
+    // group (a lone group came back with no `groups` at all).
+    var rx = try Regex.compile(a, "(ab){2}");
+    defer rx.deinit();
+    var m = (try rx.captures(a, "abab")).?;
+    defer m.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), m.groups.len);
+    try std.testing.expectEqual(@as(usize, 2), m.groups[1].?.start);
+    try expectCaps(a, "(x)?(ab){2}", "abab", "abab", &.{ .{ .s = null }, .{ .s = "ab" } });
+    try expectCaps(a, "(a|b){1,3}", "ab", "ab", &.{.{ .s = "b" }});
+    // An iteration that skips the group keeps the earlier iteration's span.
+    try expectCaps(a, "(?:(a)|b){2}", "ab", "ab", &.{.{ .s = "a" }});
+    try expectCaps(a, "(?<y>\\d\\d){2}-", "2024-", "2024-", &.{.{ .s = "24" }});
+    // A named backreference inside the repeated atom resolves too.
+    try expectCaps(a, "(?<x>a)\\k<x>{2}", "aaa", "aaa", &.{.{ .s = "a" }});
+    const P = regex.Pattern("(ab){2}", .{});
+    try std.testing.expectEqual(@as(usize, 2), P.captures("abab").?.groups[1].?.start);
+}
+
+test "captures: a counted repetition with no copies keeps its group, null" {
+    const a = std.testing.allocator;
+    // `{0}` leaves no `.cap` node (the engine needs no captures), but the
+    // group still exists: `groups` is whole match + one null group.
+    for ([_][]const u8{ "(a){0}b", "(a){0}", "(a){0,0}b" }) |p| {
+        var rx = try Regex.compile(a, p);
+        defer rx.deinit();
+        var m = (try rx.captures(a, "ab")).?;
+        defer m.deinit(a);
+        try std.testing.expectEqual(@as(usize, 2), m.groups.len);
+        try std.testing.expect(m.groups[0] != null);
+        try std.testing.expect(m.groups[1] == null);
+    }
+    const P = regex.Pattern("(a){0}b", .{});
+    try std.testing.expect(P.captures("ab").?.groups[1] == null);
+}
+
+test "captures: mandatory {m,n} copies before the last carry no groups" {
+    const a = std.testing.allocator;
+    // The last mandatory copy overwrites every slot of a group that always
+    // participates, so the earlier copies drop it — `(a){100}` stays within
+    // the comptime NFA ceiling, as it did before groups were replayed.
+    try std.testing.expect(regex.compilesAtComptime("(a){100}", false, false));
+    const P = regex.Pattern("(a){100}", .{});
+    const in: [100]u8 = @splat('a');
+    try std.testing.expectEqual(@as(usize, 99), P.captures(&in).?.groups[1].?.start);
+    try expectCaps(a, "(a){3}", "aaaa", "aaa", &.{.{ .s = "a" }});
+    try expectCaps(a, "((a)(b)){2}", "abab", "abab", &.{ .{ .s = "ab" }, .{ .s = "a" }, .{ .s = "b" } });
+    try expectCaps(a, "((a){2}){3}", "aaaaaa", "aaaaaa", &.{ .{ .s = "aa" }, .{ .s = "a" } });
+    // Not elided: a group an iteration can skip keeps the earlier iteration's
+    // span, and a backreference reads its own copy's group.
+    try expectCaps(a, "((a)|b){2}", "ab", "ab", &.{ .{ .s = "b" }, .{ .s = "a" } });
+    var rx = try Regex.compile(a, "((a)\\2){2}");
+    defer rx.deinit();
+    var m = (try rx.captures(a, "aaaa")).?;
+    defer m.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), m.groups[1].?.start);
+    try std.testing.expectEqual(@as(usize, 2), m.groups[2].?.start);
+}
+
 test "captures: anchored + non-capturing group" {
     const a = std.testing.allocator;
     try expectCaps(a, "^(a+)$", "aaa", "aaa", &.{.{ .s = "aaa" }});

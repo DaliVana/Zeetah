@@ -217,12 +217,12 @@ test "redos: backref / lookaround compile and are step-budget bounded (.NET mode
 test "quantifier: overflowing / oversized counts rejected cleanly, no leak" {
     const a = std.testing.allocator;
     const bad = [_][]const u8{
-        // Over the {m,n} expansion ceiling (1000). `a{n}` is unrolled into n
-        // node copies (parser.expand), so the ceiling is the by-construction
-        // ReDoS/memory bound — `a{1001}` is the first count past it. Raising it
-        // substantially would need a counted-repetition NFA across every engine
-        // tier and reintroduce a ReDoS surface, so the bound stays.
-        "a{1001}",               "a{20000}",
+        // `a{n}` is unrolled into n node copies (parser.expand). The runtime
+        // accepts counts up to 65535 (PCRE2's maximum) but the unrolled size is
+        // bounded by the HIR node/depth and NFA ceilings, and runs on the
+        // linear engines — so moderate counts (`a{1001}`, `{20,1024}`) compile
+        // while these blow a ceiling (or the count limit) at compile time.
+        "a{20000}",
         "a{100000}",             "(a{1000}){1000}",
         "(ab){50000}",
         // Integer overflow on the count, and inverted min > max: genuine
@@ -287,6 +287,20 @@ test "nesting: deep non-capturing (?: groups hit the parse-depth guard, not the 
     var rx = try Regex.compile(a, sbuf);
     defer rx.deinit();
     try std.testing.expect(try rx.isMatch("a"));
+}
+
+test "nesting: a backtracked loop iterated per input byte hits a guard, not the stack" {
+    const a = std.testing.allocator;
+    // Each iteration of a loop on the tree backtracker stays on the native
+    // stack. Debug frames are several times larger than release ones, so the
+    // frame-count guard alone let a Debug build overflow after ~3 K
+    // iterations; the stack-byte guard reports it in every build mode.
+    const in = try a.alloc(u8, 200_000);
+    defer a.free(in);
+    for (in, 0..) |*c, i| c.* = "ab"[i % 2];
+    var rx = try Regex.compile(a, "(?=a)(?:ab)*(?=x)");
+    defer rx.deinit();
+    try std.testing.expectError(error.MatchBudgetExceeded, rx.find(in));
 }
 
 test "utf8: malformed input bytes do not crash or over-read" {
@@ -403,6 +417,58 @@ test "redos(polynomial): unanchored $-patterns are linear (single-pass reverse f
 // reporting "no match": O(n) now, O(n^2) if the per-position restart returns.
 // Keep this guard linear. See docs/SECURITY_PROBLEMS.md.
 // ============================================================================
+// ============================================================================
+// REGRESSION GUARD — literal-prefix patterns with an unbounded tail.
+//
+// `.lit_prefix` Teddy-locates every occurrence of a ≥3-byte prefix and runs the
+// anchored DFA there; with an unbounded tail (`abc.*z`, `abc[a-y]*z`) each
+// failing candidate scans to the end of its run ⇒ O(occurrences × n) on a
+// prefix-dense haystack. A required byte (`z`) absent — or present only BEFORE
+// the prefixes — is caught by the positional necessary-byte check in
+// `search.litPrefixFind`; the hard case plants it AFTER every prefix, behind a
+// byte the tail cannot cross (`\n` for `.`, `-` for `[a-y]`), so every
+// candidate scans to the blocker and fails. The fix (`Regex.litPrefixMetered`)
+// keeps the Teddy-locate + anchored-DFA fast path but METERS the bytes failed
+// candidates scan (`PackedDfa.runFromStop` reports where the walk died — no
+// second pass); once the waste exceeds 4× the progress made + 1 KiB, the rest
+// of that search runs on the attached single-pass engine (dense/lazy DFA: one
+// forward pass, no restarts). Waste per `nextSpanFrom` call is bounded by a
+// constant multiple of its progress, so a whole `count`/`findAll` is
+// O(n + matches) — linear, not the bare restart's O(occurrences × n). Keep
+// this guard linear.
+// ============================================================================
+test "redos(polynomial): unbounded literal-prefix patterns are linear" {
+    const a = std.testing.allocator;
+    const Case = struct { pat: []const u8, lead: []const u8, tail: []const u8 };
+    const cases = [_]Case{
+        .{ .pat = "abc.*z", .lead = "", .tail = "" }, // required byte absent
+        .{ .pat = "abc.*z", .lead = "z", .tail = "" }, // only before the prefixes
+        .{ .pat = "abc.*z", .lead = "", .tail = "\nz" }, // after, behind a blocker
+        .{ .pat = "abc[a-y]*z", .lead = "", .tail = "-z" },
+    };
+    var offenders: usize = 0;
+    for (cases) |c| {
+        var rx = try Regex.compile(a, c.pat);
+        defer rx.deinit();
+        var ts: [2]u64 = undefined;
+        for ([_]usize{ 4_000, 16_000 }, 0..) |reps, k| {
+            const buf = try a.alloc(u8, c.lead.len + 3 * reps + c.tail.len);
+            defer a.free(buf);
+            @memcpy(buf[0..c.lead.len], c.lead);
+            for (0..reps) |i| @memcpy(buf[c.lead.len + 3 * i ..][0..3], "abc");
+            @memcpy(buf[c.lead.len + 3 * reps ..], c.tail);
+            const t0 = monotonicNs();
+            _ = try rx.count(buf);
+            ts[k] = monotonicNs() - t0;
+        }
+        if (ts[1] >= ts[0] * 8 + 20_000_000) {
+            offenders += 1;
+            std.debug.print("  REGRESSED to O(n^2) ReDoS: \"{s}\" lead=\"{s}\" — t(4k)={d}ns t(16k)={d}ns\n", .{ c.pat, c.lead, ts[0], ts[1] });
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), offenders);
+}
+
 test "redos(polynomial): multiline $ and \\Z end anchors are linear (reverse end-anchored fix)" {
     const a = std.testing.allocator;
     const patterns = [_][]const u8{
@@ -608,6 +674,45 @@ test "fuzz: arbitrary short patterns never crash the compiler" {
         } else |e| {
             // Any typed RegexError is acceptable; the point is no panic.
             std.mem.doNotOptimizeAway(e);
+        }
+    }
+}
+
+// ============================================================================
+// Deep-but-legal HIR shapes near the runtime depth ceiling
+// (`hir.MAX_DEPTH_RUNTIME`): the recursive analyses (literal extraction,
+// properties), the NFA lowering and the cloner must stay within the native
+// stack for every shape the parser admits — wide alternations (a dictionary),
+// long literal runs, deep optional nests (`{m,n}` expansion). Runs in Debug
+// (large frames) as part of the suite. Each pattern must compile (or be
+// rejected with a typed error) and answer a search — never crash.
+// ============================================================================
+test "deep HIR shapes near the depth ceiling compile and search without stack overflow" {
+    const a = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    const Shape = enum { dictionary, long_literal, deep_optional, group_chain };
+    for ([_]Shape{ .dictionary, .long_literal, .deep_optional, .group_chain }) |shape| {
+        buf.clearRetainingCapacity();
+        switch (shape) {
+            // 3000 alternatives of 6-letter words: a 3000-deep `alt` spine.
+            .dictionary => for (0..3000) |i| {
+                if (i > 0) try buf.append(a, '|');
+                for (0..6) |k| try buf.append(a, @intCast('a' + (i * 7 + k * 3) % 26));
+            },
+            // One 3500-byte literal: a 3500-deep `concat` spine.
+            .long_literal => for (0..3500) |i| try buf.append(a, @intCast('a' + i % 26)),
+            // `{1,1900}` unrolls into nested optionals.
+            .deep_optional => try buf.appendSlice(a, "x[0-9a-f]{1,1900}y"),
+            // 1500 concatenated capture-free groups.
+            .group_chain => for (0..1500) |_| try buf.appendSlice(a, "(?:ab)"),
+        }
+        if (Regex.compile(a, buf.items)) |r| {
+            var rx = r;
+            defer rx.deinit();
+            _ = try rx.isMatch("zz abcabc xyz 0123 xffy ababab");
+        } else |e| {
+            try std.testing.expect(isContractError(e));
         }
     }
 }

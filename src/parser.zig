@@ -114,7 +114,11 @@ fn classToSet(cc: common.CharClass) [32]u8 {
     return s;
 }
 
-const MAX_REPEAT: usize = 1000; // `{m,n}` expansion cap (bigger => fallback);
+const MAX_REPEAT: usize = 1000; // comptime `{m,n}` expansion cap (bigger => fallback);
+// Runtime cap (PCRE2's quantifier maximum): the runtime HIR node ceiling
+// (`hir.MAX_NODES_RUNTIME`) is what actually bounds an expansion's size, so the
+// count itself may be as large as real patterns use (`{20,1024}`).
+const MAX_REPEAT_RUNTIME: usize = 65535;
 // the `hir.MAX_NODES` ceiling still bounds total expansion (oversized products
 // like `(a{1000}){1000}` route to `Error.TooComplex` → `PatternTooComplex`).
 const MAX_RANGES: usize = 64; // ranges per `[...]`
@@ -285,9 +289,11 @@ pub fn parse(
 /// re-implemented the grammar a second time and could drift from it. `out_ng.*`
 /// = the number of capturing groups (group 0 = whole match, so user groups are
 /// 1..N); `out_gnames.*[g]` = group `g`'s `(?<name>)` name, else `null`. Groups
-/// inside a lookaround, `(?:`/`(?>`, and a `{m,n}` re-parse's repeated copies are
-/// non-capturing and excluded (see `openGroup`/`lookAround`), so this matches the
-/// `.cap` nodes the parser emits by construction. The name slices alias `src`, so
+/// inside a lookaround and `(?:`/`(?>` are non-capturing and excluded (see
+/// `openGroup`/`lookAround`); a `{m,n}` expansion's copies reuse the numbers of
+/// the atom they repeat (see `expand`), so N counts the source's capturing
+/// parens. A group with no `.cap` node left (`(a){0}`) never participates. The
+/// name slices alias `src`, so
 /// a caller that outlives the parse (the runtime `Regex`) must pass a buffer it
 /// keeps alive (the owned pattern), not a transient input.
 pub fn parseCaptures(
@@ -297,7 +303,7 @@ pub fn parseCaptures(
     src: []const u8,
     flags: ParseFlags,
     out_ng: *usize,
-    out_gnames: *[hir.MAX_GROUPS + 1]?[]const u8,
+    out_gnames: *[hir.groupsCap(cap) + 1]?[]const u8,
 ) Error!void {
     return parseInner(cap, h, allocator, src, flags, out_ng, out_gnames);
 }
@@ -309,7 +315,7 @@ fn parseInner(
     src: []const u8,
     flags: ParseFlags,
     out_ng: ?*usize,
-    out_gnames: ?*[hir.MAX_GROUPS + 1]?[]const u8,
+    out_gnames: ?*[hir.groupsCap(cap) + 1]?[]const u8,
 ) Error!void {
     if (src.len == 0) return Error.Unsupported;
 
@@ -355,8 +361,8 @@ fn parseInner(
 
     // Reject a numeric backreference to a group that does not exist anywhere in
     // the pattern (`(a)\2`, `\1` with no groups). Validated post-parse against
-    // the final group count so forward refs to a group that *does* exist (and
-    // `\1{2}`, whose re-parse sub-parser sees `n_groups == 0`) stay valid.
+    // the final group count so forward refs to a group that *does* exist
+    // (`\1(a)`) stay valid.
     // Without this the backtracker reads an uninitialized capture slot. Named
     // backrefs are already validated at parse time via `lookupName`.
     if (p.max_backref > p.n_groups) return Error.Invalid;
@@ -369,6 +375,11 @@ fn parseInner(
     // end-anchor (`accept_at = len`) independently and correctly.
     h.root = root;
     h.saw_lazy = p.saw_lazy;
+    // Runtime store: bound the tree depth for the recursive walks downstream
+    // (the comptime store's node ceiling already bounds it).
+    if (cap == null) {
+        if (try h.tooDeep(allocator, hir.MAX_DEPTH_RUNTIME)) return Error.TooComplex;
+    }
 
     // Single-source-of-truth capture numbering: hand back the parser's
     // authoritative group count + `(?<name>)` names (already excludes groups
@@ -376,7 +387,7 @@ fn parseInner(
     // the standalone `scanGroups` byte-scanner used to recompute independently.
     if (out_ng) |p_ng| p_ng.* = p.n_groups;
     if (out_gnames) |g| {
-        g.* = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1);
+        g.* = [_]?[]const u8{null} ** (hir.groupsCap(cap) + 1);
         var k: usize = 0;
         while (k < p.n_names) : (k += 1) g.*[p.name_g[k]] = p.names[k];
     }
@@ -386,6 +397,10 @@ fn Parser(comptime cap: ?usize) type {
     return struct {
         const Self = @This();
         const H = hir.Hir(cap);
+        /// Per-store ceilings: the runtime heap store gets the larger runtime
+        /// group count and repeat bound (see `hir.groupsCap`, `MAX_REPEAT_RUNTIME`).
+        const GROUPS = hir.groupsCap(cap);
+        const REPEAT = if (cap == null) MAX_REPEAT_RUNTIME else MAX_REPEAT;
 
         pat: []const u8,
         i: usize = 0,
@@ -403,8 +418,14 @@ fn Parser(comptime cap: ?usize) type {
         /// name→index is re-derived in regex.zig).
         n_groups: usize = 0,
         capturing: bool = true,
-        names: [hir.MAX_GROUPS][]const u8 = undefined,
-        name_g: [hir.MAX_GROUPS]u32 = undefined,
+        /// A `{m,n}` re-parse copy (`buildAtom`): groups replay the numbers
+        /// the original atom already reserved instead of opening new ones.
+        replay: bool = false,
+        /// A replay copy whose groups are all overwritten by a later mandatory
+        /// copy (see `expand`): its groups parse as non-capturing.
+        elide: bool = false,
+        names: [GROUPS][]const u8 = undefined,
+        name_g: [GROUPS]u32 = undefined,
         n_names: usize = 0,
         /// Recursive-descent nesting depth (one level per group body), guarded
         /// against stack overflow in `parseAlt`. See `MAX_PARSE_DEPTH`.
@@ -428,11 +449,18 @@ fn Parser(comptime cap: ?usize) type {
         /// is numbered in opening-paren order (standard). The final `p.n_groups`
         /// + recorded names are handed back by `parseCaptures` (the single source
         /// of truth for capture numbering). Returns 0 for a non-capturing context
-        /// (a `{m,n}` re-parse: repeated copies must not mis-number — that atom's
-        /// captures are simply not reported, a documented Phase-D limitation).
+        /// (inside a lookaround). In a `{m,n}` re-parse copy (`replay`) it hands
+        /// out the original atom's numbers again — every copy writes the same
+        /// slots, so the last participating repetition is reported — or 0 in an
+        /// `elide` copy.
         fn openGroup(p: *Self, name: ?[]const u8) Error!u32 {
             if (!p.capturing) return 0;
-            if (p.n_groups >= hir.MAX_GROUPS) return Error.TooComplex;
+            if (p.replay) {
+                // Numbered (and named) by the original atom's parse already.
+                p.n_groups += 1;
+                return if (p.elide) 0 else @intCast(p.n_groups);
+            }
+            if (p.n_groups >= GROUPS) return Error.TooComplex;
             p.n_groups += 1;
             if (name) |nm| {
                 if (nm.len == 0) return Error.Invalid;
@@ -483,16 +511,16 @@ fn Parser(comptime cap: ?usize) type {
                 if (ch < '0' or ch > '9') break;
                 g = g * 10 + (ch - '0');
                 p.i += 1;
-                if (g > hir.MAX_GROUPS) return Error.Invalid;
+                if (g > GROUPS) return Error.Invalid;
             }
             if (g == 0) return Error.Invalid;
             // Record the highest referenced group for a post-parse validation
             // (see `parse`). An at-site `g > n_groups` check would wrongly reject
-            // `\1{2}` (the `{m,n}` re-parse sub-parser has `n_groups == 0`); the
-            // post-parse check against the final group count is correct and also
-            // covers backrefs inside lookarounds.
+            // a forward reference (`\1(a)`); the post-parse check against the
+            // final group count is correct and also covers backrefs inside
+            // lookarounds.
             if (g > p.max_backref) p.max_backref = g;
-            return p.node(.{ .tag = .backref, .set_idx = g });
+            return p.node(.{ .tag = .backref, .set_idx = g, .fold = p.ci });
         }
 
         fn parseNamedBackref(p: *Self) Error!NodeRef {
@@ -507,7 +535,7 @@ fn Parser(comptime cap: ?usize) type {
             const nm = p.pat[s..p.i];
             p.i += 1;
             const g = p.lookupName(nm) orelse return Error.Invalid;
-            return p.node(.{ .tag = .backref, .set_idx = g });
+            return p.node(.{ .tag = .backref, .set_idx = g, .fold = p.ci });
         }
 
         /// `\xHH` (up to two hex digits; `\x` alone ⇒ NUL, like PCRE) or
@@ -671,6 +699,7 @@ fn Parser(comptime cap: ?usize) type {
 
         fn parseRepeat(p: *Self) Error!NodeRef {
             const atom_start = p.i;
+            const groups_before = p.n_groups;
             var f = try p.parsePrimary();
             const atom_src = p.pat[atom_start..p.i];
 
@@ -698,7 +727,8 @@ fn Parser(comptime cap: ?usize) type {
                 '{' => {
                     const br = try p.parseBrace();
                     const q = try p.quantMod();
-                    f = try p.expand(atom_src, br.min, br.max, q != .lazy);
+                    const elidable = p.n_groups > groups_before and p.capsAlwaysWritten(f, true);
+                    f = try p.expand(atom_src, .{ .base = groups_before, .elidable = elidable }, br.min, br.max, q != .lazy);
                     if (q == .possessive) f = try p.atomicWrap(f);
                 },
                 else => return f,
@@ -747,7 +777,7 @@ fn Parser(comptime cap: ?usize) type {
                 min = min * 10 + (d - '0');
                 saw_min = true;
                 p.i += 1;
-                if (min > MAX_REPEAT) return Error.Unsupported;
+                if (min > REPEAT) return Error.Unsupported;
             }
             if (!saw_min) return Error.Invalid;
             var max: ?usize = min;
@@ -760,7 +790,7 @@ fn Parser(comptime cap: ?usize) type {
                             if (d < '0' or d > '9') break;
                             mx = mx * 10 + (d - '0');
                             p.i += 1;
-                            if (mx > MAX_REPEAT) return Error.Unsupported;
+                            if (mx > REPEAT) return Error.Unsupported;
                         }
                         max = mx;
                     } else max = null; // {m,}
@@ -774,9 +804,36 @@ fn Parser(comptime cap: ?usize) type {
             return .{ .min = min, .max = max };
         }
 
+        /// The `{m,n}` atom's groups: the numbers it reserved start after
+        /// `base`; `elidable` ⇔ `capsAlwaysWritten` held for its parse.
+        const AtomGroups = struct { base: usize, elidable: bool };
+
+        /// Does every match of `ref` write every capture group under it, and is
+        /// it free of backreferences? (`mandatory`: is `ref` itself on every
+        /// path.) Then in a `{m,n}` expansion a copy followed by a mandatory
+        /// copy needs no `.cap` nodes: the later copy overwrites each slot it
+        /// would write, and nothing inside reads them.
+        fn capsAlwaysWritten(p: *const Self, ref: NodeRef, mandatory: bool) bool {
+            const nd = p.h.node(ref);
+            return switch (nd.tag) {
+                .empty, .set, .look => true,
+                .backref => false,
+                .cap => mandatory and p.capsAlwaysWritten(nd.a, true),
+                .concat => p.capsAlwaysWritten(nd.a, mandatory) and p.capsAlwaysWritten(nd.b, mandatory),
+                // A `+` runs its body at least once; an atomic group once.
+                .plus, .atomic => p.capsAlwaysWritten(nd.a, mandatory),
+                .alt => p.capsAlwaysWritten(nd.a, false) and p.capsAlwaysWritten(nd.b, false),
+                .opt, .star, .look_around => p.capsAlwaysWritten(nd.a, false),
+            };
+        }
+
         /// Re-parse the atom source into a fresh subtree (mirrors the old
         /// `buildAtom`, which re-parsed per repetition into fresh NFA states).
-        fn buildAtom(p: *Self, src: []const u8) Error!NodeRef {
+        /// Its groups replay the numbers the original atom reserved (starting
+        /// after `groups.base`) — or capture nothing when `elide` — and it
+        /// sees the names declared so far, so a `\k<name>` inside the atom
+        /// resolves.
+        fn buildAtom(p: *Self, src: []const u8, groups: AtomGroups, elide: bool) Error!NodeRef {
             var sub = Self{
                 .pat = src,
                 .h = p.h,
@@ -785,10 +842,20 @@ fn Parser(comptime cap: ?usize) type {
                 .dot_all = p.dot_all,
                 .extended = p.extended,
                 .multiline = p.multiline,
-                .capturing = false,
+                .capturing = p.capturing,
+                .replay = true,
+                .elide = p.elide or elide,
+                .n_groups = groups.base,
+                .n_names = p.n_names,
             };
+            // Only the used prefix: a copy is made per repetition (up to
+            // `MAX_REPEAT_RUNTIME` of them), so never the whole name tables.
+            @memcpy(sub.names[0..p.n_names], p.names[0..p.n_names]);
+            @memcpy(sub.name_g[0..p.n_names], p.name_g[0..p.n_names]);
             const f = try sub.parsePrimary();
             if (sub.i != src.len) return Error.Invalid;
+            // Same source, same numbering as the original parse of this atom.
+            std.debug.assert(sub.n_groups == p.n_groups);
             if (sub.saw_lazy) p.saw_lazy = true;
             return f;
         }
@@ -808,34 +875,37 @@ fn Parser(comptime cap: ?usize) type {
 
         /// `{m,n}` expansion — structurally identical to the old `expand`
         /// (one freshly-parsed atom copy per repetition; same opt/star tail).
-        fn expand(p: *Self, src: []const u8, min: usize, max: ?usize, greedy: bool) Error!NodeRef {
-            if (min == 0 and max == null) return p.star(try p.buildAtom(src), greedy);
-            if (min == 1 and max == null) return p.plus(try p.buildAtom(src), greedy);
+        /// The mandatory copies before the last one are `elide` copies when
+        /// the atom allows it (`groups.elidable`): the last mandatory copy
+        /// overwrites their slots, so `(a){100}` carries one group, not 100.
+        fn expand(p: *Self, src: []const u8, groups: AtomGroups, min: usize, max: ?usize, greedy: bool) Error!NodeRef {
+            if (min == 0 and max == null) return p.star(try p.buildAtom(src, groups, false), greedy);
+            if (min == 1 and max == null) return p.plus(try p.buildAtom(src, groups, false), greedy);
             if (min == 0) {
                 const mx = max.?;
                 if (mx == 0) return p.emptyLeaf();
-                var cur = try p.opt(try p.buildAtom(src), greedy);
+                var cur = try p.opt(try p.buildAtom(src, groups, false), greedy);
                 var k: usize = 1;
                 while (k < mx) : (k += 1) {
-                    const o = try p.opt(try p.buildAtom(src), greedy);
+                    const o = try p.opt(try p.buildAtom(src, groups, false), greedy);
                     cur = try p.concat(cur, o);
                 }
                 return cur;
             }
-            var cur = try p.buildAtom(src);
+            var cur = try p.buildAtom(src, groups, groups.elidable and min > 1);
             var k: usize = 1;
             while (k < min) : (k += 1) {
-                const nx = try p.buildAtom(src);
+                const nx = try p.buildAtom(src, groups, groups.elidable and k + 1 < min);
                 cur = try p.concat(cur, nx);
             }
             if (max) |mx| {
                 var d: usize = 0;
                 while (d < mx - min) : (d += 1) {
-                    const o = try p.opt(try p.buildAtom(src), greedy);
+                    const o = try p.opt(try p.buildAtom(src, groups, false), greedy);
                     cur = try p.concat(cur, o);
                 }
             } else {
-                const st = try p.star(try p.buildAtom(src), greedy);
+                const st = try p.star(try p.buildAtom(src, groups, false), greedy);
                 cur = try p.concat(cur, st);
             }
             return cur;

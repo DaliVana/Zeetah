@@ -54,6 +54,9 @@ pub const Cache = @import("cache.zig").Cache;
 pub const Pool = @import("cache.zig").Pool;
 pub const lazy_dfa = @import("exec/lazy_dfa.zig");
 pub const bounded_bt = @import("exec/bounded_bt.zig");
+pub const pikevm = @import("exec/pikevm.zig");
+pub const nfa_index = @import("exec/nfa_index.zig");
+pub const nfa_fuzz = @import("exec/nfa_fuzz.zig");
 pub const onepass = @import("exec/onepass.zig");
 
 // Single source of truth: the public `version` in root.zig (kept in lockstep

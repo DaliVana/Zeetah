@@ -256,6 +256,21 @@ fn smallClassSet(comptime cap: ?usize, h: *const hir.Hir(cap), set_idx: u32) ?Li
 /// backref, or an overflow of the `MAX_ALTS`/`MAX_LIT` budget).
 fn expandNode(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) ?LitSet {
     const nd = h.node(ref);
+    // Budget pre-check before recursing (each frame carries LitSets, ~KBs): a
+    // left-leaning `alt` spine of more than `MAX_ALTS` branches, or a `concat`
+    // spine deeper than `MAX_LIT` factors, cannot fit the budget — answer null
+    // without descending (a 2 600-word dictionary is a 2 600-deep `alt` spine,
+    // a long literal an equally deep `concat` one). Null only forgoes the
+    // literal optimization, so this is always sound.
+    if (nd.tag == .alt or nd.tag == .concat) {
+        const limit: usize = if (nd.tag == .alt) MAX_ALTS else MAX_LIT;
+        var depth: usize = 1;
+        var r = nd.a;
+        while (h.node(r).tag == nd.tag) : (r = h.node(r).a) {
+            depth += 1;
+            if (depth > limit) return null;
+        }
+    }
     switch (nd.tag) {
         .empty => return litEmpty(),
         .set => return if (singleByte(cap, h, nd.set_idx)) |b|

@@ -54,6 +54,22 @@ test "anchors + quantifier: ^a+$" {
     try std.testing.expect(try isM(a, "^a*$", ""));
 }
 
+test "^: a folded start anchor never re-anchors past offset 0" {
+    const a = std.testing.allocator;
+    // Found by `nfa_fuzz`: the backtracker's seek prefilter jumped the first
+    // attempt past offset 0, and the comptime backtrack arm re-anchored at
+    // every resume point of an iteration.
+    try std.testing.expect(!(try isM(a, "^(?<=b)", ",aa aA\nbaAa")));
+    var rx = try Regex.compile(a, "^(?!x)");
+    defer rx.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try rx.count("ab"));
+    const P = regex.Pattern("^(?!x)", .{});
+    try std.testing.expectEqual(@as(usize, 1), P.count("ab"));
+    try std.testing.expect(P.capturesFrom("ab", 1) == null);
+    const Q = regex.Pattern("^(?<=b)", .{});
+    try std.testing.expect(!Q.isMatch(",aa aA\nbaAa"));
+}
+
 test "\\A and \\z behave as absolute start / end anchors" {
     const a = std.testing.allocator;
     const m = (try span(a, "\\Aabc", "abcdef")).?;

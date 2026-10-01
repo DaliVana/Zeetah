@@ -1206,45 +1206,75 @@ test "aho-corasick: rejects degenerate needles" {
 /// (a position whose byte begins no literal costs one array probe), O(n·maxlen)
 /// worst case. Heap, freed by `deinit`.
 pub const LiteralAltScanner = struct {
-    /// goto[node*256 + byte] -> child node id (0 = none; root is node 0 and is
-    /// never a goto target, so 0 unambiguously means "no edge").
+    /// Byte → trie column: 0 = the byte occurs in no literal (no edge from any
+    /// node), else 1..width-1. Rows are only as wide as the literals' alphabet.
+    class_of: [256]u16,
+    /// Row width = 1 + number of distinct bytes across all literals.
+    width: usize,
+    /// goto[node*width + class] -> child node id (0 = none; root is node 0 and
+    /// is never a goto target, so 0 unambiguously means "no edge").
     goto: []u32,
     /// out_idx[node] = source index of the literal ending at this node, or NONE.
     out_idx: []u32,
     n_nodes: usize,
 
     pub const NONE: u32 = std.math.maxInt(u32);
-    /// Node-id ceiling. Bounds the dense table to ≈`NODE_LIMIT`·1 KiB; a literal
-    /// set whose trie exceeds it returns null from `build` (the caller falls
-    /// back to the existing `PatternTooComplex`, never a wrong or huge build).
-    pub const NODE_LIMIT: usize = 1 << 19;
+    /// Byte ceiling for the trie tables (`goto` + `out_idx`), enforced BEFORE
+    /// every growth — the tables never hold more than this, so a large pattern
+    /// cannot amplify into an unbounded allocation (formerly a fixed node cap of
+    /// 2^19 × 1 KiB dense rows ≈ 512 MiB, reachable from `Regex.compile`). A
+    /// literal set whose trie would exceed it returns null (the caller falls
+    /// back to `PatternTooComplex`). With byte-class rows the full 123 K-word
+    /// English dictionary (281 K nodes, ~60-byte alphabet) fits in ~70 MiB ⇒
+    /// ~20 K-node lists like rebar's `dictionary/length-15` use ~5 MiB.
+    pub const MEM_LIMIT: usize = 64 << 20;
 
     pub const Span = struct { start: usize, end: usize };
 
     /// Build the trie from `needles` in source (priority) order. Returns null on
-    /// an empty needle or if the node ceiling would be exceeded.
+    /// an empty needle or if the tables would exceed `MEM_LIMIT`.
     pub fn build(allocator: std.mem.Allocator, needles: []const []const u8) !?LiteralAltScanner {
-        const ZEROS = [_]u32{0} ** 256;
-        var goto_l: std.ArrayList(u32) = .empty;
-        errdefer goto_l.deinit(allocator);
-        var out_l: std.ArrayList(u32) = .empty;
-        errdefer out_l.deinit(allocator);
-        // Node 0 = root.
-        try goto_l.appendSlice(allocator, &ZEROS);
-        try out_l.append(allocator, NONE);
+        return buildLimited(allocator, needles, MEM_LIMIT);
+    }
 
-        for (needles, 0..) |nd, idx| {
+    /// `build` with an explicit table byte ceiling (tests use a small one).
+    pub fn buildLimited(allocator: std.mem.Allocator, needles: []const []const u8, mem_limit: usize) !?LiteralAltScanner {
+        var class_of = [_]u16{0} ** 256;
+        var width: usize = 1;
+        for (needles) |nd| {
             if (nd.len == 0) return null;
-            var node: u32 = 0;
+            for (nd) |b| if (class_of[b] == 0) {
+                class_of[b] = @intCast(width);
+                width += 1;
+            };
+        }
+        const node_bytes = width * @sizeOf(u32) + @sizeOf(u32); // one row + its out_idx
+        const max_nodes = mem_limit / node_bytes;
+        if (max_nodes == 0) return null;
+
+        var goto_l: std.ArrayList(u32) = .empty;
+        var out_l: std.ArrayList(u32) = .empty;
+        // Success-guarded cleanup: frees on BOTH error returns and the `null`
+        // (successful) returns below — an `errdefer` alone never runs for the
+        // latter, which leaked everything built so far.
+        var built = false;
+        defer if (!built) {
+            goto_l.deinit(allocator);
+            out_l.deinit(allocator);
+        };
+
+        var n_nodes: usize = 0;
+        try addNode(allocator, &goto_l, &out_l, width, max_nodes, &n_nodes); // root
+        for (needles, 0..) |nd, idx| {
+            var node: usize = 0;
             for (nd) |b| {
-                const slot = node * 256 + b;
+                const slot = node * width + class_of[b];
                 if (goto_l.items[slot] == 0) {
-                    const nid = out_l.items.len; // == goto_l.items.len / 256
-                    if (nid >= NODE_LIMIT) return null;
-                    try goto_l.appendSlice(allocator, &ZEROS);
-                    try out_l.append(allocator, NONE);
+                    if (n_nodes >= max_nodes) return null;
+                    const nid = n_nodes;
+                    try addNode(allocator, &goto_l, &out_l, width, max_nodes, &n_nodes);
                     goto_l.items[slot] = @intCast(nid);
-                    node = @intCast(nid);
+                    node = nid;
                 } else {
                     node = goto_l.items[slot];
                 }
@@ -1256,24 +1286,52 @@ pub const LiteralAltScanner = struct {
             }
         }
 
-        const n_nodes = out_l.items.len;
+        const goto = try goto_l.toOwnedSlice(allocator);
+        errdefer allocator.free(goto);
+        const out_idx = try out_l.toOwnedSlice(allocator);
+        built = true;
         return LiteralAltScanner{
-            .goto = try goto_l.toOwnedSlice(allocator),
-            .out_idx = try out_l.toOwnedSlice(allocator),
+            .class_of = class_of,
+            .width = width,
+            .goto = goto,
+            .out_idx = out_idx,
             .n_nodes = n_nodes,
         };
+    }
+
+    /// Append one empty trie node, growing the tables geometrically but never
+    /// past `max_nodes` rows (so capacity, not just length, honours the byte
+    /// ceiling).
+    fn addNode(
+        allocator: std.mem.Allocator,
+        goto_l: *std.ArrayList(u32),
+        out_l: *std.ArrayList(u32),
+        width: usize,
+        max_nodes: usize,
+        n_nodes: *usize,
+    ) !void {
+        if (out_l.items.len == out_l.capacity) {
+            const want = @min(max_nodes, @max(64, out_l.capacity * 2));
+            try out_l.ensureTotalCapacityPrecise(allocator, want);
+            try goto_l.ensureTotalCapacityPrecise(allocator, want * width);
+        }
+        goto_l.appendNTimesAssumeCapacity(0, width);
+        out_l.appendAssumeCapacity(NONE);
+        n_nodes.* += 1;
     }
 
     /// Leftmost-first match length of the alternation at exactly `p`, or null.
     /// Walks the trie collecting every literal that is a prefix of `input[p..]`
     /// (they form a chain) and returns the length of the earliest-listed one.
     inline fn matchAt(self: *const LiteralAltScanner, input: []const u8, p: usize) ?usize {
-        var node: u32 = 0;
+        var node: usize = 0;
         var best_idx: u32 = NONE;
         var best_len: usize = 0;
         var k: usize = 0;
         while (p + k < input.len) {
-            const c = self.goto[node * 256 + input[p + k]];
+            const cls = self.class_of[input[p + k]];
+            if (cls == 0) break; // byte in no literal
+            const c = self.goto[node * self.width + cls];
             if (c == 0) break;
             node = c;
             k += 1;
@@ -1304,6 +1362,27 @@ pub const LiteralAltScanner = struct {
         allocator.free(self.out_idx);
     }
 };
+
+test "literal-alt scanner: null builds free everything; the byte budget bounds the tables" {
+    const a = std.testing.allocator; // fails the test on any leak
+    // An empty literal ⇒ null (after the class pass; nothing may leak).
+    try std.testing.expect((try LiteralAltScanner.build(a, &[_][]const u8{ "ab", "" })) == null);
+    // Over the byte budget ⇒ null mid-build, with the partial trie freed. 64
+    // distinct 8-byte literals over a 16-byte alphabet need ~450 nodes × 68 B.
+    var words: [64][8]u8 = undefined;
+    var ptrs: [64][]const u8 = undefined;
+    for (&words, 0..) |*w, i| {
+        for (w, 0..) |*c, k| c.* = 'a' + @as(u8, @intCast((i * 7 + k * 3) % 16));
+        ptrs[i] = w;
+    }
+    try std.testing.expect((try LiteralAltScanner.buildLimited(a, &ptrs, 4096)) == null);
+    // The same set within budget builds, and its tables respect the budget.
+    var ok = (try LiteralAltScanner.buildLimited(a, &ptrs, 1 << 20)).?;
+    defer ok.deinit(a);
+    try std.testing.expect((ok.goto.len + ok.out_idx.len) * @sizeOf(u32) <= 1 << 20);
+    try std.testing.expectEqual(@as(usize, 17), ok.width); // 16 letters + "no edge"
+    try std.testing.expectEqual(@as(usize, 0), ok.find(&words[5], 0).?.start);
+}
 
 test "literal-alt scanner: leftmost-first over prefixes and substrings" {
     const a = std.testing.allocator;
