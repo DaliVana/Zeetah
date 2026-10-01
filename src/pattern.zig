@@ -295,7 +295,7 @@ const Built = struct {
     /// lookaround are non-capturing, so they are neither counted nor named).
     n_groups: usize = 0,
     gnames: [hir.MAX_GROUPS + 1]?[]const u8 = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1),
-    /// `.edge_look` arm: verify spec for the peeled trailing width-1 look.
+    /// `.edge_look` arm: walk config for the peeled trailing width-1 look.
     /// `dfa` holds the regular core's DFA; this is the O(1) edge check.
     el_spec: edge_look.Spec = .{ .set = [_]u8{0} ** 32, .behind = false, .neg = false },
     /// `.boundary_lits` arm: the `\b(?:lit|…)\b` literal set. Comptime-only —
@@ -517,18 +517,18 @@ fn delegateIslands(comptime cap: ?usize, h: *const hir.Hir(cap)) DelegateBake {
 const GroupNames = [hir.MAX_GROUPS + 1]?[]const u8;
 
 /// `.edge_look`: `concat(regular_greedy_core, trailing_width1_look)` bakes the
-/// core's DFA + an O(1) edge verify instead of the comptime tree backtracker
+/// core's DFA with the look folded in instead of the comptime tree backtracker
 /// (comptime peer of the runtime `.dfa_edge_look`). Shares `edge_look.recognize`
-/// with the runtime path. Capture-free; restores `h.root` so the baked `.hir`
+/// / `buildDfa` with the runtime path. Capture-free; restores `h.root` so the baked `.hir`
 /// stays the whole pattern. Caller gates `ng == 0`.
 fn tryEdgeLookBuilt(h: *hir.Hir(HIR_CAP), ng: usize, gnames: GroupNames) ?Built {
-    if (edge_look.recognize(HIR_CAP, h)) |rec| {
+    if (edge_look.recognize(HIR_CAP, h)) |found| {
+        var rec = found;
         const saved_root = h.root;
         h.root = rec.core;
         if (thompson.build(HIR_CAP, h)) |nfa_core| {
-            var nfa_c = nfa_core;
-            var cd = full_dfa.compute(HIR_CAP, &nfa_c, h.anchored_start, false);
-            if (cd.outcome == .ok) {
+            if (edge_look.buildDfa(HIR_CAP, &nfa_core, &rec.spec)) |folded| {
+                var cd = folded;
                 cd.required = seq_extract.requiredByte(HIR_CAP, h);
                 h.root = saved_root;
                 return .{ .dfa = cd, .outcome = .ok, .strat = .edge_look, .el_spec = rec.spec, .hir = h.*, .n_groups = ng, .gnames = gnames };
@@ -920,6 +920,7 @@ fn CaptureSupport(comptime built: Built) type {
     // succeeded (a `.backtrack`-strat HIR with backref/look/atomic would error in
     // `thompson.build` — those are never one-pass, so `op_ok` stays false).
     const op_built: struct { nfa: thompson.Nfa(NN), ok: bool } = comptime blk: {
+        @setEvalBranchQuota(8_000_000); // as `buildAll`: a long `{m,n}` expansion lowers deep
         const n = thompson.build(NN, &baked) catch break :blk .{ .nfa = undefined, .ok = false };
         break :blk .{ .nfa = n, .ok = true };
     };
@@ -1042,6 +1043,9 @@ fn CaptureSupport(comptime built: Built) type {
         /// comptime API can't surface that; the runtime maps it to
         /// `MatchBudgetExceeded`).
         pub fn capturesFrom(input: []const u8, from: usize) ?Caps {
+            // A folded `^`/`\A` only matches at 0 (never re-anchor at a resume
+            // point) — mirrors the runtime `capturesFrom` guard.
+            if (cap_h.anchored_start and from > 0) return null;
             var slots: [2 * (hir.MAX_GROUPS + 1)]hir.Slot = undefined;
             const nslots = 2 * (NG + 1);
             if (comptime built.strat == .line_dfa) {
@@ -1376,6 +1380,10 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             /// `MatchBudgetExceeded`. Pick inputs well under the O(n) budget for
             /// differential parity.
             pub fn nextSpanFrom(input: []const u8, from: usize) ?search.Span {
+                // A folded `^`/`\A` only matches at 0: `runFrom` would try the
+                // resume point once and re-anchor there (`^(?!x)` on "ab"
+                // counted 3) — mirrors the runtime `nextSpanFrom` guard.
+                if (a_start and from > 0) return null;
                 var bt = BT.init(&h, a_start, a_end, n_groups, seekPtr(), delPtr());
                 bt.alt_disp = altDispPtr();
                 if (LINE_SCAN_ENABLED and built.line_anchor) {
@@ -1533,8 +1541,8 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
         };
     }
 
-    // Edge-look peel (comptime peer of runtime `.dfa_edge_look`): bake the core
-    // `Dfa256` + the verify spec and drive the shared `edge_look.nextFrom`.
+    // Edge-look peel (comptime peer of runtime `.dfa_edge_look`): bake the
+    // look-folded DFA + its walk config and drive the shared `edge_look.nextFrom`.
     // Placed before the DFA-state-budget gate so the core table is baked as-is.
     if (built.strat == .edge_look) {
         // Bake the regular core COMPRESSED (`compress`) — `edge_look.nextFrom`

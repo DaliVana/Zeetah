@@ -51,9 +51,30 @@ const Cont = union(enum) {
         ref: NodeRef, // body
         next: *const Cont, // post-loop continuation
         greedy: bool,
-        loop_from: usize, // pos this iteration started at
     },
 };
+
+/// A loop state this path visited at `pos`, linked newest-first through the
+/// native stack frames that visited it. Positions never decrease along a path,
+/// so the visits at the current position are the list's leading run.
+const Seen = struct { key: u32, pos: usize, prev: ?*const Seen };
+
+// The loop states of a `*` / `+` (keyed by its body), mirroring the Thompson
+// construction the NFA engines run (`thompson.lower`): a `*`'s entry split
+// (enter or skip), the body's start, and the loop-back split after each
+// iteration (loop to the body's start, or exit) — three distinct states.
+comptime {
+    std.debug.assert(hir.MAX_NODES_RUNTIME * 4 < std.math.maxInt(u32)); // keys can't overflow
+}
+fn entryKey(body: NodeRef) u32 {
+    return body * 4;
+}
+fn bodyKey(body: NodeRef) u32 {
+    return body * 4 + 1;
+}
+fn loopKey(body: NodeRef) u32 {
+    return body * 4 + 2;
+}
 
 /// The tree backtracker, generic over the HIR store. `cap == null` is the
 /// runtime (heap) HIR; a concrete `cap` is a comptime fixed-size HIR baked by
@@ -88,16 +109,22 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
         /// leading-byte set, so a non-matching line is skipped with a single byte
         /// test before the (dominant-cost) tree walk. `null` ⇒ no filter.
         line_first: ?[32]u8 = null,
+        /// Loop states visited on the current path at its current position
+        /// (see `seenAt`). Saved/restored around each visit, like capture slots.
+        seen: ?*const Seen = null,
         input: []const u8 = &.{},
         slots: [2 * (hir.MAX_GROUPS + 1)]hir.Slot = undefined,
         match_end: usize = 0,
         steps: u64 = 0,
         budget: u64 = 0,
-        /// CPS-recursion depth across `m`/`cont`/`loopStep` (each adds a native
-        /// stack frame). The step `budget` bounds *total work* (anti-ReDoS) but
-        /// not stack depth; this guard surfaces deep recursion as a typed
-        /// `error.Budget` (→ `MatchBudgetExceeded`) instead of a stack overflow.
+        /// CPS-recursion depth across `m`/`cont`/`loopSplit`/`lookAroundMatches`
+        /// (each adds a native stack frame). The step `budget` bounds *total
+        /// work* (anti-ReDoS) but not stack depth; this guard surfaces deep
+        /// recursion as a typed `error.Budget` (→ `MatchBudgetExceeded`)
+        /// instead of a stack overflow.
         depth: u32 = 0,
+        /// Frame address at depth 0 — the base `checkStack` measures from.
+        stack_base: usize = 0,
 
         // `hasBit` / `isWord` / `lookHolds` now live in `charclass.zig` (`cc`).
 
@@ -153,18 +180,52 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
             if (self.steps > self.budget) return Error.Budget;
         }
 
-        /// Each `m`/`cont`/`loopStep` recursion is a native stack frame; ~200 B
-        /// each, typical thread stack 8 MB ⇒ ~40 K-deep before overflow. 16 K
-        /// leaves comfortable headroom and is far beyond any realistic pattern
+        /// Each counted recursion is a native stack frame — ~530 B each in a
+        /// ReleaseFast build (a `(?:ab)*` loop measured 6.3 MB at depth 11.9 K),
+        /// so 16 K-deep needs ~9 MB. 16 K is far beyond any realistic pattern
         /// (real backtrack work is bounded by `budget` long before this trips).
         const MAX_DEPTH: u32 = 16_384;
+        /// Frame sizes vary (Debug frames are several times larger, and
+        /// `greedySetRun` / `matchAtomic` frames are not counted), so the stack
+        /// actually used is bounded too: ¾ of the 16 MiB a Zig thread gets by
+        /// default (`std.Thread`'s `default_stack_size`, and the main thread of
+        /// a Zig executable), above what `MAX_DEPTH` uses in a release build.
+        /// A caller on a smaller stack (an 8 MB C main thread, a 512 KB macOS
+        /// pthread) should run deep backtracking on a 16 MiB thread.
+        const MAX_STACK_BYTES: usize = 12 << 20;
+        /// Checked every `STACK_CHECK_EVERY` depths (one predictable branch
+        /// per entry); a power of two dividing `MAX_DEPTH`.
+        const STACK_CHECK_EVERY: u32 = 64;
+        comptime {
+            std.debug.assert(MAX_DEPTH % STACK_CHECK_EVERY == 0);
+        }
         inline fn enter(self: *Self) Error!void {
             // Check-first so a refused entry leaves `depth` unchanged — the
             // matching `defer self.depth -= 1` in the caller is only registered
             // after `try self.enter()` succeeds, keeping the counter balanced
             // across re-uses of this `Backtracker`.
-            if (self.depth >= MAX_DEPTH) return Error.Budget;
+            if (self.depth % STACK_CHECK_EVERY == 0) {
+                // Cold, out of line: inlined into every `m`/`cont` frame it
+                // cost the tokenizer bench ~3% (measured).
+                @branchHint(.unlikely);
+                try self.checkStack();
+            }
             self.depth += 1;
+        }
+
+        /// Refuse past `MAX_DEPTH`, or past `MAX_STACK_BYTES` of stack below
+        /// the frame that entered at depth 0 (which records it). Not at
+        /// comptime, which has no frame addresses.
+        noinline fn checkStack(self: *Self) Error!void {
+            if (self.depth >= MAX_DEPTH) return Error.Budget;
+            if (@inComptime()) return;
+            const here = @frameAddress();
+            if (self.depth == 0) {
+                self.stack_base = here;
+                return;
+            }
+            const used = if (self.stack_base >= here) self.stack_base - here else here - self.stack_base;
+            if (used > MAX_STACK_BYTES) return Error.Budget;
         }
 
         fn m(self: *Self, ref: NodeRef, pos: usize, k: *const Cont) Error!bool {
@@ -219,14 +280,15 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
                     // SIMD fast path: greedy repetition of a single byte class.
                     if (nd.greedy and self.h.node(nd.a).tag == .set)
                         return self.greedySetRun(nd.a, pos, k, 0);
-                    const lp: Cont = .{ .loop = .{ .ref = nd.a, .next = k, .greedy = nd.greedy, .loop_from = pos } };
-                    return self.loopStep(pos, &lp);
+                    const lp: Cont = .{ .loop = .{ .ref = nd.a, .next = k, .greedy = nd.greedy } };
+                    return self.loopSplit(pos, &lp, entryKey(nd.a));
                 },
                 .plus => {
                     if (nd.greedy and self.h.node(nd.a).tag == .set)
                         return self.greedySetRun(nd.a, pos, k, 1);
-                    const lp: Cont = .{ .loop = .{ .ref = nd.a, .next = k, .greedy = nd.greedy, .loop_from = pos } };
-                    return self.m(nd.a, pos, &lp);
+                    // `x+` ≡ `x x*`: the first iteration enters the body directly.
+                    const lp: Cont = .{ .loop = .{ .ref = nd.a, .next = k, .greedy = nd.greedy } };
+                    return self.enterBody(nd.a, pos, &lp);
                 },
                 .cap => {
                     const g: usize = nd.set_idx;
@@ -259,41 +321,53 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
                 // *every* `m` stack frame and eat into the `MAX_DEPTH` headroom.
                 .atomic => return self.matchAtomic(nd.a, pos, k),
                 .look_around => {
-                    const behind = (nd.set_idx & hir.LA_BEHIND) != 0;
                     const neg = (nd.set_idx & hir.LA_NEGATIVE) != 0;
-                    var ok: bool = false;
-                    if (!behind) {
-                        const acc: Cont = .accept;
-                        ok = try self.m(nd.a, pos, &acc);
-                    } else {
-                        // Lookbehind: the sub-pattern must match a span ending
-                        // exactly at `pos` (enforced by `Cont.accept_at`). Scan
-                        // candidate widths shortest-first so a negative lookbehind
-                        // rejects on the first violating span; a fixed-width sub
-                        // collapses to a single offset (byte-identical to the old
-                        // fixed-only path). Unbounded `*`/`+`/backref cap at `pos`.
-                        // Each `m` step ticks the same budget ⇒ bounded, no hang.
-                        const wb = self.widthBounds(nd.a);
-                        const hi = if (wb.bounded) @min(wb.max, pos) else pos;
-                        const lo = @min(wb.min, pos);
-                        var w: usize = lo;
-                        while (w <= hi) : (w += 1) {
-                            const acc: Cont = .{ .accept_at = pos };
-                            if (try self.m(nd.a, pos - w, &acc)) {
-                                ok = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (ok == !neg) return self.cont(pos, k); // zero-width
+                    if (try self.lookAroundMatches(nd, pos) == !neg) return self.cont(pos, k); // zero-width
                     return false;
                 },
             }
         }
 
+        /// Does a lookaround's sub-pattern match at `pos` (ahead: starting there;
+        /// behind: ending there)? An independent sub-match, so it starts with an
+        /// empty `seen` list — its ε-cycles are its own.
+        fn lookAroundMatches(self: *Self, nd: hir.HNode, pos: usize) Error!bool {
+            try self.enter();
+            defer self.depth -= 1;
+            const saved = self.seen;
+            self.seen = null;
+            defer self.seen = saved;
+            const behind = (nd.set_idx & hir.LA_BEHIND) != 0;
+            var ok: bool = false;
+            if (!behind) {
+                const acc: Cont = .accept;
+                ok = try self.m(nd.a, pos, &acc);
+            } else {
+                // Lookbehind: the sub-pattern must match a span ending
+                // exactly at `pos` (enforced by `Cont.accept_at`). Scan
+                // candidate widths shortest-first so a negative lookbehind
+                // rejects on the first violating span; a fixed-width sub
+                // collapses to a single offset (byte-identical to the old
+                // fixed-only path). Unbounded `*`/`+`/backref cap at `pos`.
+                // Each `m` step ticks the same budget ⇒ bounded, no hang.
+                const wb = self.widthBounds(nd.a);
+                const hi = if (wb.bounded) @min(wb.max, pos) else pos;
+                const lo = @min(wb.min, pos);
+                var w: usize = lo;
+                while (w <= hi) : (w += 1) {
+                    const acc: Cont = .{ .accept_at = pos };
+                    if (try self.m(nd.a, pos - w, &acc)) {
+                        ok = true;
+                        break;
+                    }
+                }
+            }
+            return ok;
+        }
+
         /// SIMD fast path for a **greedy** repetition whose body is a single
         /// byte class (`[a-z]+`, `.*`, `\w*`, the `.*` inside `(?=.*X)`, …).
-        /// Instead of one recursive `m`/`cont`/`loopStep` frame per byte (a
+        /// Instead of one recursive `m`/`cont`/`loopSplit` frame per byte (a
         /// scalar `hasBit` each), consume the maximal class run with one
         /// vectorized scan (`class_span.Ranges.runEnd`, NEON `cmhs`+`uminv`),
         /// then backtrack by trying the post-loop continuation at decreasing
@@ -307,34 +381,81 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
             const bm = self.h.setBitmap(self.h.node(body).set_idx);
             const r = class_span.Ranges.fromBitmap(bm) orelse {
                 // Rare wide class: preserve the exact recursive semantics.
-                const lp: Cont = .{ .loop = .{ .ref = body, .next = k, .greedy = true, .loop_from = pos } };
-                return if (min == 0) self.loopStep(pos, &lp) else self.m(body, pos, &lp);
+                const lp: Cont = .{ .loop = .{ .ref = body, .next = k, .greedy = true } };
+                return if (min == 0) self.loopSplit(pos, &lp, entryKey(body)) else self.enterBody(body, pos, &lp);
             };
+            // Entry visit: a `*` enters at its entry split, a `+` at its body.
+            if (self.seenAt(if (min == 0) entryKey(body) else bodyKey(body), pos)) return false;
             const e = r.runEnd(self.input, pos); // SIMD: maximal greedy extent
             if (e - pos < min) return false; // `+` needs ≥1 member
-            // Greedy give-back: try the continuation at e, e-1, …, pos+min.
+            // Greedy give-back: try the continuation at e, e-1, …, pos+min. The
+            // path leaves the loop at `p` through a split — the entry split for
+            // a `*` taking zero iterations, else the loop-back split — its only
+            // loop-state visit at `p`.
+            const saved = self.seen;
+            defer self.seen = saved;
             var p = e;
             while (true) : (p -= 1) {
                 try self.tick();
+                const here: Seen = .{ .key = if (p == pos) entryKey(body) else loopKey(body), .pos = p, .prev = saved };
+                self.seen = &here;
                 if (try self.cont(p, k)) return true;
                 if (p == pos + min) break;
             }
             return false;
         }
 
-        fn loopStep(self: *Self, pos: usize, lp: *const Cont) Error!bool {
+        /// A visit of one of a loop's splits at `pos` — a `*`'s entry split
+        /// (`entryKey`) or the loop-back split after an iteration (`loopKey`):
+        /// iterate again or exit, in greedy / lazy order.
+        fn loopSplit(self: *Self, pos: usize, lp: *const Cont, key: u32) Error!bool {
             try self.enter();
             defer self.depth -= 1;
-            // Callers always pass a `.loop` variant (`m`'s `.star`/`.plus` and
-            // `cont`'s `.loop` recursion). Destructure once for readability.
+            // Callers always pass a `.loop` variant (`m`'s `.star` and `cont`'s
+            // `.loop` recursion). Destructure once for readability.
             const l = lp.loop;
-            const bodyk: Cont = .{ .loop = .{ .ref = l.ref, .next = l.next, .greedy = l.greedy, .loop_from = pos } };
+            if (self.seenAt(key, pos)) return false;
+            const here: Seen = .{ .key = key, .pos = pos, .prev = self.seen };
+            const saved = self.seen;
+            self.seen = &here;
+            defer self.seen = saved;
             if (l.greedy) {
-                if (try self.m(l.ref, pos, &bodyk)) return true;
+                if (try self.enterBody(l.ref, pos, lp)) return true;
                 return self.cont(pos, l.next);
             }
             if (try self.cont(pos, l.next)) return true;
-            return self.m(l.ref, pos, &bodyk);
+            return self.enterBody(l.ref, pos, lp);
+        }
+
+        /// Enter a loop's body at `pos` (from its split, or directly for a `+`'s
+        /// first iteration); `lp` is the loop continuation it returns to.
+        /// `inline`: it sits on the native stack under every loop iteration's
+        /// continuation, so as a call it would add an uncounted frame per
+        /// iteration (and cut the iterations `MAX_DEPTH` / `MAX_STACK_BYTES`
+        /// admit).
+        inline fn enterBody(self: *Self, body: NodeRef, pos: usize, lp: *const Cont) Error!bool {
+            if (self.seenAt(bodyKey(body), pos)) return false;
+            const here: Seen = .{ .key = bodyKey(body), .pos = pos, .prev = self.seen };
+            const saved = self.seen;
+            self.seen = &here;
+            defer self.seen = saved;
+            return self.m(body, pos, lp);
+        }
+
+        /// Did this path already visit loop state `key` at `pos`? That revisit
+        /// closes an ε-cycle (an iteration that consumed nothing, or an outer
+        /// loop re-entering an inner loop that just looped back here). The NFA
+        /// engines enter each state once per position's ε-closure (RE2 / Rust
+        /// semantics), so the path is dead — its span and captures never
+        /// surface. PCRE instead lets one empty iteration through and keeps its
+        /// captures; the DFA tier can't model that, so every tier uses this rule.
+        fn seenAt(self: *const Self, key: u32, pos: usize) bool {
+            var it = self.seen;
+            while (it) |s| : (it = s.prev) {
+                if (s.pos != pos) return false;
+                if (s.key == key) return true;
+            }
+            return false;
         }
 
         /// Atomic group `(?>body)` / possessive quantifier (`a*+` ≡ `(?>a*)`).
@@ -377,10 +498,9 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
                     self.slots[s.slot] = old;
                     return false;
                 },
-                .loop => |l| {
-                    if (pos == l.loop_from) return self.cont(pos, l.next); // anti-empty: stop
-                    return self.loopStep(pos, k);
-                },
+                // An iteration ended: the loop-back split (an empty iteration
+                // dies at the body's start: see `seenAt`).
+                .loop => |l| return self.loopSplit(pos, k, loopKey(l.ref)),
             }
         }
 
@@ -455,7 +575,11 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
                 // the leftmost such absolute position `≥ start`; `null` ⇒ no
                 // candidate anywhere ahead ⇒ no real match either.
                 if (self.seek) |sd| {
-                    start = sd.locate(input, start) orelse return null;
+                    const next = sd.locate(input, start) orelse return null;
+                    // A folded `^`/`\A` allows `from` only: a later candidate is
+                    // no candidate (`^(?<=b)` must not match after a `b`).
+                    if (self.a_start and next != start) return null;
+                    start = next;
                     if (start > input.len) return null;
                 }
                 // Only the live slot range is ever read or written: `.cap` writes

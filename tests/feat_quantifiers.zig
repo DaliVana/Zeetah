@@ -183,6 +183,34 @@ test "atomic group (?>...) commits and never backtracks" {
     try std.testing.expectEqualStrings("foo@", (try slice(a, "(?>[A-Za-z0-9_]+)@", "say foo@bar")).?);
 }
 
+test "empty loop iterations: every tier follows the NFA rule (RE2 / Rust)" {
+    const a = std.testing.allocator;
+    // Found by `nfa_fuzz`: an iteration that matches empty re-enters the loop's
+    // state at the same position, which ends that path. The DFA tier and the
+    // tree backtracker (forced by a no-op `(?=)`) must agree on spans ...
+    for ([_][]const u8{ "(?:a*|b)+", "(?:a*|b)+(?=)" }) |p| {
+        const sp = (try span(a, p, "ab")).?;
+        try std.testing.expectEqual(@as(usize, 0), sp.s);
+        try std.testing.expectEqual(@as(usize, 2), sp.e);
+    }
+    // (an outer loop can't re-enter an inner lazy loop that just looped back)
+    for ([_][]const u8{ "(?:a*?)*", "(?:a*?)*(?=)" }) |p| {
+        const sp = (try span(a, p, "aa")).?;
+        try std.testing.expectEqual(@as(usize, 0), sp.e);
+    }
+    // ... and an empty iteration's captures never surface.
+    for ([_][]const u8{ "(?:a|(b??))*", "(?:a|(b??))*(?=)" }) |p| {
+        var rx = try Regex.compile(a, p);
+        defer rx.deinit();
+        var m = (try rx.captures(a, "a")).?;
+        defer m.deinit(a);
+        try std.testing.expect(m.groups[1] == null);
+    }
+    // Comptime captures run on the tree backtracker too.
+    const P = regex.Pattern("(?:a|(b??))*", .{});
+    try std.testing.expect(P.captures("a").?.groups[1] == null);
+}
+
 test "quantifier on a class and on a group" {
     const a = std.testing.allocator;
     try std.testing.expectEqualStrings("123", (try slice(a, "[0-9]{3}", "ab12345")).?);

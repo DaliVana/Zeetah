@@ -126,7 +126,7 @@ const MetaKind = enum {
 | `backtrack` | lookaround / backreferences / atomic groups (incl. possessive quantifiers, which lower to atomic groups) | HIR-tree backtracker, with a `seek` over-approximation prefilter and concat-internal regular "island" delegation | `exec/backtrack.zig`, `exec/seek.zig`, `exec/delegate.zig` |
 | `split_alt` | a top-level alternation mixing regular and non-regular branches | regular branches → anchored DFAs, the rest → tree backtracker | `exec/split_alt.zig` |
 | `dup_word` | the adjacent-duplicate-word shape `(\b\w+\b)\s+\1` | a single O(n) linear scan | `exec/dupword.zig` |
-| `dfa_edge_look` | a regular core followed by one width-1 trailing look (`\w+(?=!)`, `\w+\b`), no captures | DFA over the core + an O(1) edge verify per candidate end | `exec/edge_look.zig` |
+| `dfa_edge_look` | a regular, greedy, alternation-free core followed by one width-1 trailing lookaround (`\w+(?=!)`, `\d+(?<![05])`), no captures | DFA over the core with the look folded in (lookahead: one more byte, end reported one back; lookbehind: a last-byte-in-class copy of the NFA), so the leftmost-first cut only fires where the look holds | `exec/edge_look.zig` |
 | `literal_alt` | a pure-literal alternation too large for the NFA (a dictionary) | leftmost-first trie walk; tables bounded by a byte budget | `prefilter.zig` (`LiteralAltScanner`) |
 
 The regular tier (`literal`, `lit_prefix`, `reverse_suffix`, `dfa`,
@@ -477,7 +477,7 @@ strategy is "bake the value, reuse the executor":
   BacktrackerG(null)` alias is unchanged). `Pattern` parses to a fixed-size comptime
   HIR, **trims it to its exact node count**, and bakes that `Hir(node_count)` into
   `.rodata` — so a small non-regular pattern emits a small table, not the
-  build-ceiling-sized store. The matcher's `m`/`cont`/`loopStep` body is identical
+  build-ceiling-sized store. The matcher's `m`/`cont`/`loopSplit` body is identical
   across cap modes; `cc.lookHolds` (word boundaries, line/text anchors) is pure and
   comptime-evaluable, which is what lets look-assertions run at comptime.
 - **Captures** are materialized into an inline `Captures(ng, gnames)` value — a

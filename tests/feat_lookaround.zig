@@ -108,24 +108,19 @@ test "edge-look: comptime Pattern engages the DFA path and matches runtime" {
     try std.testing.expect(D.has_dfa);
     try std.testing.expectEqualStrings("5", D.find("in 345 end").?.slice);
 
-    // An ALTERNATION core is NOT peeled onto edge-look: the priority-cut core
-    // DFA exposes only the highest-priority accept per start, so a lower-priority
-    // branch's look-passing accept could be dropped (e.g. `(?:.|..)(?=x)`). Such
-    // a pattern routes to the comptime tree backtracker (`has_dfa == false`) and
-    // must still match correctly. (See `edge_look.regularGreedy`.)
+    // An ALTERNATION core is NOT peeled onto edge-look (its scope,
+    // `edge_look.regularGreedy`): such a pattern routes to the comptime tree
+    // backtracker (`has_dfa == false`) and must still match correctly.
     const Palt = regex.Pattern("(?:https?:\\/\\/|ftp:\\/\\/)[\\w\\-.~:\\/?#@!$&*+,;=%]+(?<![,.])", .{});
     try std.testing.expect(!Palt.has_dfa);
     try std.testing.expectEqualStrings("ftp://a.com", Palt.find("x ftp://a.com, y").?.slice);
     try std.testing.expectEqualStrings("https://example.com", Palt.find("see https://example.com. more").?.slice);
 }
 
-test "edge-look: alternation core is not peeled onto the priority-cut DFA" {
+test "edge-look: alternation core is not peeled onto the DFA" {
     const a = std.testing.allocator;
-    // Regression: an alternation in the core must NOT be peeled onto edge-look.
-    // The priority-cut core DFA exposes only the highest-priority accept per
-    // start, so when that branch's accept fails the trailing look a lower-
-    // priority branch's *passing* accept would be dropped — wrong span / spurious
-    // no-match. These route to the (correct) tree backtracker instead.
+    // An alternation in the core stays on the tree backtracker (scope). These
+    // are the spans a priority cut that ignored the look got wrong.
     try std.testing.expectEqualStrings("ab", (try slice(a, "(?:.|..)(?=x)", "abx")).?);
     try std.testing.expectEqualStrings("foobar", (try slice(a, "(?:foo|foobar)(?=X)", "foobarX")).?);
     try std.testing.expectEqualStrings("abc", (try slice(a, "(?:ab|abc)(?!c)", "abc")).?);
@@ -133,6 +128,55 @@ test "edge-look: alternation core is not peeled onto the priority-cut DFA" {
     const P = regex.Pattern("(?:.|..)(?=x)", .{});
     try std.testing.expect(!P.has_dfa);
     try std.testing.expectEqualStrings("ab", P.find("abx").?.slice);
+}
+
+test "edge-look: the look is folded into the DFA, so its accept cut is exact" {
+    const a = std.testing.allocator;
+    // Found by `nfa_fuzz`: a core DFA cut after the highest-priority accept,
+    // then checked the look — a quantifier over a multi-width body dropped the
+    // lower-priority path whose end passes it. The look is now part of the
+    // accept, and these keep the linear engine.
+    try std.testing.expectEqualStrings(" cb", (try slice(a, "(?:[^b](?:[^a])?){0,2}(?<=b)", " cb")).?);
+    try std.testing.expectEqualStrings("ab", (try slice(a, "a*(?:ab?)*(?=a)", "aba")).?);
+    try std.testing.expectEqualStrings("aaab", (try slice(a, "a(?:a[ab]?)*(?=a)", "aaaba")).?);
+    try std.testing.expectEqualStrings("ab", (try slice(a, "a*(?:ab)*(?<!a)", "ab")).?);
+    try std.testing.expectEqualStrings("abab", (try slice(a, "(?:ab)*(?=x)", "ababx")).?);
+    try std.testing.expectEqualStrings("one two ", (try slice(a, "(?:\\w+\\s){2,}(?=\\.)", "one two .")).?);
+    // A negative lookahead holds at end of input; an empty core sees the
+    // context before the match (none at offset 0).
+    try std.testing.expectEqualStrings("abc12", (try slice(a, "\\w+(?!\\d)", "abc12")).?);
+    var rx = try Regex.compile(a, "x*(?<=y)");
+    defer rx.deinit();
+    const m = (try rx.find("y")).?;
+    try std.testing.expectEqual(@as(usize, 1), m.start);
+    try std.testing.expectEqual(@as(usize, 1), m.end);
+    try std.testing.expectEqualStrings("", (try slice(a, "x*(?<!y)", "y")).?);
+
+    const P = regex.Pattern("a*(?:ab?)*(?=a)", .{});
+    try std.testing.expect(P.has_dfa);
+    try std.testing.expectEqualStrings("ab", P.find("aba").?.slice);
+    const Q = regex.Pattern("a*(?:ab)*(?<!a)", .{});
+    try std.testing.expect(Q.has_dfa);
+    try std.testing.expectEqualStrings("ab", Q.find("ab").?.slice);
+
+    // Linear, not the budgeted backtracker: no `MatchBudgetExceeded`.
+    var big: [4096]u8 = undefined;
+    for (&big, 0..) |*c, i| c.* = "ab"[i % 2];
+    var rl = try Regex.compile(a, "(?:ab)*(?=x)");
+    defer rl.deinit();
+    try std.testing.expect(rl.kind == .dfa_edge_look);
+    try std.testing.expect((try rl.find(&big)) == null);
+}
+
+test "edge-look: a folded start anchor tries offset 0 only" {
+    const a = std.testing.allocator;
+    try std.testing.expect(!try isM(a, "^a(?=b)", "xab"));
+    try std.testing.expectEqualStrings("a", (try slice(a, "^a(?=b)", "ab")).?);
+    try std.testing.expect(!try isM(a, "\\Aa+(?<!c)", "xaa"));
+    const P = regex.Pattern("^a(?=b)", .{});
+    try std.testing.expect(P.has_dfa);
+    try std.testing.expect(P.find("xab") == null);
+    try std.testing.expectEqualStrings("a", P.find("ab").?.slice);
 }
 
 test "edge-look: comptime == runtime over multi-match inputs (findAll/count)" {

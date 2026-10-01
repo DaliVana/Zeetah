@@ -267,9 +267,9 @@ pub const Regex = struct {
     /// (`lit|lit|…`) whose naive NFA blows `MAX_NFA` — leftmost-first scan, no
     /// NFA (see `prefilter.LiteralAltScanner`).
     lit_alt: ?*prefilter.LiteralAltScanner = null,
-    /// `.dfa_edge_look`: verify spec for the peeled trailing width-1 look.
-    /// The regular `core` runs on `self.dfa` (a normal `Dfa256`); this is the
-    /// O(1) edge check applied to each candidate end (see `exec/edge_look.zig`).
+    /// `.dfa_edge_look`: the peeled trailing width-1 look. `self.dfa` is the
+    /// core's DFA with the look folded in; this is the walk config `nextFrom`
+    /// needs on top of it (see `exec/edge_look.zig`).
     el_spec: edge_look.Spec = .{ .set = [_]u8{0} ** 32, .behind = false, .neg = false },
     /// Captures fast path: when the pattern is one-pass (decided at compile by
     /// the pure `onepass.dfaMatchIsOnePass` over the DFA), `captures()` resolves slots
@@ -278,19 +278,18 @@ pub const Regex = struct {
     /// always-correct fallback if the deterministic walk bails.
     op_onepass: bool = false,
 
-    /// Build the regular-`core` DFA for the `.dfa_edge_look` strategy: point
-    /// the HIR root at `core_ref`, build NFA → `Dfa256` (unanchored at the end —
-    /// the trailing look is handled by the O(1) edge verify, not the DFA),
-    /// then restore the root. Returns `null` (caller falls back) on any build
-    /// failure. The `required`-byte prefilter is computed over the core.
-    fn buildEdgeLookDfa(allocator: std.mem.Allocator, h: *hir.Hir(null), core_ref: hir.NodeRef) ?*full_dfa.PackedDfa {
+    /// Build the `.dfa_edge_look` DFA: point the HIR root at the recognized
+    /// core, build its NFA, fold the trailing look into it and determinize
+    /// (`edge_look.buildDfa`, which also finishes `rec.spec`), then restore the
+    /// root. Returns `null` (caller falls back) on any build failure. The
+    /// `required`-byte prefilter is computed over the core.
+    fn buildEdgeLookDfa(allocator: std.mem.Allocator, h: *hir.Hir(null), rec: *edge_look.Recognized) ?*full_dfa.PackedDfa {
         const saved = h.root;
-        h.root = core_ref;
+        h.root = rec.core;
         defer h.root = saved;
         var nfa = thompson.buildAlloc(allocator, h) catch return null;
         defer nfa.deinit(allocator);
-        var d = full_dfa.compute(null, &nfa, h.anchored_start, false);
-        if (d.outcome != .ok) return null;
+        var d = edge_look.buildDfa(null, &nfa, &rec.spec) orelse return null;
         d.required = seq_extract.requiredByte(null, h);
         const heap = full_dfa.packHeap(allocator, &d) catch return null;
         return heap;
@@ -535,11 +534,12 @@ pub const Regex = struct {
     // an arm succeeds, so a `null`/error return never leaks or double-frees.
 
     /// `.dfa_edge_look`: peel `concat(regular_core, trailing_width1_look)`, run
-    /// `core` on a linear DFA + an O(1) edge verify instead of demoting the whole
+    /// it on a linear DFA with the look folded in instead of demoting the whole
     /// pattern to the tree backtracker. Capture-free. Caller gates `ng == 0`.
     fn tryEdgeLook(allocator: std.mem.Allocator, h: *hir.Hir(null), owned: []const u8, flags: common.CompileFlags, gnames: GNames) ?Regex {
-        if (edge_look.recognize(null, h)) |rec| {
-            if (buildEdgeLookDfa(allocator, h, rec.core)) |coredfa| {
+        if (edge_look.recognize(null, h)) |found| {
+            var rec = found;
+            if (buildEdgeLookDfa(allocator, h, &rec)) |coredfa| {
                 return Regex{
                     .allocator = allocator,
                     .pattern = owned,
@@ -1509,9 +1509,12 @@ pub const Regex = struct {
             };
             if (!one_pass) try self.spanSlots(allocator, input, sp, slots[0..nslots]);
         } else {
-            // No capture groups: only the whole-match span is meaningful.
+            // No `.cap` node: only the whole-match span is meaningful.
             const sp = (try self.nextSpanFrom(input, pos)) orelse return null;
-            return wholeMatch(input, sp.start, sp.end);
+            if (self.n_groups == 0) return wholeMatch(input, sp.start, sp.end);
+            // Numbered groups that cannot participate (`(a){0}`): all null.
+            @memset(slots[0..nslots], -1);
+            span = sp;
         }
 
         const groups = try allocator.alloc(?Group, self.n_groups + 1);

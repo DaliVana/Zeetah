@@ -289,6 +289,20 @@ test "nesting: deep non-capturing (?: groups hit the parse-depth guard, not the 
     try std.testing.expect(try rx.isMatch("a"));
 }
 
+test "nesting: a backtracked loop iterated per input byte hits a guard, not the stack" {
+    const a = std.testing.allocator;
+    // Each iteration of a loop on the tree backtracker stays on the native
+    // stack. Debug frames are several times larger than release ones, so the
+    // frame-count guard alone let a Debug build overflow after ~3 K
+    // iterations; the stack-byte guard reports it in every build mode.
+    const in = try a.alloc(u8, 200_000);
+    defer a.free(in);
+    for (in, 0..) |*c, i| c.* = "ab"[i % 2];
+    var rx = try Regex.compile(a, "(?=a)(?:ab)*(?=x)");
+    defer rx.deinit();
+    try std.testing.expectError(error.MatchBudgetExceeded, rx.find(in));
+}
+
 test "utf8: malformed input bytes do not crash or over-read" {
     const a = std.testing.allocator;
     const patterns = [_][]const u8{ "a.b", ".*", "^.+$", "\\w+", "a.*c" };
