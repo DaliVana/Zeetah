@@ -178,3 +178,92 @@ test "anchors: comptime Pattern agrees with runtime Regex" {
         }
     }
 }
+
+/// `^…$` / `\A…\z` (both anchors folded): the match, if any, is the whole
+/// input. `want` is hand-checked; runtime `Regex` and comptime `Pattern` must
+/// both return it (`find`, `isMatch`, `count`).
+fn bothAnchored(comptime pat: []const u8, in: []const u8, want: ?[2]usize) !void {
+    const a = std.testing.allocator;
+    var rx = try Regex.compile(a, pat);
+    defer rx.deinit();
+    const P = regex.Pattern(pat, .{});
+    var rm = try rx.find(in);
+    defer if (rm) |*x| x.deinit(a);
+    const pm = P.find(in);
+    errdefer std.debug.print("\nbothAnchored {s} on \"{s}\": want {any} runtime {any} comptime {any}\n", .{ pat, in, want, if (rm) |m| [2]usize{ m.start, m.end } else null, if (pm) |m| [2]usize{ m.start, m.end } else null });
+    try std.testing.expectEqual(want == null, rm == null);
+    try std.testing.expectEqual(want == null, pm == null);
+    if (want) |w| {
+        try std.testing.expectEqual(w[0], rm.?.start);
+        try std.testing.expectEqual(w[1], rm.?.end);
+        try std.testing.expectEqual(w[0], pm.?.start);
+        try std.testing.expectEqual(w[1], pm.?.end);
+    }
+    try std.testing.expectEqual(want != null, try rx.isMatch(in));
+    try std.testing.expectEqual(want != null, P.isMatch(in));
+    try std.testing.expectEqual(@as(usize, @intFromBool(want != null)), try rx.count(in));
+    try std.testing.expectEqual(@as(usize, @intFromBool(want != null)), P.count(in));
+}
+
+test "anchors: ^(alt)$ — a later, longer alternative still reaches $" {
+    // The end-anchored DFA used to apply the leftmost-first accept cut: once an
+    // earlier alternative accepted mid-input, the later one that reaches `$`
+    // was dropped, so all of these were wrongly rejected.
+    try bothAnchored("^(?:a|aa)$", "aa", .{ 0, 2 });
+    try bothAnchored("^(?:a|aa)$", "a", .{ 0, 1 });
+    try bothAnchored("^(?:a|aa)$", "aaa", null);
+    try bothAnchored("\\A(?:a|aa)\\z", "aa", .{ 0, 2 });
+    try bothAnchored("^(?:a|ab)$", "ab", .{ 0, 2 });
+    try bothAnchored("^(?:a|ab)$", "ac", null);
+    try bothAnchored("^(?:cat|category)$", "category", .{ 0, 8 });
+    try bothAnchored("^(?:cat|category)$", "cat", .{ 0, 3 });
+    try bothAnchored("^(?:cat|category)$", "categ", null);
+    try bothAnchored("^(?:a|.*)$", "abc", .{ 0, 3 });
+    try bothAnchored("^(?:a|.*)$", "", .{ 0, 0 });
+    try bothAnchored("^(?:ab|a)(?:c|bc)$", "abc", .{ 0, 3 });
+    try bothAnchored("^(?:ab|a)(?:c|bc)$", "abbc", .{ 0, 4 });
+    try bothAnchored("^(?:ab|a)(?:c|bc)$", "ac", .{ 0, 2 });
+    try bothAnchored("^(?:x|xy)*$", "xyx", .{ 0, 3 });
+    try bothAnchored("^(?:x|xy)*$", "yx", null);
+    try bothAnchored("^(?:a|aa)b*$", "aab", .{ 0, 3 });
+    try bothAnchored("^(?:[^a]|ba)$", "ba", .{ 0, 2 });
+    try bothAnchored("(?i)^(?:a|aa)$", "AA", .{ 0, 2 });
+    // isbn without `(?m)`: a 13-digit input is the second alternative.
+    try bothAnchored("^(?:\\d{9}[\\dXx]|\\d{13})$", "1234567890123", .{ 0, 13 });
+    try bothAnchored("^(?:\\d{9}[\\dXx]|\\d{13})$", "123456789X", .{ 0, 10 });
+    try bothAnchored("^(?:\\d{9}[\\dXx]|\\d{13})$", "12345678901234", null);
+}
+
+test "anchors: ^(alt)$ captures and the lazy-DFA route" {
+    const a = std.testing.allocator;
+    // Captures: leftmost-first priority still decides the groups of the
+    // (unique) whole-input match.
+    {
+        var rx = try Regex.compile(a, "^(a|ab)(c|bcd)$");
+        defer rx.deinit();
+        const P = regex.Pattern("^(a|ab)(c|bcd)$", .{});
+        inline for (.{ .{ "abcd", 0, 1, 1, 4 }, .{ "abc", 0, 2, 2, 3 } }) |c| {
+            var m = (try rx.captures(a, c[0])).?;
+            defer m.deinit(a);
+            const pc = P.captures(c[0]).?;
+            try std.testing.expectEqual(@as(usize, c[1]), m.groups[1].?.start);
+            try std.testing.expectEqual(@as(usize, c[2]), m.groups[1].?.end);
+            try std.testing.expectEqual(@as(usize, c[3]), m.groups[2].?.start);
+            try std.testing.expectEqual(@as(usize, c[4]), m.groups[2].?.end);
+            try std.testing.expectEqual(@as(usize, c[1]), pc.get(1).?.start);
+            try std.testing.expectEqual(@as(usize, c[4]), pc.get(2).?.end);
+        }
+    }
+    // A pattern too big for the eager DFA runs on the lazy DFA (runtime only:
+    // the comptime NFA ceiling rejects it).
+    {
+        var rx = try Regex.compile(a, "^(?:a|aa)[a-z]{0,200}$");
+        defer rx.deinit();
+        try std.testing.expect(rx.kind == .lazy_dfa);
+        var m = (try rx.find("aa")).?;
+        defer m.deinit(a);
+        try std.testing.expectEqual(@as(usize, 2), m.end);
+        try std.testing.expect(try rx.isMatch("aab"));
+        try std.testing.expect(!try rx.isMatch("b"));
+    }
+}

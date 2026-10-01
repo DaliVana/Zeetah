@@ -122,7 +122,7 @@ const MetaKind = enum {
 | `lazy_dfa` | the eager DFA would exceed its state ceiling (or the dense freeze would); **plain look-assertions** (`\b`, `\B`, mid-pattern `^`/`$`, `(?m)` anchors, `\A`, `\z`) | the same subset construction, evaluated on demand and memoized; in *look mode* each state also carries the class of the previous byte and assertions are evaluated inside the transition (matches reported one byte late) | `exec/lazy_dfa.zig`, `exec/lazy_memo.zig` |
 | `class_span` | one greedy single contiguous-range `class+` / `class*` | SIMD member-run scan, no automaton | `exec/class_span.zig` |
 | `boundary_lits` | `\b(?:kw1\|kw2\|…)\b` keyword alternations | Aho-Corasick locate + O(1) `\b` verify | `exec/seq_extract.zig`, `prefilter.zig` |
-| `bt_look` | the look-assertions the lazy DFA does not take: `\Z` (two bytes of lookahead) and a leading `(?m)^` (whose line-start scan skips whole lines) — plus the line-DFA / reverse-end-DFA fast paths | line-DFA or reverse-end DFA when built, else the bounded backtracker over line starts / every start; the PikeVM when the visited bitset would exceed its budget | `exec/bounded_bt.zig`, `exec/line_dfa.zig`, `exec/pikevm.zig` |
+| `bt_look` | the look-assertions the lazy DFA does not take: `\Z` (two bytes of lookahead) and a leading `(?m)^` (whose line-start scan skips whole lines) — plus the line-DFA / reverse-end-DFA fast paths | line-DFA (forward, or the reverse body DFA as a whole-line membership test for an alternation/lazy body with `$`) or reverse-end DFA when built, else the bounded backtracker over line starts / every start; the PikeVM when the visited bitset would exceed its budget (anchored at each line start for a `(?m)^` scan) | `exec/bounded_bt.zig`, `exec/line_dfa.zig`, `exec/pikevm.zig` |
 | `backtrack` | lookaround / backreferences / atomic groups (incl. possessive quantifiers, which lower to atomic groups) | HIR-tree backtracker, with a `seek` over-approximation prefilter and concat-internal regular "island" delegation | `exec/backtrack.zig`, `exec/seek.zig`, `exec/delegate.zig` |
 | `split_alt` | a top-level alternation mixing regular and non-regular branches | regular branches → anchored DFAs, the rest → tree backtracker | `exec/split_alt.zig` |
 | `dup_word` | the adjacent-duplicate-word shape `(\b\w+\b)\s+\1` | a single O(n) linear scan | `exec/dupword.zig` |
@@ -268,9 +268,9 @@ _ = try re.isMatch("aaaaaaaaaaaaaaaaX"); // fast, linear — no error, no hang
 
 ### Non-regular patterns — bounded step budget
 
-Patterns the DFA cannot express or fold — backreferences, lookaround, atomic
-groups (including possessive quantifiers), and lazy combined with an end-anchor
-(`a*?$`) — run on the HIR-tree backtracker (`exec/backtrack.zig`). The
+Patterns the DFA cannot express or fold — backreferences, lookaround, and
+atomic groups (including possessive quantifiers) — run on the HIR-tree
+backtracker (`exec/backtrack.zig`). The
 backtracker is governed by an explicit **step budget** scaled to the input plus
 a **recursion-depth guard**:
 
@@ -392,9 +392,10 @@ the ceiling or uses an unsupported feature (no comptime → runtime fallback).
 The comptime path covers the **same feature surface as the runtime `Regex`** — the
 two share the `parser → HIR` front end, and `Pattern` bakes whichever matcher the
 runtime would build: a minimized DFA (or comptime Teddy literal) for regular
-patterns, or the **same bounded tree-backtracker** for non-regular ones, with its
-seek / over-approximation / delegate prefilters and full capture extraction
-(numbered + `(?<name>)` named), all into `.rodata`. So lookaround, backreferences,
+patterns, or — for non-regular ones — a backtracker **compiled from the HIR**
+with the same semantics as the runtime tree backtracker, its seek /
+over-approximation prefilters baked into `.rodata`, and full capture extraction
+(numbered + `(?<name>)` named). So lookaround, backreferences,
 atomic/possessive quantifiers, look-assertions (`\b`, `\B`, mid-pattern `^`/`$`,
 `(?m)` line anchors), lazy-with-end-anchor, and captures **all work at comptime**.
 See *The comptime backtracker* below for how the non-regular tier is baked.
@@ -469,17 +470,38 @@ comptime-only gap).
 ### The comptime backtracker — baking the non-regular tier
 
 The non-regular tier (backreferences, lookaround, atomic/possessive quantifiers,
-look-assertions, lazy-with-end-anchor) is baked the same way the DFA tier is. The
-strategy is "bake the value, reuse the executor":
+look-assertions, lazy-with-end-anchor) is baked at compile time like the DFA tier,
+but it is **compiled to code** rather than interpreted:
 
-- **HIR → `.rodata`.** `exec/backtrack.zig`'s tree matcher was made generic over
-  the HIR store — `BacktrackerG(comptime cap)` (the runtime `Backtracker =
-  BacktrackerG(null)` alias is unchanged). `Pattern` parses to a fixed-size comptime
-  HIR, **trims it to its exact node count**, and bakes that `Hir(node_count)` into
-  `.rodata` — so a small non-regular pattern emits a small table, not the
-  build-ceiling-sized store. The matcher's `m`/`cont`/`loopSplit` body is identical
-  across cap modes; `cc.lookHolds` (word boundaries, line/text anchors) is pure and
-  comptime-evaluable, which is what lets look-assertions run at comptime.
+- **HIR → code.** `exec/compiled_bt.zig` turns the baked HIR into a specialized
+  matcher: every node is its own Zig type with a `run(ctx, pos)` function and every
+  continuation is a type resolved at compile time (continuation-passing through
+  types, the CTRE model). `concat(a, b)` is `Node(a, Node(b, K))`, a class test is
+  an inline range compare, and a greedy class loop is a scan plus give-back.
+  Capture slots are written only on the `captures` path or when a backreference
+  reads them. The semantics are the tree interpreter's, exactly: the same
+  leftmost-first order, ε-cycle rule (applied only to loops that can sit on an
+  ε-cycle), step budget and stack guard, slot/atomic/lookaround behaviour and scan
+  loop. One structural change: a run of identical copies from a `{m,n}` expansion
+  (`x x x? x?`) is matched as one counted repeat. That is exact when the copy is
+  loop-free, non-nullable and capture-free, and the repeat is greedy or
+  fixed-width, and it removes the flat expansion's exponential skip-then-take
+  retries (`.{0,200}x`). Against walking the HIR, the benchmark's
+  backtracking-tier workloads count 5–12× faster at 1 MiB (`sqli_nested` 12×,
+  `lookbehind_amount` 11×, `password_strength` 8.6×, `tokenizer` 7.9×,
+  `querystring_kv` 7.8×, `isbn` 5.8×, `postal_uk` 5.4×), and the comptime
+  harness binary is ~120 KB smaller. `pattern.zig`'s `BtEngine` wraps it for both
+  comptime call sites (the `.backtrack` arm and `CaptureSupport`).
+- **No HIR in `.rodata`.** `Pattern` parses to a fixed-size comptime HIR and
+  **trims it to its exact node count** before generating code; the HIR itself is
+  not baked (only wide classes' 32-byte bitmaps are). `cc.lookHolds` (word
+  boundaries, line/text anchors) is pure and comptime-evaluable, so a `Pattern`
+  still evaluates inside `comptime`.
+- **The interpreter is the oracle.** `exec/backtrack.zig`'s tree matcher stays
+  generic over the HIR store — `BacktrackerG(comptime cap)`, with the runtime
+  `Backtracker = BacktrackerG(null)` — so `compiled_bt.zig`'s tests can run it over
+  the very same comptime HIR and pin compiled == interpreter slot for slot, over
+  hand-picked and generated patterns.
 - **Captures** are materialized into an inline `Captures(ng, gnames)` value — a
   fixed `[ng+1]?Group` array, **no allocator** (the comptime peer of the runtime's
   heap `Match.groups`; `Pattern.captures(input) ?Captures` vs runtime
@@ -490,13 +512,12 @@ strategy is "bake the value, reuse the executor":
 - **The prefilters are baked too**, reusing the *zero-allocator* `full_dfa.compute`
   (the same one the DFA tier uses — the lazy/dense builders are allocator-heavy and
   were deliberately *not* ported):
-  - a **seek** over-approximation `Dfa256` (relax `look`/`backref`→ε, drop the
-    `atomic` cut) plus the `lb_byte` leading-look-behind `memchr`, threaded into the
-    backtracker's own scan loop so it skips dead regions at every step;
-  - a **delegate** plan that runs regular islands of a concat at DFA speed.
-  Both are baked as values and pointed at with `@constCast` (read-only on the hot
-  path, never freed). Soundness mirrors the runtime `seek.build`/`delegate.build`
-  guards exactly.
+  a **seek** over-approximation DFA (relax `look`/`backref`→ε, drop the `atomic`
+  cut; baked compressed) plus the `lb_byte` leading-look-behind `memchr`, threaded
+  into the backtracker's own scan loop so it skips dead regions at every step.
+  Soundness mirrors the runtime `seek.build` guards exactly. (The runtime also
+  delegates regular concat islands to DFAs, `exec/delegate.zig`; the compiled
+  matcher doesn't need that — it runs class loops as scans.)
 - **Routing** is comptime-only: `pattern.zig buildAll` dispatches on
   `requires_backtracking or has_look` *before* `thompson.build`. The shared
   `properties.requires_backtracking` deliberately omits `has_look` so the *runtime*
@@ -606,7 +627,8 @@ intentional, not an accident of layering.
   benchmark workloads — an ongoing tuning surface, not a settled one.
 - **Match semantics.** Leftmost-first (Perl/RE2) is preserved end-to-end (see
   [Match semantics](#match-semantics)). Lazy combined with an end-anchor (`a*?$`)
-  routes to the tree backtracker on both front-ends and is still leftmost-first.
+  stays on the DFA path on both front-ends: the end-anchored DFA carries no
+  leftmost-first accept cut, so the span is the same whatever the greediness.
 
 ## Module map
 
@@ -629,10 +651,11 @@ intentional, not an accident of layering.
 | `exec/pikevm.zig` | NFA breadth-first simulation — the O(n_states)-memory fallback (looks + captures) |
 | `exec/nfa_index.zig` | `EdgeIndex`: per-state out-edge index of the retained NFA in priority order, built once per `Regex` and borrowed by the bounded backtracker and the PikeVM |
 | `exec/onepass.zig` | one-pass capture walker (slots over a found span); walks a prebuilt out-edge index — the `Regex`'s shared `EdgeIndex` at runtime, a comptime-baked `SizedIndex` in a `Pattern` |
-| `exec/edge_look.zig`, `exec/line_dfa.zig` | trailing width-1 look peel (`dfa_edge_look`); line-anchored body-DFA scan |
+| `exec/edge_look.zig`, `exec/line_dfa.zig` | trailing width-1 look peel (`dfa_edge_look`); line-anchored body-DFA scan (forward, or reverse whole-line membership) |
 | `exec/class_span.zig` | SIMD single-range `class+`/`class*` scan |
 | `exec/seq_extract.zig` | literal-sequence / keyword extraction (`Seq`; `boundary_lits`) |
 | `exec/backtrack.zig`, `exec/bounded_bt.zig` | HIR-tree backtracker (backref/lookaround/atomic) + bounded `O(n·m)` NFA backtracker (span captures, `bt_look`) |
+| `exec/compiled_bt.zig` | comptime-only: the baked HIR compiled to a specialized backtracker (the comptime `Pattern`'s non-regular tier and capture fills) |
 | `exec/nfa_fuzz.zig` | random-pattern differential test across the NFA engines and the public API |
 | `exec/seek.zig` | regular over-approximation prefilter for the backtracking tier |
 | `exec/delegate.zig` | concat-internal regular-island delegation into the backtracker |

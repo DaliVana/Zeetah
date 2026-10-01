@@ -311,6 +311,37 @@ test "comptime Pattern <-> runtime Regex agree across the supported subset" {
     try crAgree("abc[0-9]+$");
     try crAgree("hello.*world$");
     try crAgree("abc.*$");
+    // Lazy + end-anchor is regular and stays on the no-cut end-anchored DFA
+    // (it used to be forced onto the tree backtracker): the span is
+    // start-fixed and ends at the anchor whatever the greediness.
+    try crAgree("a*?$");
+    try crAgree(".*?b$");
+    try crAgree("(?:a|b)*?$");
+    try crAgree("a{2,4}?$");
+    try crAgree("x*?a+?$");
+}
+
+test "lazy + end-anchor on the DFA path keeps leftmost-first spans (comptime + runtime)" {
+    const a = std.testing.allocator;
+    const cases = .{
+        .{ "a*?$", "aaa", 0, 3 },
+        .{ ".*?b$", "aabxb", 0, 5 },
+        .{ "a*?$", "", 0, 0 },
+        .{ "b*?$", "aaa", 3, 3 },
+    };
+    inline for (cases) |c| {
+        const P = regex.Pattern(c[0], .{});
+        comptime std.debug.assert(P.has_dfa);
+        const pm = P.find(c[1]).?;
+        try std.testing.expectEqual(@as(usize, c[2]), pm.start);
+        try std.testing.expectEqual(@as(usize, c[3]), pm.end);
+        var rx = try Regex.compile(a, c[0]);
+        defer rx.deinit();
+        var rm = (try rx.find(c[1])).?;
+        defer rm.deinit(a);
+        try std.testing.expectEqual(@as(usize, c[2]), rm.start);
+        try std.testing.expectEqual(@as(usize, c[3]), rm.end);
+    }
 }
 
 // The comptime DFA SIMD spin-skip (`comptime_dfa.runFromSpin`) only fires after
@@ -363,13 +394,14 @@ test "comptime DFA spin-skip: long wide-self-loop runs straddle SPIN_TRIGGER, pa
 }
 
 // Non-regular tier differential: backref / lookaround / atomic / possessive /
-// lazy-anchored patterns route to the comptime-baked tree backtracker
+// lazy-anchored patterns route to the comptime backtracker
 // (`has_dfa == false`, no DFA table — Steps 1-3 of the comptime-backtracker
 // work). This is the ONLY coverage that *instantiates* that `Pattern` arm —
 // every other test pattern is regular, so the arm is comptime-eliminated and a
 // green build says nothing about it. Calling `isMatch`/`find` here forces full
-// analysis of the baked `Hir(node_count)` + the generic `BacktrackerG(node_count)`,
-// so this file compiling at all is the primary proof those pieces type-check;
+// analysis of the trimmed `Hir(node_count)` and the matcher `compiled_bt.zig`
+// generates from it, so this file compiling at all is the primary proof those
+// pieces type-check;
 // the value checks then confirm the comptime matcher agrees with the runtime
 // `Regex` engine. Inputs are short (well under `backtrack.run`'s O(n) step
 // budget) so neither side hits the budget cut — comptime degrades it to `null`
@@ -421,10 +453,6 @@ test "comptime Pattern <-> runtime Regex agree: non-regular (tree backtracker) t
     try btAgree("a*+b", "aaab"); // possessive, match
     try btAgree("a*+a", "aaa"); // possessive, no match
     try btAgree("a{2,3}+a", "aaa"); // bounded possessive starves trailing `a`
-    // lazy + end-anchor: regular language, but `saw_lazy && anchored_end`
-    // routes to the tree backtracker (the DFA accept-cut can't model it).
-    try btAgree("a*?$", "aaa");
-    try btAgree(".*?b$", "aabxb");
 }
 
 // Comptime `.dup_word` arm (peer of the runtime `dup_word` engine): the
@@ -477,8 +505,8 @@ test "comptime .dup_word arm: adjacent-duplicate-word parity with runtime Regex"
 }
 
 // Comptime backtracker line-start enumeration (Fix 3): a `(?m)^…` pattern that
-// falls to the backtracker (body can match `\n`, or alt+`$`) enumerates line
-// starts instead of scanning every byte. `line_anchor_scan` proves the path
+// falls to the backtracker (its body can match `\n`, or has a look other than
+// the line anchors) enumerates line starts instead of scanning every byte. `line_anchor_scan` proves the path
 // engaged; find/count/findAll are pinned to the runtime `Regex` over a
 // multi-line haystack.
 fn lineScanAgree(comptime p: []const u8, in: []const u8) !void {
@@ -509,9 +537,11 @@ test "comptime backtracker line-start enumeration: (?m)^…$ parity with runtime
     try lineScanAgree(uk, "no postcodes here\nat all on any line\n");
     try lineScanAgree(uk, "");
     try lineScanAgree(uk, "EC1A1BB");
-    const isbn = "^(?:\\d{9}[\\dXx]|\\d{13})$";
-    try lineScanAgree(isbn, "123456789X\nbad\n9780306406157\n000000000\n12345\n");
-    try lineScanAgree(isbn, "line1\nline2\nline3\n");
+    // Alternation + `$` whose `\s` can match `\n` (a match may span lines), so
+    // it can't be a whole-line membership test: stays on the backtracker.
+    const phone = "^(?:\\d{3}\\s?\\d{4}|\\d{7}|\\d{3})$";
+    try lineScanAgree(phone, "555 1234\nbad\n5551234\n555\n1234\n555\n1234\n");
+    try lineScanAgree(phone, "line1\nline2\nline3\n");
 }
 
 // Comptime first-byte alternation dispatch (Task A): a top-level `.alt` pattern
@@ -636,6 +666,19 @@ test "comptime backtracker inherits the ReDoS step budget over a longer input" {
     }
 }
 
+test "comptime backtracker is compiled and still evaluates inside `comptime`" {
+    // The non-regular tier runs on the compiled backtracker
+    // (`exec/compiled_bt.zig`); it must stay usable from `comptime` (no
+    // allocator, no frame addresses there).
+    const P = regex.Pattern("(\\w+) \\1", .{});
+    comptime std.debug.assert(!P.has_dfa);
+    try std.testing.expectEqual(@as(usize, 2), comptime P.count("the the cat cat dog"));
+    try std.testing.expectEqual(@as(usize, 3), (comptime P.find("xx the the").?).start);
+    try std.testing.expectEqualStrings("b", (comptime P.captures("a b b").?).get(1).?.slice);
+    const Q = regex.Pattern("(?<=\\$)[0-9]+(?:\\.[0-9]{2})?|\\b(?:a|ab)+?c", .{});
+    try std.testing.expectEqual(@as(usize, 4), comptime Q.count("$12.50 abc $7 ababc"));
+}
+
 test "comptime backtracker findAll/count parity with runtime Regex" {
     // Non-overlapping iteration on the `.backtrack` arm must use the same
     // span-shift + empty-advance convention as the runtime engine.
@@ -659,10 +702,9 @@ test "comptime backtracker findAll/count parity with runtime Regex" {
     }
 }
 
-test "comptime backtracker bakes a trimmed HIR (rodata size sanity)" {
-    // Step 2: the baked HIR is trimmed to the pattern's exact node count, not
-    // the `HIR_CAP` = 2048 build ceiling — so a tiny non-regular pattern emits a
-    // tiny `.rodata` table rather than ~98 KB. `(ab)\1` is ~6 HIR nodes.
+test "comptime backtracker compiles a trimmed HIR" {
+    // The HIR is trimmed to the pattern's exact node count, not the `HIR_CAP` =
+    // 2048 build ceiling, before code generation. `(ab)\1` is ~6 HIR nodes.
     const P = regex.Pattern("(ab)\\1", .{});
     comptime std.debug.assert(!P.has_dfa);
     comptime std.debug.assert(P.bt_node_count > 0 and P.bt_node_count < 32);
@@ -710,15 +752,13 @@ test "comptime backtracker over-approx seek: findAll/count parity over dead gaps
     try seekParity("[A-Za-z]++;", "aa; ....... bb; ....... ccc; xyz");
 }
 
-test "comptime backtracker delegate: regular-island DFA == tree-walk (parity vs runtime)" {
-    // Concat-internal regular-island delegation, baked at comptime: a greedy
-    // regular PREFIX of a concat (the `.a` spine) runs at DFA speed via
-    // `core.matchEndFrom`, the irregular glue (lookahead) stays in the
-    // tree-walker. These patterns FIRE the baked delegate (verified: islands>0);
-    // the delegate is sound only if delegate-on == delegate-off, so comptime
-    // findAll/count must match the runtime engine span-for-span. Multi-match
-    // inputs with both hits and near-misses (the continuation fails ⇒ fall back
-    // to full `m(nd.a,…)` recursion) exercise both branches of the delegation.
+test "comptime backtracker: regular prefix + lookahead glue, parity vs runtime" {
+    // A greedy regular PREFIX of a concat (the `.a` spine) followed by
+    // irregular glue (lookahead). The runtime delegates the prefix to a DFA
+    // island (`exec/delegate.zig`); the comptime matcher compiles it as class
+    // scans. Both must agree span-for-span on findAll/count. Multi-match
+    // inputs with both hits and near-misses (the continuation fails ⇒ the
+    // prefix gives back) exercise both outcomes.
     try seekParity("[a-z]+[0-9]+(?=END)", "ab12END zz9END q aaaa1111ENDED a1END x000");
     // NOTE: `[A-Za-z]+ (?=\d)` and `x[0-9]*y+(?!Z)` used to live here (backtracker
     // + seek). They are now `concat(regular_core, trailing_width1_look)`, so they
@@ -804,24 +844,69 @@ test "comptime line-DFA (?m)^body$: DFA-backed, comptime == runtime" {
     try lineParity("(?m)^(?:GET|POST)", "GET /a\nPOST /b\nPUT /c\nGETX\n");
 }
 
-test "comptime line-DFA soundness: alt/lazy + $ fall back (priority-cut), comptime == runtime" {
-    // `$` + alternation/lazy: the leftmost-first priority-cut DFA could return a
-    // shorter, higher-priority accept that fails `$` while a longer alt would
-    // pass. These MUST NOT use the line-DFA (`!has_dfa`) and must match the
-    // backtracker. Pins the regression fix (isbn 13-digit, `(?:a|aa)$`).
+/// `(?m)^BODY$` with a `\n`-free body: the matches are exactly the WHOLE lines
+/// listed in `want` (indices of the `\n`-separated segments, including a final
+/// unterminated or empty one; hand-checked against L(BODY)). Both front-ends
+/// must return exactly those spans, from the line-DFA (`has_dfa`).
+fn wholeLineParity(comptime body: []const u8, in: []const u8, want: []const usize) !void {
     const a = std.testing.allocator;
-    const Cases = [_]struct { p: []const u8, in: []const u8, want: usize }{
-        .{ .p = "(?m)^(?:a|aa)$", .in = "aa\nb\na", .want = 2 },
-        .{ .p = "(?m)^(?:\\d{9}[\\dXx]|\\d{13})$", .in = "123456789X\n1234567890123\nbad", .want = 2 },
-        .{ .p = "(?m)^a{2,3}?$", .in = "aaa\naa\nb", .want = 2 },
-    };
-    inline for (Cases) |c| {
-        comptime std.debug.assert(!regex.Pattern(c.p, .{}).has_dfa); // fell back
-        var rx = try Regex.compile(a, c.p);
-        defer rx.deinit();
-        try std.testing.expectEqual(c.want, try rx.count(c.in));
-        try std.testing.expectEqual(c.want, regex.Pattern(c.p, .{}).count(c.in));
+    const p = "(?m)^(?:" ++ body ++ ")$";
+    const P = regex.Pattern(p, .{});
+    comptime std.debug.assert(P.has_dfa); // the line-DFA, not the backtracker
+    var spans: std.ArrayList([2]usize) = .empty;
+    defer spans.deinit(a);
+    var s: usize = 0;
+    var line: usize = 0;
+    var w: usize = 0;
+    while (true) : (line += 1) {
+        const e = std.mem.indexOfScalarPos(u8, in, s, '\n') orelse in.len;
+        if (w < want.len and want[w] == line) {
+            try spans.append(a, .{ s, e });
+            w += 1;
+        }
+        if (e == in.len) break;
+        s = e + 1;
     }
+    try std.testing.expectEqual(want.len, w); // every listed line exists
+    var rx = try Regex.compile(a, p);
+    defer rx.deinit();
+    const rms = try rx.findAll(a, in);
+    defer a.free(rms);
+    const pms = try P.findAll(a, in);
+    defer a.free(pms);
+    errdefer std.debug.print("\nwholeLineParity pattern={s} input=\"{f}\" want={d} runtime={d} comptime={d}\n", .{ p, std.zig.fmtString(in), spans.items.len, rms.len, pms.len });
+    try std.testing.expectEqual(spans.items.len, rms.len);
+    try std.testing.expectEqual(spans.items.len, pms.len);
+    for (spans.items, rms, pms) |sp, r, q| {
+        try std.testing.expectEqual(sp[0], r.start);
+        try std.testing.expectEqual(sp[1], r.end);
+        try std.testing.expectEqual(sp[0], q.start);
+        try std.testing.expectEqual(sp[1], q.end);
+    }
+    try std.testing.expectEqual(spans.items.len, try rx.count(in));
+    try std.testing.expectEqual(spans.items.len, P.count(in));
+}
+
+test "line-DFA whole-line mode: alt/lazy + $ as membership, == hand-checked lines" {
+    // `$` + alternation/lazy: the forward leftmost-first DFA could stop at a
+    // shorter, higher-priority accept that misses the line end while a longer
+    // alternative reaches it (`(?:a|aa)$` on "aa", isbn on a 13-digit line).
+    // With `^`, `$` and a `\n`-free body the only possible match on a line is
+    // the whole line, so both front-ends run these as whole-line membership on
+    // the body's reverse (no-cut) DFA.
+    try wholeLineParity("a|aa", "aa\nb\na", &.{ 0, 2 });
+    const isbn = "\\d{9}[\\dXx]|\\d{13}";
+    try wholeLineParity(isbn, "123456789X\n1234567890123\nbad\n12345678901234\n123456789\n", &.{ 0, 1 });
+    try wholeLineParity(isbn, "123456789X\nbad\n9780306406157\n000000000\n12345\n", &.{ 0, 2 });
+    try wholeLineParity(isbn, "line1\nline2\nline3\n", &.{});
+    try wholeLineParity("a{2,3}?", "aaa\naa\nb\naaaa\na", &.{ 0, 1 });
+    try wholeLineParity("(?:ab|a)(?:c|bc)", "abc\nabbc\nac\nabcc\n", &.{ 0, 1, 2 });
+    try wholeLineParity("a+?b*", "a\nab\nabbb\nb\naab\n", &.{ 0, 1, 2, 4 });
+    // Nullable bodies: empty lines, a trailing `\n`, and the empty final line.
+    try wholeLineParity("a|", "\na\n\naa\n", &.{ 0, 1, 2, 4 });
+    try wholeLineParity("(?:x|xy)*", "xyx\n\nxx\nyx\n", &.{ 0, 1, 2, 4 });
+    // A last line without `\n`; a CR is body content, so "…\r" is no match.
+    try wholeLineParity("4\\d{12}(?:\\d{3})?|5[1-5]\\d{14}", "4111111111111111\r\n4111111111111\n5500000000000004", &.{ 1, 2 });
 }
 
 test "comptime line-DFA with captures: DFA-backed, slots == runtime" {

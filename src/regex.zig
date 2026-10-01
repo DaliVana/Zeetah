@@ -29,7 +29,6 @@ const parser = @import("parser.zig");
 const thompson = @import("thompson.zig");
 const full_dfa = @import("exec/full_dfa.zig");
 const core = @import("exec/core.zig");
-const cc = @import("exec/charclass.zig");
 const line_dfa_mod = @import("exec/line_dfa.zig");
 const search = @import("exec/search.zig");
 const planner = @import("planner.zig");
@@ -186,13 +185,14 @@ pub const Regex = struct {
     /// `properties.line_first`). `null` ⇒ no filter (nullable body).
     bt_line_first: ?[32]u8 = null,
     /// `.bt_look` + `bt_line_anchor` only: a looks-stripped DFA for the regular
-    /// `\n`-free body of `(?m)^body$` / `(?m)^body` (no captures). When set, the
-    /// line scan runs ONE DFA pass per line (`matchEndFrom`) instead of the NFA
-    /// `matchAt` — the dominant per-line cost. `$` is verified by the longest
-    /// body end landing on a line terminator (sound: a `\n`-free body's longest
-    /// accept never crosses the line). See `properties.lineAnchoredRegular`.
+    /// `\n`-free body of `(?m)^body$` / `(?m)^body`. When set, the line scan
+    /// runs ONE DFA pass per line (`line_dfa.nextFrom`) instead of the NFA
+    /// `matchAt` — the dominant per-line cost. `line_mode` says how: the forward
+    /// body DFA (`.prefix` / `.dollar`), or — for an alternation/lazy body with
+    /// `$` — the body's REVERSE DFA as a whole-line membership test
+    /// (`.whole_line`). See `properties.lineAnchoredRegular`.
     line_dfa: ?*full_dfa.PackedDfa = null,
-    line_has_dollar: bool = false,
+    line_mode: line_dfa_mod.Mode = .prefix,
     /// `.bt_look` only: the REVERSE DFA (`full_dfa.computeReverse`) of the body
     /// of a reverse end-anchored pattern (`(?m)<class>+$` / `<class>+\Z`,
     /// unanchored start, regular non-nullable body, no captures —
@@ -757,16 +757,18 @@ pub const Regex = struct {
     /// applies when `props.has_look`. Consumes `nheap` (the retained NFA).
     fn buildBtLook(allocator: std.mem.Allocator, h: *hir.Hir(null), nheap: ?*thompson.Nfa(null), props: properties.Properties, owned: []const u8, flags: common.CompileFlags, ng: usize, gnames: GNames) !Regex {
         var line_dfa: ?*full_dfa.PackedDfa = null;
-        var line_has_dollar = false;
+        var line_mode: line_dfa_mod.Mode = .prefix;
         errdefer if (line_dfa) |p| {
             p.deinit(allocator);
             allocator.destroy(p);
         };
         if (props.bounds.start == .line) {
             if (properties.lineAnchoredRegular(null, h)) |shape| {
-                if (buildLineDfa(allocator, h)) |d| {
-                    line_dfa = d;
-                    line_has_dollar = shape.has_dollar;
+                const mode = line_dfa_mod.Mode.of(shape);
+                const d = if (mode == .whole_line) buildRevEndDfa(allocator, h) else buildLineDfa(allocator, h);
+                if (d) |dd| {
+                    line_dfa = dd;
+                    line_mode = mode;
                 }
             }
         }
@@ -815,7 +817,7 @@ pub const Regex = struct {
             .bt_line_anchor = props.bounds.start == .line,
             .bt_line_first = props.line_first,
             .line_dfa = line_dfa,
-            .line_has_dollar = line_has_dollar,
+            .line_mode = line_mode,
             .rev_end_dfa = rev_end_dfa,
             .rev_end_kind = if (rev_end_dfa != null) props.rev_end.? else .unanchored,
             .n_groups = ng,
@@ -1246,9 +1248,9 @@ pub const Regex = struct {
         // Fast path FIRST: the line-DFA scan needs none of the NFA scratch, so
         // take it before paying the O(n) `(state,pos)` bitset `ensure` below.
         if (self.line_dfa) |dfa| return self.lineDfaScan(dfa, input, from);
-        // Over the backtracker's visited budget: the PikeVM evaluates the
-        // leading `(?m)^` itself, so an unanchored search finds the same match.
-        if (!bounded_bt.fits(self.nfa.?.n_states, input.len - from)) return self.pikeFind(input, from);
+        // Over the backtracker's visited budget (it is sized to the whole rest
+        // of the input): keep the line-start enumeration, on the PikeVM.
+        if (!bounded_bt.fits(self.nfa.?.n_states, input.len - from)) return self.pikeLineScan(input, from);
         const pool = self.bt_pool.?;
         const sc = try pool.get();
         defer pool.put(sc);
@@ -1259,12 +1261,35 @@ pub const Regex = struct {
         return core.Span{ .start = s.start, .end = s.end };
     }
 
+    /// The over-budget peer of `findLineStart`: the same line-start
+    /// enumeration and first-byte reject (`line_dfa.scanLineStarts`), with
+    /// the PikeVM (`O(n_states)` memory) anchored at each candidate line
+    /// start. An unanchored PikeVM over the rest of the input instead runs
+    /// every byte of every line.
+    fn pikeLineScan(self: *const Regex, input: []const u8, from: usize) !?core.Span {
+        const pool = self.pike_pool.?;
+        const sc = try pool.get();
+        defer pool.put(sc);
+        var vm = try pikevm.PikeVm.init(self.nfa.?, self.nfa_idx.?.*, self.bt_a_start, self.bt_a_end, sc, 2);
+        const Line = struct {
+            vm: *pikevm.PikeVm,
+            input: []const u8,
+
+            pub fn attempt(self_: @This(), s: usize, _: usize) !?core.Span {
+                var slots: [2]hir.Slot = undefined;
+                if (try self_.vm.search(self_.input, s, .{ .anchored = true }, &slots)) |m| return core.Span{ .start = m.start, .end = m.end };
+                return null;
+            }
+        };
+        return line_dfa_mod.scanLineStarts(input, from, if (self.bt_line_first) |*set| set else null, Line{ .vm = &vm, .input = input });
+    }
+
     /// Line-anchored regular fast path (`line_dfa` set): the shared
     /// `line_dfa.nextFrom` walker (also used by the comptime `Pattern`) runs one
-    /// looks-stripped body-DFA pass per line over the FULL input (absolute
-    /// coords). See `exec/line_dfa.zig` for the soundness argument.
+    /// body-DFA pass per line over the FULL input (absolute coords). See
+    /// `exec/line_dfa.zig` for the soundness argument of each `line_mode`.
     fn lineDfaScan(self: *const Regex, dfa: *const full_dfa.PackedDfa, input: []const u8, from: usize) ?core.Span {
-        return line_dfa_mod.nextFrom(dfa, self.line_has_dollar, if (self.bt_line_first) |*set| set else null, input, from);
+        return line_dfa_mod.nextFrom(dfa, self.line_mode, if (self.bt_line_first) |*set| set else null, input, from);
     }
 
     /// Build the looks-stripped body DFA for a `lineAnchoredRegular` pattern:
@@ -1284,11 +1309,12 @@ pub const Regex = struct {
         return heap;
     }
 
-    /// Build the REVERSE body DFA for a `revEndAnchored` pattern: clone the HIR
-    /// relaxing every look to `ε` (strips the trailing `$`/`\Z`; there are no
-    /// other looks), Thompson-build, and `computeReverse`. `null` on any
-    /// build/ceiling failure (or a reverse explosion) ⇒ caller keeps the NFA
-    /// `bt_look` scan. Mirror of `buildLineDfa`, but reversed for the end anchor.
+    /// Build the REVERSE body DFA for a `revEndAnchored` pattern or a
+    /// `whole_line` line shape: clone the HIR relaxing every look to `ε` (strips
+    /// the `^`/`$`/`\Z` anchors; there are no other looks), Thompson-build, and
+    /// `computeReverse` (no priority cut). `null` on any build/ceiling failure
+    /// (or a reverse explosion) ⇒ caller keeps the NFA `bt_look` scan. Mirror of
+    /// `buildLineDfa`, reversed.
     fn buildRevEndDfa(allocator: std.mem.Allocator, h: *const hir.Hir(null)) ?*full_dfa.PackedDfa {
         var oh = hir.Hir(null).initRuntime();
         defer oh.deinit(allocator);
@@ -1998,4 +2024,34 @@ test "regex(meta): look search + captures past the backtracker's visited budget 
     defer c.deinit(a);
     try std.testing.expectEqual(@as(usize, 5 * (wlen + 1)), c.groups[1].?.start);
     try std.testing.expectEqual(@as(usize, 5 * (wlen + 1) + wlen), c.groups[1].?.end);
+}
+
+test "regex(meta): (?m)^ line scan past the backtracker's visited budget stays on line starts" {
+    const a = std.testing.allocator;
+    // `\b` keeps this off the line-DFA; `[a-z]{1,400}` makes the NFA large
+    // enough that the visited window for the whole input exceeds
+    // `bounded_bt.VISITED_BUDGET_BYTES`, so the scan runs the PikeVM anchored
+    // at each line start (`pikeLineScan`). Every 3rd line matches.
+    const pat = "(?m)^\\b[a-z]{1,400}[0-9]$";
+    const lines = 4000;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    for (0..lines) |i| {
+        try buf.appendSlice(a, switch (i % 3) {
+            0 => "abcdefghijklmnopqrstuvwxyz7",
+            1 => "abcdefghijklmnopqrstuvwxyz",
+            else => "9abcdefghijklmnopqrstuvwxyz",
+        });
+        try buf.append(a, '\n');
+    }
+    var rx = try Regex.compileWithFlags(a, pat, .{});
+    defer rx.deinit();
+    try std.testing.expect(rx.kind == .bt_look and rx.bt_line_anchor and rx.line_dfa == null);
+    try std.testing.expect(!bounded_bt.fits(rx.nfa.?.n_states, buf.items.len));
+    try std.testing.expectEqual(@as(usize, (lines + 2) / 3), try rx.count(buf.items));
+    // Resuming mid-line (inside line 0) finds line 3, not a fake line start.
+    const line3 = 28 + 27 + 28; // lines 0-2 with their '\n'
+    const m = (try rx.findFrom(buf.items, 5)).?;
+    try std.testing.expectEqual(@as(usize, line3), m.start);
+    try std.testing.expectEqual(@as(usize, line3 + 27), m.end);
 }

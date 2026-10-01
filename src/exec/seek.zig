@@ -57,8 +57,7 @@ inline fn lowerApprox(dst: *H, a: std.mem.Allocator, src: *const H, ref: NodeRef
 /// monomorphized `findLeftmost`-based locator (`pattern.zig` supplies both as a
 /// pair). `locate` returns the same absolute candidate start the runtime `dfa`
 /// path would (it wraps the differential-pinned `findLeftmost`). Bundling the
-/// pointer + function in one optional encodes the both-or-neither invariant —
-/// mirrors `delegate.Island`.
+/// pointer + function in one optional encodes the both-or-neither invariant.
 pub const Cdfa = struct {
     ptr: *const anyopaque,
     locate_fn: *const fn (*const anyopaque, []const u8, usize) ?usize,

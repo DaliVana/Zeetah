@@ -2,9 +2,10 @@
 //!
 //! The meta engine is a DFA: lazy means the *earliest* accepting end is
 //! taken (minimal match) at the leftmost start, vs greedy's latest end.
-//! Lazy *combined with an end-anchor* (`a*?$`) is the one shape the DFA
-//! accept-cut cannot model, so it routes to the tree backtracker instead
-//! (still leftmost-first); covered in the end-anchor test below.
+//! Lazy *combined with an end-anchor* (`a*?$`) is regular too: the
+//! end-anchored DFA drops its leftmost-first accept cut, so the match is
+//! start-fixed and ends at the anchor whatever the greediness (still
+//! leftmost-first); covered in the end-anchor test below.
 
 const std = @import("std");
 const regex = @import("zeetah");

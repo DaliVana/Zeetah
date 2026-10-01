@@ -152,8 +152,8 @@ pub fn Hir(comptime cap: ?usize) type {
         /// Prescan results (see `parser.prescan`).
         anchored_start: bool,
         anchored_end: bool,
-        /// Set when any lazy quantifier fragment is produced (drives the
-        /// `anchored_end && saw_lazy` fallback the old `computeDfa` applies).
+        /// Set when any lazy quantifier fragment is produced (gates the
+        /// literal prefilters that must not see `.*?`-bearing shapes).
         saw_lazy: bool,
 
         /// Comptime store initializer (no allocator).

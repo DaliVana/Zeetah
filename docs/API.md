@@ -764,8 +764,8 @@ comptime std.debug.assert(!Dup.has_dfa);
 minimized DFA (or a comptime Teddy literal); non-regular patterns bake the same
 bounded tree-backtracker the runtime uses, including **captures** (numbered + named),
 **lookaround**, **backreferences**, **atomic/possessive** quantifiers, **word
-boundaries** (`\b`/`\B`), **`(?m)` line anchors**, and **lazy-with-end-anchor**
-(`a*?$`). `\p{…}` is supported (allocator-free resolver).
+boundaries** (`\b`/`\B`) and **`(?m)` line anchors**. `\p{…}` is supported
+(allocator-free resolver).
 
 Because a `Pattern` bakes a single matcher with **no runtime fallback**, the
 constructs that are genuinely unsupported *anywhere* in the engine are a hard

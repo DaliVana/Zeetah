@@ -367,12 +367,11 @@ fn parseInner(
     // backrefs are already validated at parse time via `lookupName`.
     if (p.max_backref > p.n_groups) return Error.Invalid;
 
-    // Lazy + end-anchor (`a*?$`): the leftmost-first DFA accept-cut cannot
-    // honor "earliest lazy accept" *and* "accept == end-of-text" at once, so
-    // the construction cut can't model it. Rather than reject, `properties`
-    // flags `saw_lazy && anchored_end` as `requires_backtracking` and routes it
-    // to the tree backtracker, which handles lazy (`nd.greedy`) and the
-    // end-anchor (`accept_at = len`) independently and correctly.
+    // Lazy + end-anchor (`a*?$`) is regular and stays on the DFA path: the
+    // end-anchored DFAs drop their leftmost-first accept cut under `a_end`
+    // (the cut mis-modelled lazy-against-`$` and alternation-against-`$`,
+    // `^(?:a|aa)$`, alike). `saw_lazy` is recorded for the prefilter gates
+    // that exclude `.*?`-bearing shapes, not for engine routing.
     h.root = root;
     h.saw_lazy = p.saw_lazy;
     // Runtime store: bound the tree depth for the recursive walks downstream

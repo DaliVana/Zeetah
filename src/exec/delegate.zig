@@ -44,16 +44,13 @@ const NodeRef = hir.NodeRef;
 const MAX_ISLANDS: usize = 32;
 
 /// Is `ref`'s subtree a delegatable regular island? (See module soundness.)
-/// `pub` + generic over the store cap so the comptime path (`pattern.zig`'s
-/// baked-delegate builder) reuses the SAME classifier as the runtime — the
-/// soundness argument above holds identically for both.
-pub fn delegatable(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) bool {
+fn delegatable(h: *const H, ref: NodeRef) bool {
     if (ref == hir.none) return false;
     const nd = h.node(ref);
     return switch (nd.tag) {
         .empty, .set => true,
-        .concat => delegatable(cap, h, nd.a) and delegatable(cap, h, nd.b),
-        .star, .plus, .opt => nd.greedy and delegatable(cap, h, nd.a),
+        .concat => delegatable(h, nd.a) and delegatable(h, nd.b),
+        .star, .plus, .opt => nd.greedy and delegatable(h, nd.a),
         // alt (priority/longest mismatch), lazy (handled above via !greedy),
         // cap/backref/look/look_around (irregular or slot-writing), atomic
         // (non-regular cut) → no.
@@ -66,25 +63,25 @@ pub fn delegatable(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) b
 /// the tree-walker in tight O(len) already — compiling a minimized DFA for it
 /// is pure compile-time cost for no runtime gain. Delegation only earns its
 /// keep when a `*`/`+` makes the run length unbounded.
-pub fn hasUnboundedRep(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) bool {
+fn hasUnboundedRep(h: *const H, ref: NodeRef) bool {
     const nd = h.node(ref);
     return switch (nd.tag) {
         .star, .plus => true,
-        .opt => hasUnboundedRep(cap, h, nd.a),
-        .concat => hasUnboundedRep(cap, h, nd.a) or hasUnboundedRep(cap, h, nd.b),
+        .opt => hasUnboundedRep(h, nd.a),
+        .concat => hasUnboundedRep(h, nd.a) or hasUnboundedRep(h, nd.b),
         else => false,
     };
 }
 
 /// Minimum match width of a delegatable subtree (only called on subtrees
 /// `delegatable` already accepted, so the irregular tags never occur).
-pub fn minLen(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) usize {
+fn minLen(h: *const H, ref: NodeRef) usize {
     const nd = h.node(ref);
     return switch (nd.tag) {
         .empty => 0,
         .set => 1,
-        .concat => minLen(cap, h, nd.a) + minLen(cap, h, nd.b),
-        .plus => minLen(cap, h, nd.a),
+        .concat => minLen(h, nd.a) + minLen(h, nd.b),
+        .plus => minLen(h, nd.a),
         .star, .opt => 0,
         else => 0,
     };
@@ -97,55 +94,24 @@ inline fn copyReg(dst: *H, a: std.mem.Allocator, src: *const H, ref: NodeRef) hi
     return hir.cloneSubtree(null, null, dst, a, src, ref, false);
 }
 
-/// Type-erased "match this island anchored from `pos`, return its
-/// greedy-maximal end" function. The pointer is the island's compiled DFA
-/// (a runtime heap `full_dfa.Dfa256`, or a comptime-baked compressed
-/// `comptime_dfa.Dfa(ns,nk)`); the function knows the concrete type. Erasure
-/// lets a single `Plan` hold islands of heterogeneous compressed types — the
-/// comptime path bakes each island as its own minimized `[ns][nk]` table
-/// (a few hundred `.rodata` bytes) instead of a full 131 KB `Dfa256`.
-pub const MatchFn = *const fn (*const anyopaque, []const u8, usize) ?usize;
-
-/// An island handle: its DFA pointer + monomorphized matcher. `matchEnd`
-/// returns the anchored leftmost-longest end at `pos`, or null.
-pub const Island = struct {
-    ptr: *const anyopaque,
-    match_fn: MatchFn,
-    pub inline fn matchEnd(self: Island, input: []const u8, pos: usize) ?usize {
-        return self.match_fn(self.ptr, input, pos);
-    }
-};
-
-/// Runtime island matcher: the erased pointer is a heap `full_dfa.PackedDfa`.
-fn packedDfaMatchEnd(p: *const anyopaque, input: []const u8, pos: usize) ?usize {
-    const d: *const full_dfa.PackedDfa = @ptrCast(@alignCast(p));
-    return d.runFrom(input, pos);
-}
-
 pub const Plan = struct {
     allocator: std.mem.Allocator,
     refs: [MAX_ISLANDS]NodeRef = [_]NodeRef{hir.none} ** MAX_ISLANDS,
-    /// Erased island DFA pointers (`*full_dfa.Dfa256` at runtime, baked
-    /// `comptime_dfa.Dfa(ns,nk)` at comptime) + their monomorphized matchers.
-    dfas: [MAX_ISLANDS]*const anyopaque = undefined,
-    match_fns: [MAX_ISLANDS]MatchFn = undefined,
+    /// Each island's anchored DFA, heap-packed (right-sized, not a 128 KB
+    /// `Dfa256`); `runFrom` returns its greedy-maximal end at a position.
+    dfas: [MAX_ISLANDS]*full_dfa.PackedDfa = undefined,
     n: usize = 0,
 
-    /// The island handle for HIR root `ref`, or null if `ref` is not a
-    /// delegated island. Linear scan over a tiny table.
-    pub fn dfaFor(self: *const Plan, ref: NodeRef) ?Island {
+    /// The island DFA for HIR root `ref`, or null if `ref` is not a delegated
+    /// island. Linear scan over a tiny table.
+    pub fn dfaFor(self: *const Plan, ref: NodeRef) ?*const full_dfa.PackedDfa {
         var i: usize = 0;
-        while (i < self.n) : (i += 1) if (self.refs[i] == ref)
-            return .{ .ptr = self.dfas[i], .match_fn = self.match_fns[i] };
+        while (i < self.n) : (i += 1) if (self.refs[i] == ref) return self.dfas[i];
         return null;
     }
 
     pub fn deinit(self: *Plan) void {
-        var i: usize = 0;
-        // Runtime islands are heap `full_dfa.PackedDfa` (the only builder that
-        // calls `deinit`); the comptime baked `Plan` is never `deinit`'d.
-        while (i < self.n) : (i += 1) {
-            const pd = @as(*full_dfa.PackedDfa, @constCast(@ptrCast(@alignCast(self.dfas[i]))));
+        for (self.dfas[0..self.n]) |pd| {
             pd.deinit(self.allocator);
             self.allocator.destroy(pd);
         }
@@ -166,9 +132,9 @@ pub fn build(allocator: std.mem.Allocator, h: *const H) ?*Plan {
     while (ref < n_nodes and pl.n < MAX_ISLANDS) : (ref += 1) {
         const nd = h.node(ref);
         if (nd.tag != .concat) continue;
-        if (!delegatable(null, h, nd.a)) continue;
-        if (minLen(null, h, nd.a) < 1) continue; // nullable ⇒ no work saved
-        if (!hasUnboundedRep(null, h, nd.a)) continue; // fixed run ⇒ DFA not worth it
+        if (!delegatable(h, nd.a)) continue;
+        if (minLen(h, nd.a) < 1) continue; // nullable ⇒ no work saved
+        if (!hasUnboundedRep(h, nd.a)) continue; // fixed run ⇒ DFA not worth it
 
         // Extract the island into its own anchored DFA.
         var oh = H.initRuntime();
@@ -183,7 +149,6 @@ pub fn build(allocator: std.mem.Allocator, h: *const H) ?*Plan {
         const heap = full_dfa.packHeap(allocator, &d) catch continue;
         pl.refs[pl.n] = nd.a;
         pl.dfas[pl.n] = heap;
-        pl.match_fns[pl.n] = packedDfaMatchEnd;
         pl.n += 1;
     }
 
