@@ -89,7 +89,7 @@ const VT = @Vector(TW, u8);
 /// candidate filter far more selective on natural text. Used only by the
 /// scalar, comptime-safe `Teddy.build`.
 pub const FREQ: [256]u16 = blk: {
-    var f = [_]u16{1} ** 256; // unknown/binary bytes: rare (good probes)
+    var f: [256]u16 = @splat(1); // unknown/binary bytes: rare (good probes)
     // Letter frequencies (per-mille, Cornell/Lewand ordering), applied to
     // both cases; uppercase damped (rarer in running text).
     const letters = "etaoinshrdlcumwfgypbvkjxqz";
@@ -163,14 +163,14 @@ pub const Prefilter = union(enum) {
         if (nmem == 1) return .{ .single = members[0] };
 
         if (nmem <= 8) {
-            var m: [8]u8 = .{0} ** 8;
+            var m: [8]u8 = @splat(0);
             for (0..nmem) |i| m[i] = members[i];
             return .{ .multi = .{ .b = m, .n = @intCast(nmem) } };
         }
 
         if (nruns <= 8) {
-            var lo: [8]u8 = .{0} ** 8;
-            var span: [8]u8 = .{0} ** 8;
+            var lo: [8]u8 = @splat(0);
+            var span: [8]u8 = @splat(0);
             for (0..nruns) |i| {
                 lo[i] = runs_lo[i];
                 span[i] = runs_hi[i] - runs_lo[i];
@@ -621,19 +621,19 @@ pub const Teddy = struct {
     pub const MAX_NEEDLES: usize = 8;
     pub const MAX_LEN: usize = 64;
 
-    pat: [MAX_NEEDLES][MAX_LEN]u8 = [_][MAX_LEN]u8{[_]u8{0} ** MAX_LEN} ** MAX_NEEDLES,
-    len: [MAX_NEEDLES]u8 = [_]u8{0} ** MAX_NEEDLES,
+    pat: [MAX_NEEDLES][MAX_LEN]u8 = @splat(@splat(0)),
+    len: [MAX_NEEDLES]u8 = @splat(0),
     n: u8 = 0,
-    first: [32]u8 = [_]u8{0} ** 32,
+    first: [32]u8 = @splat(0),
 
     // --- two-byte filter (rare-byte heuristic), one entry per needle ---
     /// First byte of needle w (== pat[w][0]); kept explicit so the hot loop
     /// never indexes `pat`.
-    b1: [MAX_NEEDLES]u8 = [_]u8{0} ** MAX_NEEDLES,
+    b1: [MAX_NEEDLES]u8 = @splat(0),
     /// The statistically rarest byte within needle w (by `FREQ`).
-    b2: [MAX_NEEDLES]u8 = [_]u8{0} ** MAX_NEEDLES,
+    b2: [MAX_NEEDLES]u8 = @splat(0),
     /// Offset of `b2` within needle w. `0` sentinel when len==1 (unused).
-    o: [MAX_NEEDLES]u8 = [_]u8{0} ** MAX_NEEDLES,
+    o: [MAX_NEEDLES]u8 = @splat(0),
     /// True iff every needle has len>=2 (so the 2-byte filter / Teddy are
     /// sound for the whole set; a len-1 needle has no decorrelated 2nd byte).
     all_ge2: bool = false,
@@ -645,8 +645,8 @@ pub const Teddy = struct {
     one_memchr: bool = false,
 
     // --- Teddy nibble masks (8 buckets = 1 bit per needle) ---
-    mask_lo: [TEDDY_MAXMASK][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** TEDDY_MAXMASK,
-    mask_hi: [TEDDY_MAXMASK][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** TEDDY_MAXMASK,
+    mask_lo: [TEDDY_MAXMASK][16]u8 = @splat(@splat(0)),
+    mask_hi: [TEDDY_MAXMASK][16]u8 = @splat(@splat(0)),
     /// Mask bytes actually used: starts at min(min_len, TEDDY_NMASK) and is
     /// deepened by `build` (≤ min_len, ≤ TEDDY_MAXMASK) until the prefixes
     /// separate the needle set, so the necessary condition stays selective.
@@ -659,17 +659,17 @@ pub const Teddy = struct {
     // these are materialised at pattern-compile time and the hot finders just
     // read them.
     /// `@splat(b1[k])` — first byte of needle k, broadcast.
-    splat_b1: [MAX_NEEDLES]V = [_]V{@splat(0)} ** MAX_NEEDLES,
+    splat_b1: [MAX_NEEDLES]V = @splat(@splat(0)),
     /// `@splat(b2[k])` — rare byte of needle k, broadcast.
-    splat_b2: [MAX_NEEDLES]V = [_]V{@splat(0)} ** MAX_NEEDLES,
+    splat_b2: [MAX_NEEDLES]V = @splat(@splat(0)),
     /// `@splat(1 << k)` — needle k's bucket bit, broadcast (findMulti).
-    splat_bit: [MAX_NEEDLES]V = [_]V{@splat(0)} ** MAX_NEEDLES,
+    splat_bit: [MAX_NEEDLES]V = @splat(@splat(0)),
     /// max rare-byte offset across needles (findMulti loop bound).
     maxo: usize = 0,
     /// Width-tiled low/high nibble tables (findTeddy); on AVX2 this also
     /// bakes the both-128-lane duplication once instead of per call.
-    tlv: [TEDDY_MAXMASK]VT = [_]VT{@splat(0)} ** TEDDY_MAXMASK,
-    thv: [TEDDY_MAXMASK]VT = [_]VT{@splat(0)} ** TEDDY_MAXMASK,
+    tlv: [TEDDY_MAXMASK]VT = @splat(@splat(0)),
+    thv: [TEDDY_MAXMASK]VT = @splat(@splat(0)),
 
     pub const Hit = struct { start: usize, which: u8 };
 
@@ -974,7 +974,7 @@ test "teddy: multi-substring find matches a naive scan" {
 test "teddy: build rejects degenerate inputs" {
     try std.testing.expect(Teddy.build(&[_][]const u8{}) == null);
     try std.testing.expect(Teddy.build(&[_][]const u8{ "ok", "" }) == null);
-    const big = "x" ** (Teddy.MAX_LEN + 1);
+    const big = common.repeat("x", Teddy.MAX_LEN + 1);
     try std.testing.expect(Teddy.build(&[_][]const u8{big}) == null);
 }
 
@@ -1070,9 +1070,9 @@ pub fn AhoCorasickN(comptime MAX_NODES: usize) type {
         // is never a goto target). fail[node] -> failure link. out_len[node] ->
         // the length of a needle ending here (0 = none); ties keep the shortest
         // so the reported start is the earliest possible (still a sound prefilter).
-        goto: [MAX_NODES][256]u16 = [_][256]u16{[_]u16{0} ** 256} ** MAX_NODES,
-        fail: [MAX_NODES]u16 = [_]u16{0} ** MAX_NODES,
-        out_len: [MAX_NODES]u16 = [_]u16{0} ** MAX_NODES,
+        goto: [MAX_NODES][256]u16 = @splat(@splat(0)),
+        fail: [MAX_NODES]u16 = @splat(0),
+        out_len: [MAX_NODES]u16 = @splat(0),
         n_nodes: usize = 1, // node 0 = root
 
         pub const Hit = struct { start: usize, len: usize };
@@ -1239,7 +1239,7 @@ pub const LiteralAltScanner = struct {
 
     /// `build` with an explicit table byte ceiling (tests use a small one).
     pub fn buildLimited(allocator: std.mem.Allocator, needles: []const []const u8, mem_limit: usize) !?LiteralAltScanner {
-        var class_of = [_]u16{0} ** 256;
+        var class_of: [256]u16 = @splat(0);
         var width: usize = 1;
         for (needles) |nd| {
             if (nd.len == 0) return null;

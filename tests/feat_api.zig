@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const regex = @import("zeetah");
+const rep = regex.common.repeat;
 const Regex = regex.Regex;
 
 test "public surface: types reachable through signatures are nameable" {
@@ -191,7 +192,7 @@ const rsuffix_corpus = [_][]const u8{
     "Quick brown fox jumps over foobar end",
     "prefix Z then later foobar and foobar again",
     "UPPER then nothing matching",
-    "z" ** 200 ++ "foobar",
+    rep("z", 200) ++ "foobar",
 };
 
 test "reverse_suffix: find/isMatch consistent with an independent recompile" {
@@ -380,17 +381,17 @@ fn spinAgree(comptime p: []const u8, in: []const u8) !void {
 test "comptime DFA spin-skip: long wide-self-loop runs straddle SPIN_TRIGGER, parity with runtime" {
     // `.*X` / `[^"]*"` / `<[^>]+>` / base64 — wide self-loop states (`has_spin`).
     inline for (.{ 1, 62, 63, 64, 65, 66, 130, 200 }) |n| {
-        try spinAgree(".*x", "a" ** n ++ "x" ++ "tail");
-        try spinAgree(".*x", "a" ** n); // no terminator → run to EOI, no match
-        try spinAgree("\"[^\"]*\"", "\"" ++ "b" ** n ++ "\" rest");
-        try spinAgree("<[^>]+>", "<" ++ "c" ** n ++ "> after");
-        try spinAgree("[A-Za-z0-9+/]+=*", "Zm9v" ** n ++ "== next"); // base64-ish
-        try spinAgree(".*=.*", "k" ** n ++ "=" ++ "v" ** n); // two long runs
+        try spinAgree(".*x", rep("a", n) ++ "x" ++ "tail");
+        try spinAgree(".*x", rep("a", n)); // no terminator → run to EOI, no match
+        try spinAgree("\"[^\"]*\"", "\"" ++ rep("b", n) ++ "\" rest");
+        try spinAgree("<[^>]+>", "<" ++ rep("c", n) ++ "> after");
+        try spinAgree("[A-Za-z0-9+/]+=*", rep("Zm9v", n) ++ "== next"); // base64-ish
+        try spinAgree(".*=.*", rep("k", n) ++ "=" ++ rep("v", n)); // two long runs
     }
     // Multiple matches over a long input — exercises the spin path under
     // `findAll`/`count` non-overlapping resume.
-    try spinAgree("<[^>]+>", "<" ++ "a" ** 100 ++ "> mid <" ++ "b" ** 100 ++ "> end");
-    try spinAgree(".*x", ("y" ** 80 ++ "x\n") ** 4);
+    try spinAgree("<[^>]+>", "<" ++ rep("a", 100) ++ "> mid <" ++ rep("b", 100) ++ "> end");
+    try spinAgree(".*x", rep(rep("y", 80) ++ "x\n", 4));
 }
 
 // Non-regular tier differential: backref / lookaround / atomic / possessive /

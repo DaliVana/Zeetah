@@ -18,7 +18,7 @@ jobs:
 
       - uses: mlugg/setup-zig@v2
         with:
-          version: '0.17.0-dev.56+a8226cd53'
+          version: '0.17.0-dev.2384+ac77c23af'
 
       - name: Build
         run: zig build
@@ -51,7 +51,7 @@ jobs:
 
       - uses: mlugg/setup-zig@v2
         with:
-          version: '0.17.0-dev.56+a8226cd53'
+          version: '0.17.0-dev.2384+ac77c23af'
 
       - name: Build (${{ matrix.target }})
         run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast

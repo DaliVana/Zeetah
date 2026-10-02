@@ -4,7 +4,7 @@
 
 **Zig fast regex meta engine**
 
-[![Zig](https://img.shields.io/badge/Zig-0.16+-orange.svg)](https://ziglang.org)
+[![Zig](https://img.shields.io/badge/Zig-0.17+-orange.svg)](https://ziglang.org)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 [Overview](#overview) · [Install](#installation) · [Quick Start](#quick-start) · [The meta engine](#the-meta-engine) · [Features](#feature-support) · [API](#public-api) · [Docs](#documentation)
@@ -44,7 +44,7 @@ Zeetah grew out of two earlier Zig projects and owes them a direct debt — see
 
 ## Installation
 
-Requires **Zig 0.16+**. Zeetah has no external dependencies.
+Requires **Zig 0.17+** (0.17.0-dev.2384 or newer). Zeetah has no external dependencies.
 
 ### As a package
 
@@ -583,7 +583,7 @@ zig build parity   # run the meta-engine smoke harness
 
 ## Requirements
 
-- Zig 0.16 or later
+- Zig 0.17 or later (0.17.0-dev.2384+)
 - No external dependencies
 
 ## Acknowledgments

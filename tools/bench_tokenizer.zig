@@ -134,8 +134,8 @@ pub fn main() !void {
         \\  throughput  : {d:.1} MiB/s, {d:.2} M pre-tokens/s
         \\
     , .{
-        mb,                  bytes.len,
-        ntok,                secs * 1000.0,
-        mb / secs,           (@as(f64, @floatFromInt(ntok)) / 1e6) / secs,
+        mb,        bytes.len,
+        ntok,      secs * 1000.0,
+        mb / secs, (@as(f64, @floatFromInt(ntok)) / 1e6) / secs,
     });
 }

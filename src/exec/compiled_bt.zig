@@ -72,7 +72,7 @@ pub const Opts = struct {
     /// a match there (from each branch's FIRST-set; a nullable branch is a
     /// candidate for every byte). Empty ⇒ the root is matched whole.
     alt_branches: []const NodeRef = &.{},
-    alt_table: [256]AltMask = [_]AltMask{0} ** 256,
+    alt_table: [256]AltMask = @splat(0),
 };
 
 /// Per-search state, one per `runFrom`. Node functions take it by pointer.
@@ -895,7 +895,7 @@ fn parseForTest(comptime pattern: []const u8) Parsed {
     @setEvalBranchQuota(100_000_000);
     var h = hir.Hir(TEST_HIR_CAP).initComptime();
     var ng: usize = 0;
-    var names = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1);
+    var names: [hir.MAX_GROUPS + 1]?[]const u8 = @splat(null);
     parser.parseCaptures(TEST_HIR_CAP, &h, undefined, pattern, .{}, &ng, &names) catch
         return .{ .h = h, .ng = 0, .ok = false };
     return .{ .h = h, .ng = ng, .ok = true };
@@ -914,7 +914,7 @@ fn trimForTest(comptime src: hir.Hir(TEST_HIR_CAP)) hir.Hir(src.node_count) {
     t.saw_lazy = src.saw_lazy;
     for (0..n) |i| t.nodes[i] = src.nodes[i];
     for (0..src.set_count) |s| t.sets[s] = src.sets[s];
-    for (src.set_count..n) |s| t.sets[s] = [_]u8{0} ** 32;
+    for (src.set_count..n) |s| t.sets[s] = @splat(0);
     return t;
 }
 

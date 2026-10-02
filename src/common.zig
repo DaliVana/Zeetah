@@ -20,6 +20,19 @@ pub const CharRange = struct {
     }
 };
 
+/// Comptime string repetition — the replacement for the `**` array-repeat
+/// operator Zig 0.17 removed. `repeat("ab", 3)` is `"ababab"`; the result is
+/// a pointer to a comptime-built constant, so it coerces to `[]const u8`.
+pub fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    const arr = comptime blk: {
+        @setEvalBranchQuota(4 * n + 100);
+        var out: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+        break :blk out;
+    };
+    return &arr;
+}
+
 /// 256-bit set membership over a `[32]u8` bitmap: `set[c>>3] & (1 << (c&7))`.
 /// The one canonical definition of the engine's hot-path byte-set test — the
 /// per-module `hasBit` / `bitsetHas` / `inSet` names are thin aliases of this,
@@ -106,7 +119,7 @@ pub const UnicodeClass = struct {
     /// pre-tokenizers) is overwhelmingly ASCII, so this turns the per-codepoint
     /// test into one bitmap lookup instead of a UTF-8 decode + binary search.
     /// Only meaningful when `ascii_valid` (see `initRanges`).
-    ascii: [16]u8 = [_]u8{0} ** 16,
+    ascii: [16]u8 = @splat(0),
     /// `false` => `ascii` not precomputed; `matches` uses the binary search
     /// (still correct, just not accelerated). Defaulting false keeps every
     /// plain `.{ .ranges = … }` construction (e.g. tests) behavior-identical.
@@ -117,7 +130,7 @@ pub const UnicodeClass = struct {
     /// so this is a straight containment sweep — same convention
     /// `CharClass.fillBitmap` relies on.
     pub fn fillAscii(ranges: []const CodepointRange) [16]u8 {
-        var out = [_]u8{0} ** 16;
+        var out: [16]u8 = @splat(0);
         var cp: Codepoint = 0;
         while (cp < 128) : (cp += 1) {
             for (ranges) |r| {

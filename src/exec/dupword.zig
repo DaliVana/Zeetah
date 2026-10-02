@@ -110,11 +110,11 @@ pub fn buildAt(comptime cap: ?usize, h: *const hir.Hir(cap)) ?DupWord {
     if (body.tag != .concat) return null;
     const body_a = h.node(body.a); // concat( look\b, plus )
     const tb = h.node(body.b); // trailing look \b
-    if (tb.tag != .look or tb.set_idx != @intFromEnum(hir.LookKind.word_boundary)) return null;
+    if (tb.tag != .look or tb.set_idx != @backingInt(hir.LookKind.word_boundary)) return null;
     if (body_a.tag != .concat) return null;
     const lb = h.node(body_a.a); // leading look \b
     const plusn = h.node(body_a.b);
-    if (lb.tag != .look or lb.set_idx != @intFromEnum(hir.LookKind.word_boundary)) return null;
+    if (lb.tag != .look or lb.set_idx != @backingInt(hir.LookKind.word_boundary)) return null;
     if (plusn.tag != .plus) return null;
     const clsn = h.node(plusn.a);
     if (clsn.tag != .set) return null;

@@ -308,9 +308,9 @@ fn buildNfa(a: std.mem.Allocator, pat: []const u8, h: *hir.Hir(null)) !Nfa {
 test "pikevm: leftmost-first + looks + captures agree with the bounded backtracker" {
     const a = std.testing.allocator;
     const pats = [_][]const u8{
-        "\\bfoo|foobar\\b", "\\ba|ab\\b",        "(a+?)(a*)",       "(\\w+)\\b",
-        "(?m)^(x|xy)$",     "(a|ab)(c|bcd)(d*)", "\\B\\w",           "a*",
-        "(?m)$",            "x*y|z",             "(\\bab)|(\\Bb)",  "(?:(a)|b)+",
+        "\\bfoo|foobar\\b", "\\ba|ab\\b",        "(a+?)(a*)",      "(\\w+)\\b",
+        "(?m)^(x|xy)$",     "(a|ab)(c|bcd)(d*)", "\\B\\w",         "a*",
+        "(?m)$",            "x*y|z",             "(\\bab)|(\\Bb)", "(?:(a)|b)+",
     };
     const ins = [_][]const u8{ "", "foobar", "ab ab", "aaa", "xy\nx", "abcd", "a b", "zxy", "abab bab" };
     // ONE scratch across every NFA (these stack NFAs reuse addresses): the

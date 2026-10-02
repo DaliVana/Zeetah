@@ -150,8 +150,8 @@ pub fn Dfa(comptime n_states: usize, comptime n_classes: usize) type {
         /// `spin_slots = 0` when the source DFA has no spin) — a typed change to
         /// `compress`/`compressTo` and the few `Dfa(...)` instantiation sites.
         has_spin: bool = false,
-        stay_idx: [n_states]u8 = [_]u8{SPIN_NONE} ** n_states,
-        stay_sets: [SPIN_MAX][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** SPIN_MAX,
+        stay_idx: [n_states]u8 = @splat(SPIN_NONE),
+        stay_sets: [SPIN_MAX][32]u8 = @splat(@splat(0)),
 
         pub inline fn isAccepting(self: *const Self, s: u16) bool {
             return self.accepting[s];
@@ -381,7 +381,7 @@ test "Dfa: literal-ish two-class machine" {
     // Class 0 = byte 'a', class 1 = everything else.
     // States: 0 DEAD, 1 start, 2 accept. 1 --'a'--> 2, 2 --'a'--> 2.
     const D = Dfa(3, 2);
-    var class_of = [_]u8{1} ** 256;
+    var class_of: [256]u8 = @splat(1);
     class_of['a'] = 0;
     const d = D{
         .class_of = class_of,
@@ -391,18 +391,18 @@ test "Dfa: literal-ish two-class machine" {
             .{ 2, DEAD }, // 2: 'a'->2, other->DEAD
         },
         .accepting = blk: {
-            var a = [_]bool{false} ** 3;
+            var a: [3]bool = @splat(false);
             a[2] = true; // state 2 accepting
             break :blk a;
         },
         .start_bytes = blk: {
-            var s = [_]u8{0} ** 256;
+            var s: [256]u8 = @splat(0);
             s[0] = 'a'; // only 'a' leaves start live
             break :blk s;
         },
         .n_start_bytes = 1,
         .start_byte_set = blk: {
-            var s = [_]u8{0} ** 32;
+            var s: [32]u8 = @splat(0);
             s['a' >> 3] |= 1 << ('a' & 7);
             break :blk s;
         },
@@ -425,24 +425,24 @@ test "Dfa: literal-ish two-class machine" {
 
 test "Dfa: anchored_start does not slide" {
     const D = Dfa(3, 2);
-    var class_of = [_]u8{1} ** 256;
+    var class_of: [256]u8 = @splat(1);
     class_of['a'] = 0;
     const d = D{
         .class_of = class_of,
         .transitions = .{ .{ DEAD, DEAD }, .{ 2, DEAD }, .{ 2, DEAD } },
         .accepting = blk: {
-            var a = [_]bool{false} ** 3;
+            var a: [3]bool = @splat(false);
             a[2] = true;
             break :blk a;
         },
         .start_bytes = blk: {
-            var s = [_]u8{0} ** 256;
+            var s: [256]u8 = @splat(0);
             s[0] = 'a';
             break :blk s;
         },
         .n_start_bytes = 1,
         .start_byte_set = blk: {
-            var s = [_]u8{0} ** 32;
+            var s: [32]u8 = @splat(0);
             s['a' >> 3] |= 1 << ('a' & 7);
             break :blk s;
         },
@@ -457,24 +457,24 @@ test "Dfa: anchored_start does not slide" {
 
 test "Dfa: anchored_end requires consuming to input end" {
     const D = Dfa(3, 2);
-    var class_of = [_]u8{1} ** 256;
+    var class_of: [256]u8 = @splat(1);
     class_of['a'] = 0;
     const d = D{
         .class_of = class_of,
         .transitions = .{ .{ DEAD, DEAD }, .{ 2, DEAD }, .{ 2, DEAD } },
         .accepting = blk: {
-            var a = [_]bool{false} ** 3;
+            var a: [3]bool = @splat(false);
             a[2] = true;
             break :blk a;
         },
         .start_bytes = blk: {
-            var s = [_]u8{0} ** 256;
+            var s: [256]u8 = @splat(0);
             s[0] = 'a';
             break :blk s;
         },
         .n_start_bytes = 1,
         .start_byte_set = blk: {
-            var s = [_]u8{0} ** 32;
+            var s: [32]u8 = @splat(0);
             s['a' >> 3] |= 1 << ('a' & 7);
             break :blk s;
         },

@@ -79,58 +79,59 @@ fn lookupGc(norm: []const u8) ?NameResult {
     const Entry = struct { []const u8, NameResult };
     const table = [_]Entry{
         // Super-categories
-        .{ "l", .{ .cats = L } },          .{ "letter", .{ .cats = L } },
-        .{ "lc", .{ .cats = LC } },        .{ "casedletter", .{ .cats = LC } },
-        .{ "m", .{ .cats = M } },          .{ "mark", .{ .cats = M } },
-        .{ "combiningmark", .{ .cats = M } },
-        .{ "n", .{ .cats = N } },          .{ "number", .{ .cats = N } },
-        .{ "p", .{ .cats = P } },          .{ "punctuation", .{ .cats = P } },
-        .{ "punct", .{ .cats = P } },
-        .{ "s", .{ .cats = S } },          .{ "symbol", .{ .cats = S } },
-        .{ "z", .{ .cats = Z } },          .{ "separator", .{ .cats = Z } },
-        .{ "c", .{ .cats = C } },          .{ "other", .{ .cats = C } },
+        .{ "l", .{ .cats = L } },                           .{ "letter", .{ .cats = L } },
+        .{ "lc", .{ .cats = LC } },                         .{ "casedletter", .{ .cats = LC } },
+        .{ "m", .{ .cats = M } },                           .{ "mark", .{ .cats = M } },
+        .{ "combiningmark", .{ .cats = M } },               .{ "n", .{ .cats = N } },
+        .{ "number", .{ .cats = N } },                      .{ "p", .{ .cats = P } },
+        .{ "punctuation", .{ .cats = P } },                 .{ "punct", .{ .cats = P } },
+        .{ "s", .{ .cats = S } },                           .{ "symbol", .{ .cats = S } },
+        .{ "z", .{ .cats = Z } },                           .{ "separator", .{ .cats = Z } },
+        .{ "c", .{ .cats = C } },                           .{ "other", .{ .cats = C } },
         // Letters
-        .{ "lu", .{ .cats = one(.Lu) } }, .{ "uppercaseletter", .{ .cats = one(.Lu) } },
-        .{ "ll", .{ .cats = one(.Ll) } }, .{ "lowercaseletter", .{ .cats = one(.Ll) } },
-        .{ "lt", .{ .cats = one(.Lt) } }, .{ "titlecaseletter", .{ .cats = one(.Lt) } },
-        .{ "lm", .{ .cats = one(.Lm) } }, .{ "modifierletter", .{ .cats = one(.Lm) } },
-        .{ "lo", .{ .cats = one(.Lo) } }, .{ "otherletter", .{ .cats = one(.Lo) } },
+        .{ "lu", .{ .cats = one(.Lu) } },                   .{ "uppercaseletter", .{ .cats = one(.Lu) } },
+        .{ "ll", .{ .cats = one(.Ll) } },                   .{ "lowercaseletter", .{ .cats = one(.Ll) } },
+        .{ "lt", .{ .cats = one(.Lt) } },                   .{ "titlecaseletter", .{ .cats = one(.Lt) } },
+        .{ "lm", .{ .cats = one(.Lm) } },                   .{ "modifierletter", .{ .cats = one(.Lm) } },
+        .{ "lo", .{ .cats = one(.Lo) } },                   .{ "otherletter", .{ .cats = one(.Lo) } },
         // Marks
-        .{ "mn", .{ .cats = one(.Mn) } }, .{ "nonspacingmark", .{ .cats = one(.Mn) } },
-        .{ "mc", .{ .cats = one(.Mc) } }, .{ "spacingmark", .{ .cats = one(.Mc) } },
-        .{ "me", .{ .cats = one(.Me) } }, .{ "enclosingmark", .{ .cats = one(.Me) } },
+        .{ "mn", .{ .cats = one(.Mn) } },                   .{ "nonspacingmark", .{ .cats = one(.Mn) } },
+        .{ "mc", .{ .cats = one(.Mc) } },                   .{ "spacingmark", .{ .cats = one(.Mc) } },
+        .{ "me", .{ .cats = one(.Me) } },                   .{ "enclosingmark", .{ .cats = one(.Me) } },
         // Numbers
-        .{ "nd", .{ .cats = one(.Nd) } }, .{ "decimalnumber", .{ .cats = one(.Nd) } },
-        .{ "digit", .{ .cats = one(.Nd) } },
-        .{ "nl", .{ .cats = one(.Nl) } }, .{ "letternumber", .{ .cats = one(.Nl) } },
-        .{ "no", .{ .cats = one(.No) } }, .{ "othernumber", .{ .cats = one(.No) } },
+        .{ "nd", .{ .cats = one(.Nd) } },                   .{ "decimalnumber", .{ .cats = one(.Nd) } },
+        .{ "digit", .{ .cats = one(.Nd) } },                .{ "nl", .{ .cats = one(.Nl) } },
+        .{ "letternumber", .{ .cats = one(.Nl) } },         .{ "no", .{ .cats = one(.No) } },
+        .{ "othernumber", .{ .cats = one(.No) } },
         // Punctuation
-        .{ "pc", .{ .cats = one(.Pc) } }, .{ "connectorpunctuation", .{ .cats = one(.Pc) } },
-        .{ "pd", .{ .cats = one(.Pd) } }, .{ "dashpunctuation", .{ .cats = one(.Pd) } },
-        .{ "ps", .{ .cats = one(.Ps) } }, .{ "openpunctuation", .{ .cats = one(.Ps) } },
-        .{ "pe", .{ .cats = one(.Pe) } }, .{ "closepunctuation", .{ .cats = one(.Pe) } },
-        .{ "pi", .{ .cats = one(.Pi) } }, .{ "initialpunctuation", .{ .cats = one(.Pi) } },
-        .{ "pf", .{ .cats = one(.Pf) } }, .{ "finalpunctuation", .{ .cats = one(.Pf) } },
-        .{ "po", .{ .cats = one(.Po) } }, .{ "otherpunctuation", .{ .cats = one(.Po) } },
+                 .{ "pc", .{ .cats = one(.Pc) } },
+        .{ "connectorpunctuation", .{ .cats = one(.Pc) } }, .{ "pd", .{ .cats = one(.Pd) } },
+        .{ "dashpunctuation", .{ .cats = one(.Pd) } },      .{ "ps", .{ .cats = one(.Ps) } },
+        .{ "openpunctuation", .{ .cats = one(.Ps) } },      .{ "pe", .{ .cats = one(.Pe) } },
+        .{ "closepunctuation", .{ .cats = one(.Pe) } },     .{ "pi", .{ .cats = one(.Pi) } },
+        .{ "initialpunctuation", .{ .cats = one(.Pi) } },   .{ "pf", .{ .cats = one(.Pf) } },
+        .{ "finalpunctuation", .{ .cats = one(.Pf) } },     .{ "po", .{ .cats = one(.Po) } },
+        .{ "otherpunctuation", .{ .cats = one(.Po) } },
         // Symbols
-        .{ "sm", .{ .cats = one(.Sm) } }, .{ "mathsymbol", .{ .cats = one(.Sm) } },
-        .{ "sc", .{ .cats = one(.Sc) } }, .{ "currencysymbol", .{ .cats = one(.Sc) } },
-        .{ "sk", .{ .cats = one(.Sk) } }, .{ "modifiersymbol", .{ .cats = one(.Sk) } },
-        .{ "so", .{ .cats = one(.So) } }, .{ "othersymbol", .{ .cats = one(.So) } },
+            .{ "sm", .{ .cats = one(.Sm) } },
+        .{ "mathsymbol", .{ .cats = one(.Sm) } },           .{ "sc", .{ .cats = one(.Sc) } },
+        .{ "currencysymbol", .{ .cats = one(.Sc) } },       .{ "sk", .{ .cats = one(.Sk) } },
+        .{ "modifiersymbol", .{ .cats = one(.Sk) } },       .{ "so", .{ .cats = one(.So) } },
+        .{ "othersymbol", .{ .cats = one(.So) } },
         // Separators
-        .{ "zs", .{ .cats = one(.Zs) } }, .{ "spaceseparator", .{ .cats = one(.Zs) } },
-        .{ "zl", .{ .cats = one(.Zl) } }, .{ "lineseparator", .{ .cats = one(.Zl) } },
-        .{ "zp", .{ .cats = one(.Zp) } }, .{ "paragraphseparator", .{ .cats = one(.Zp) } },
+                 .{ "zs", .{ .cats = one(.Zs) } },
+        .{ "spaceseparator", .{ .cats = one(.Zs) } },       .{ "zl", .{ .cats = one(.Zl) } },
+        .{ "lineseparator", .{ .cats = one(.Zl) } },        .{ "zp", .{ .cats = one(.Zp) } },
+        .{ "paragraphseparator", .{ .cats = one(.Zp) } },
         // Other
-        .{ "cc", .{ .cats = one(.Cc) } }, .{ "control", .{ .cats = one(.Cc) } },
-        .{ "cntrl", .{ .cats = one(.Cc) } },
-        .{ "cf", .{ .cats = one(.Cf) } }, .{ "format", .{ .cats = one(.Cf) } },
-        .{ "cs", .{ .cats = one(.Cs) } }, .{ "surrogate", .{ .cats = one(.Cs) } },
-        .{ "co", .{ .cats = one(.Co) } }, .{ "privateuse", .{ .cats = one(.Co) } },
-        .{ "cn", .{ .cats = one(.Cn) } }, .{ "unassigned", .{ .cats = one(.Cn) } },
+          .{ "cc", .{ .cats = one(.Cc) } },
+        .{ "control", .{ .cats = one(.Cc) } },              .{ "cntrl", .{ .cats = one(.Cc) } },
+        .{ "cf", .{ .cats = one(.Cf) } },                   .{ "format", .{ .cats = one(.Cf) } },
+        .{ "cs", .{ .cats = one(.Cs) } },                   .{ "surrogate", .{ .cats = one(.Cs) } },
+        .{ "co", .{ .cats = one(.Co) } },                   .{ "privateuse", .{ .cats = one(.Co) } },
+        .{ "cn", .{ .cats = one(.Cn) } },                   .{ "unassigned", .{ .cats = one(.Cn) } },
         // Special values
-        .{ "any", .{ .special = .any } },
-        .{ "ascii", .{ .special = .ascii } },
+        .{ "any", .{ .special = .any } },                   .{ "ascii", .{ .special = .ascii } },
         .{ "assigned", .{ .special = .assigned } },
     };
     for (table) |e| {
@@ -151,27 +152,27 @@ fn lookupGc(norm: []const u8) ?NameResult {
 fn isUnsupportedProperty(norm: []const u8) bool {
     const known = [_][]const u8{
         // property names
-        "script",          "sc",  "scriptextensions", "scx",
-        "block",           "blk", "age",
+        "script",            "sc",                        "scriptextensions",      "scx",
+        "block",             "blk",                       "age",
         // common binary properties
-        "whitespace",      "alphabetic", "uppercase", "lowercase",
-        "emoji",           "emojipresentation",       "emojimodifier",
-        "noncharactercodepoint",   "math",
-        "hexdigit",        "asciihexdigit",           "dash",
-        "diacritic",       "extender",                "ideographic",
-        "joincontrol",     "quotationmark",           "softdotted",
-        "defaultignorablecodepoint",                  "whitespacelm3",
+                          "whitespace",
+        "alphabetic",        "uppercase",                 "lowercase",             "emoji",
+        "emojipresentation", "emojimodifier",             "noncharactercodepoint", "math",
+        "hexdigit",          "asciihexdigit",             "dash",                  "diacritic",
+        "extender",          "ideographic",               "joincontrol",           "quotationmark",
+        "softdotted",        "defaultignorablecodepoint", "whitespacelm3",
         // common script value names (bare `\p{Greek}` shorthand)
-        "common",          "latin",      "greek",     "cyrillic",
-        "armenian",        "hebrew",     "arabic",    "syriac",
-        "thaana",          "devanagari", "bengali",   "gurmukhi",
-        "gujarati",        "oriya",      "tamil",     "telugu",
-        "kannada",         "malayalam",  "sinhala",   "thai",
-        "lao",             "tibetan",    "myanmar",   "georgian",
-        "hangul",          "ethiopic",   "cherokee",  "mongolian",
-        "hiragana",        "katakana",   "bopomofo",  "han",
-        "yi",              "coptic",     "inherited", "runic",
-        "ogham",           "khmer",      "braille",
+                "common",
+        "latin",             "greek",                     "cyrillic",              "armenian",
+        "hebrew",            "arabic",                    "syriac",                "thaana",
+        "devanagari",        "bengali",                   "gurmukhi",              "gujarati",
+        "oriya",             "tamil",                     "telugu",                "kannada",
+        "malayalam",         "sinhala",                   "thai",                  "lao",
+        "tibetan",           "myanmar",                   "georgian",              "hangul",
+        "ethiopic",          "cherokee",                  "mongolian",             "hiragana",
+        "katakana",          "bopomofo",                  "han",                   "yi",
+        "coptic",            "inherited",                 "runic",                 "ogham",
+        "khmer",             "braille",
     };
     for (known) |k| {
         if (std.mem.eql(u8, k, norm)) return true;
@@ -354,7 +355,7 @@ pub fn resolve(
 pub fn resolveLatin1Bitmap(spec: []const u8, outer_negated: bool) ![32]u8 {
     const parsed = try parseSpec(spec, outer_negated);
 
-    var bm = [_]u8{0} ** 32;
+    var bm: [32]u8 = @splat(0);
     const B = struct {
         fn setRange(m: *[32]u8, lo: u32, hi: u32) void {
             if (lo > 0xFF) return;

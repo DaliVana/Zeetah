@@ -20,8 +20,8 @@ const V = @Vector(W, u8);
 const MAXR = 16;
 
 pub const Ranges = struct {
-    lo: [MAXR]u8 = [_]u8{0} ** MAXR,
-    hi: [MAXR]u8 = [_]u8{0} ** MAXR,
+    lo: [MAXR]u8 = @splat(0),
+    hi: [MAXR]u8 = @splat(0),
     n: u8 = 0,
 
     /// Extract contiguous member ranges from a 256-bit class bitmap.
@@ -113,7 +113,7 @@ pub const Ranges = struct {
 };
 
 test "class_span: ranges + scan basics" {
-    var bm = [_]u8{0} ** 32;
+    var bm: [32]u8 = @splat(0);
     var c: u8 = '0';
     while (c <= '9') : (c += 1) bm[c >> 3] |= (@as(u8, 1) << @as(u3, @intCast(c & 7)));
     const r = Ranges.fromBitmap(bm).?;
@@ -125,14 +125,15 @@ test "class_span: ranges + scan basics" {
     try std.testing.expectEqual(@as(?usize, 14), r.firstMember(s, 9));
     try std.testing.expectEqual(@as(usize, 18), r.runEnd(s, 14));
     // long input exercising the 16-byte vector path on both sides
-    const long = ("x" ** 40) ++ ("7" ** 50) ++ ("y" ** 5);
+    const rep = @import("../common.zig").repeat;
+    const long = rep("x", 40) ++ rep("7", 50) ++ rep("y", 5);
     try std.testing.expectEqual(@as(?usize, 40), r.firstMember(long, 0));
     try std.testing.expectEqual(@as(usize, 90), r.runEnd(long, 40));
     try std.testing.expectEqual(@as(?usize, null), r.firstMember("zzzz", 0));
 }
 
 test "class_span: multi-range class (\\w-like) scans correctly" {
-    var bm = [_]u8{0} ** 32;
+    var bm: [32]u8 = @splat(0);
     for ([_][2]u8{ .{ '0', '9' }, .{ 'A', 'Z' }, .{ 'a', 'z' }, .{ '_', '_' } }) |rg| {
         var x: u8 = rg[0];
         while (x <= rg[1]) : (x += 1) bm[x >> 3] |= (@as(u8, 1) << @as(u3, @intCast(x & 7)));

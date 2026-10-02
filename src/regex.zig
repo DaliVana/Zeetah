@@ -206,7 +206,7 @@ pub const Regex = struct {
     /// the capture engine's automaton. `gnames[g]` is group g's `(?<name>)`
     /// name (aliases `pattern`), or null.
     n_groups: usize = 0,
-    gnames: GNames = [_]?[]const u8{null} ** (hir.MAX_GROUPS_RUNTIME + 1),
+    gnames: GNames = @splat(null),
     /// Owned HIR for the `.backtrack` path (backref / lookaround run on the
     /// tree backtracker, which walks the HIR, not the NFA).
     bt_hir: ?*hir.Hir(null) = null,
@@ -270,7 +270,7 @@ pub const Regex = struct {
     /// `.dfa_edge_look`: the peeled trailing width-1 look. `self.dfa` is the
     /// core's DFA with the look folded in; this is the walk config `nextFrom`
     /// needs on top of it (see `exec/edge_look.zig`).
-    el_spec: edge_look.Spec = .{ .set = [_]u8{0} ** 32, .behind = false, .neg = false },
+    el_spec: edge_look.Spec = .{ .set = @splat(0), .behind = false, .neg = false },
     /// Captures fast path: when the pattern is one-pass (decided at compile by
     /// the pure `onepass.dfaMatchIsOnePass` over the DFA), `captures()` resolves slots
     /// via a single allocation-free deterministic forward pass instead of the
@@ -1032,7 +1032,7 @@ pub const Regex = struct {
         var h = hir.Hir(null).initRuntime();
         var h_owned = true; // false once ownership is transferred to a heap copy
         defer if (h_owned) h.deinit(allocator);
-        var gnames0 = [_]?[]const u8{null} ** (hir.MAX_GROUPS_RUNTIME + 1);
+        var gnames0: [hir.MAX_GROUPS_RUNTIME + 1]?[]const u8 = @splat(null);
         var ng0: usize = 0;
         // `parseCaptures` is the single source of truth for capture numbering +
         // names (replaces the old standalone `scanGroups` second grammar).

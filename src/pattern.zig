@@ -206,13 +206,13 @@ fn flattenAlt(comptime cap: ?usize, h: *const hir.Hir(cap), ref: hir.NodeRef, ou
 /// match `m(root)` would.
 fn altDispatchInfo(comptime cap: ?usize, h: *const hir.Hir(cap)) AltInfo {
     @setEvalBranchQuota(1_000_000); // 256 bytes × up to 64 branches of table fill
-    var info: AltInfo = .{ .n = 0, .branches = undefined, .table = [_]compiled_bt.AltMask{0} ** 256 };
+    var info: AltInfo = .{ .n = 0, .branches = undefined, .table = @splat(0) };
     if (h.root == hir.none or h.node(h.root).tag != .alt) return info;
     var n: usize = 0;
     flattenAlt(cap, h, h.root, &info.branches, &n);
     if (n < 2 or n > MAX_ALT_BRANCHES) return info;
     for (0..n) |i| {
-        var bm = [_]u8{0} ** 32;
+        var bm: [32]u8 = @splat(0);
         const fr = properties.firstBytes(cap, h, info.branches[i], &bm);
         const bit = @as(compiled_bt.AltMask, 1) << @intCast(i);
         if (!fr.ok or fr.nullable) {
@@ -234,7 +234,7 @@ fn altDispatchInfo(comptime cap: ?usize, h: *const hir.Hir(cap)) AltInfo {
 /// selects the slot-filling instantiation; the whole-match scan passes `false`
 /// (slots are then written only for a backreference).
 fn BtEngine(comptime NN: usize, comptime baked: hir.Hir(NN), comptime NG: usize, comptime captures: bool) type {
-    const alt_info = if (ALT_DISPATCH_ENABLED) altDispatchInfo(NN, &baked) else AltInfo{ .n = 0, .branches = undefined, .table = [_]compiled_bt.AltMask{0} ** 256 };
+    const alt_info = if (ALT_DISPATCH_ENABLED) altDispatchInfo(NN, &baked) else AltInfo{ .n = 0, .branches = undefined, .table = @splat(0) };
     const alt_branches: [alt_info.n]hir.NodeRef = blk: {
         var a: [alt_info.n]hir.NodeRef = undefined;
         for (0..alt_info.n) |i| a[i] = alt_info.branches[i];
@@ -313,10 +313,10 @@ const Built = struct {
     /// uses, so the two front-ends agree by construction (groups inside a
     /// lookaround are non-capturing, so they are neither counted nor named).
     n_groups: usize = 0,
-    gnames: [hir.MAX_GROUPS + 1]?[]const u8 = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1),
+    gnames: [hir.MAX_GROUPS + 1]?[]const u8 = @splat(null),
     /// `.edge_look` arm: walk config for the peeled trailing width-1 look.
     /// `dfa` holds the regular core's DFA; this is the O(1) edge check.
-    el_spec: edge_look.Spec = .{ .set = [_]u8{0} ** 32, .behind = false, .neg = false },
+    el_spec: edge_look.Spec = .{ .set = @splat(0), .behind = false, .neg = false },
     /// `.boundary_lits` arm: the `\b(?:lit|…)\b` literal set. Comptime-only —
     /// the Aho-Corasick automaton is rebuilt + node-trimmed in `Pattern` (not
     /// stored here) so `Built` stays small. Empty (`n == 0`) for other strats.
@@ -324,7 +324,7 @@ const Built = struct {
     /// `.dup_word` arm: the baked adjacent-duplicate-word recogniser (two
     /// bitmaps + group id). Default is the never-matching zero descriptor for
     /// every other strat (it is read only on the `.dup_word` arm).
-    dw: dupword.DupWord = .{ .class = [_]u8{0} ** 32, .sep = [_]u8{0} ** 32, .group = 0 },
+    dw: dupword.DupWord = .{ .class = @splat(0), .sep = @splat(0), .group = 0 },
     /// `.backtrack` arm: a regular over-approximation DFA used as the seek
     /// prefilter (skip proven-dead prefixes). Built at comptime by the SAME
     /// zero-allocator `full_dfa.compute` the regular arm uses, over a relaxed
@@ -637,7 +637,7 @@ fn buildAll(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) 
     var h = hir.Hir(HIR_CAP).initComptime();
     // `parseCaptures` is the single source of truth for capture numbering + names
     // (replaces the old standalone `parser.scanGroups`); it fills `gnames`/`ng`.
-    var gnames = [_]?[]const u8{null} ** (hir.MAX_GROUPS + 1);
+    var gnames: [hir.MAX_GROUPS + 1]?[]const u8 = @splat(null);
     var ng_groups: usize = 0;
     parser.parseCaptures(HIR_CAP, &h, undefined, pattern, .{ .ci = ci, .multiline = ml }, &ng_groups, &gnames) catch |e| {
         return .{
@@ -868,7 +868,7 @@ fn CaptureSupport(comptime built: Built) type {
         t.saw_lazy = src_h.saw_lazy;
         for (0..NN) |i| t.nodes[i] = src_h.nodes[i];
         for (0..src_h.set_count) |s| t.sets[s] = src_h.sets[s];
-        for (src_h.set_count..NN) |s| t.sets[s] = [_]u8{0} ** 32;
+        for (src_h.set_count..NN) |s| t.sets[s] = @splat(0);
         break :blk t;
     };
 
@@ -1176,7 +1176,7 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             for (0..src_h.set_count) |s| t.sets[s] = src_h.sets[s];
             // Pad unused set slots so the comptime value is fully defined
             // (#sets ≤ #nodes, so `[set_count..NN]` is the padding range).
-            for (src_h.set_count..NN) |s| t.sets[s] = [_]u8{0} ** 32;
+            for (src_h.set_count..NN) |s| t.sets[s] = @splat(0);
             break :blk t;
         };
         return struct {

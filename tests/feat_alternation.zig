@@ -119,8 +119,8 @@ test "alternation: literal fast path equals an independent recompile" {
     const a = std.testing.allocator;
     const pat = "red|green|blue";
     const corpus = [_][]const u8{
-        "",                 "red",            "a green b",
-        "blue and red",     "no colour here", "greenish bluefish",
+        "",             "red",            "a green b",
+        "blue and red", "no colour here", "greenish bluefish",
     };
     var rx = try Regex.compile(a, pat);
     defer rx.deinit();

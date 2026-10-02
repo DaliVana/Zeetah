@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const regex = @import("zeetah");
+const rep = regex.common.repeat;
 const Regex = regex.Regex;
 
 fn slice(a: std.mem.Allocator, pat: []const u8, in: []const u8) !?[]const u8 {
@@ -226,7 +227,7 @@ test "lookbehind: variable-width terminates on long input (anti-ReDoS)" {
     const a = std.testing.allocator;
     // ~2000-byte run forces the reverse scan to span many offsets; it must
     // terminate (match or typed MatchBudgetExceeded), never hang.
-    const big = "a" ** 2000 ++ "b";
+    const big = rep("a", 2000) ++ "b";
     const r = isM(a, "(?<=a+)b", big);
     if (r) |hit| {
         try std.testing.expect(hit);

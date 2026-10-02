@@ -97,8 +97,8 @@ test "unicode: comptime Pattern bakes \\p and agrees with runtime Regex" {
     // \p{^L}==\P{L} internal-negation identity.
     const pats = .{ "\\p{L}+", "\\P{N}+", "\\pL", "\\p{Lu}+", "[\\p{L}\\p{N}]+", "\\p{^L}+" };
     const ins = [_][]const u8{
-        "",       "  abc 123",  "ab  123!cd", "7x9",
-        "ABCdef", "\xC0\xB7z",  "Word42 ",    "ab 12!",
+        "",       "  abc 123", "ab  123!cd", "7x9",
+        "ABCdef", "\xC0\xB7z", "Word42 ",    "ab 12!",
     };
     inline for (pats) |p| {
         const P = regex.Pattern(p, .{});

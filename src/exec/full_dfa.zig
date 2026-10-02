@@ -86,8 +86,8 @@ pub const Dfa256 = struct {
     /// wide-self-loop state `s`, `stay_idx[s]` indexes `stay_sets` (the set of
     /// bytes that keep the walk in `s`); otherwise it is `SPIN_NONE`.
     has_spin: bool = false,
-    stay_idx: [MAX_DFA]u8 = [_]u8{SPIN_NONE} ** MAX_DFA,
-    stay_sets: [SPIN_MAX][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** SPIN_MAX,
+    stay_idx: [MAX_DFA]u8 = @splat(SPIN_NONE),
+    stay_sets: [SPIN_MAX][32]u8 = @splat(@splat(0)),
 
     /// Next state from `state` on byte-class `cls`. The table-access primitive
     /// shared with the comptime `comptime_dfa.Dfa` (whose field is named
@@ -246,7 +246,7 @@ pub const PackedDfa = struct {
     has_spin: bool = false,
     /// `stay_idx[state]` (`SPIN_NONE` ⇒ no skip set) — inline fixed (`MAX_DFA`).
     stay_idx: [MAX_DFA]u8,
-    stay_sets: [SPIN_MAX][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** SPIN_MAX,
+    stay_sets: [SPIN_MAX][32]u8 = @splat(@splat(0)),
 
     /// Next state from `state` on byte-class `cls`. Flat-indexed peer of
     /// `Dfa256.step`; same name so the generic walkers drive either uniformly.
@@ -485,17 +485,17 @@ pub fn computeReverse(comptime cap: ?usize, nfa: *const thompson.Nfa(cap)) Dfa25
     const n_classes = cls.n_classes;
     const rep = cls.rep;
 
-    var eps_to = [_]u16{0} ** MAX_EDGES;
-    var eps_off = [_]usize{0} ** (MAX_NFA + 1);
-    var cnt_to = [_]u16{0} ** MAX_EDGES;
-    var cnt_set = [_]u16{0} ** MAX_EDGES;
-    var cnt_off = [_]usize{0} ** (MAX_NFA + 1);
+    var eps_to: [MAX_EDGES]u16 = @splat(0);
+    var eps_off: [MAX_NFA + 1]usize = @splat(0);
+    var cnt_to: [MAX_EDGES]u16 = @splat(0);
+    var cnt_set: [MAX_EDGES]u16 = @splat(0);
+    var cnt_off: [MAX_NFA + 1]usize = @splat(0);
     dfa_build.buildForwardCsr(cap, &rev, &eps_to, &eps_off, &cnt_to, &cnt_set, &cnt_off);
 
     var dfa_list: [MAX_DFA][MAX_NFA]u16 = undefined;
-    var dfa_len = [_]usize{0} ** MAX_DFA;
-    var trans = [_][256]usize{[_]usize{0} ** 256} ** MAX_DFA;
-    var accepting = [_]bool{false} ** MAX_DFA;
+    var dfa_len: [MAX_DFA]usize = @splat(0);
+    var trans: [MAX_DFA][256]usize = @splat(@splat(0));
+    var accepting: [MAX_DFA]bool = @splat(false);
     dfa_len[0] = 0; // state 0 = DEAD sink
     var dfa_n: usize = 1;
 
@@ -604,17 +604,17 @@ fn fixedCopy(nfa: *const thompson.Nfa(null)) thompson.Nfa(MAX_NFA) {
 
 pub fn emptyDfa256(outcome: Outcome) Dfa256 {
     return .{
-        .class_of = [_]u8{0} ** 256,
+        .class_of = @splat(0),
         .n_classes = 1,
         .n_states = 1,
         .start = 0,
         .a_start = false,
         .a_end = false,
-        .accepting = [_]bool{false} ** MAX_DFA,
-        .trans = [_][256]u16{[_]u16{0} ** 256} ** MAX_DFA,
-        .start_bytes = [_]u8{0} ** 256,
+        .accepting = @splat(false),
+        .trans = @splat(@splat(0)),
+        .start_bytes = @splat(0),
         .n_start_bytes = 0,
-        .start_byte_set = [_]u8{0} ** 32,
+        .start_byte_set = @splat(0),
         .outcome = outcome,
     };
 }
@@ -641,17 +641,17 @@ pub fn compute(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), a_start: boo
     const rep = cls.rep;
 
     // --- Leftmost-first subset construction (CSR adjacency) ----------------
-    var eps_to = [_]u16{0} ** MAX_EDGES;
-    var eps_off = [_]usize{0} ** (MAX_NFA + 1);
-    var cnt_to = [_]u16{0} ** MAX_EDGES;
-    var cnt_set = [_]u16{0} ** MAX_EDGES;
-    var cnt_off = [_]usize{0} ** (MAX_NFA + 1);
+    var eps_to: [MAX_EDGES]u16 = @splat(0);
+    var eps_off: [MAX_NFA + 1]usize = @splat(0);
+    var cnt_to: [MAX_EDGES]u16 = @splat(0);
+    var cnt_set: [MAX_EDGES]u16 = @splat(0);
+    var cnt_off: [MAX_NFA + 1]usize = @splat(0);
     dfa_build.buildForwardCsr(cap, nfa, &eps_to, &eps_off, &cnt_to, &cnt_set, &cnt_off);
 
     var dfa_list: [MAX_DFA][MAX_NFA]u16 = undefined;
-    var dfa_len = [_]usize{0} ** MAX_DFA;
-    var trans = [_][256]usize{[_]usize{0} ** 256} ** MAX_DFA;
-    var accepting = [_]bool{false} ** MAX_DFA;
+    var dfa_len: [MAX_DFA]usize = @splat(0);
+    var trans: [MAX_DFA][256]usize = @splat(@splat(0));
+    var accepting: [MAX_DFA]bool = @splat(false);
 
     dfa_len[0] = 0; // state 0 = DEAD sink
     var dfa_n: usize = 1;
@@ -736,7 +736,7 @@ pub fn compute(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), a_start: boo
 
     // --- Minimization: Moore partition refinement ------------------------
     // Initial partition: accepting vs non-accepting.
-    var part = [_]usize{0} ** MAX_DFA;
+    var part: [MAX_DFA]usize = @splat(0);
     {
         var s: usize = 0;
         while (s < dfa_n) : (s += 1) part[s] = if (accepting[s]) 1 else 0;
@@ -785,8 +785,8 @@ pub fn compute(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), a_start: boo
         }
     }
 
-    var block_id = [_]usize{0} ** MAX_DFA;
-    var block_seen = [_]bool{false} ** MAX_DFA;
+    var block_id: [MAX_DFA]usize = @splat(0);
+    var block_seen: [MAX_DFA]bool = @splat(false);
     var n_min: usize = 0;
     const dead_block = part[0];
     block_id[dead_block] = 0;
@@ -850,8 +850,8 @@ pub fn compute(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), a_start: boo
     // member maps only for the states that qualify. Build-time only.
     {
         // Per-class member bitmap + popcount, computed once over 256 bytes.
-        var class_bm = [_][32]u8{[_]u8{0} ** 32} ** MAX_DFA;
-        var class_pop = [_]u16{0} ** MAX_DFA;
+        var class_bm: [MAX_DFA][32]u8 = @splat(@splat(0));
+        var class_pop: [MAX_DFA]u16 = @splat(0);
         {
             var b: usize = 0;
             while (b < 256) : (b += 1) {
@@ -871,7 +871,7 @@ pub fn compute(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), a_start: boo
                 if (out.trans[s][cl] == sid) width += class_pop[cl];
             }
             if (width < SPIN_MIN_WIDTH) continue;
-            var stay = [_]u8{0} ** 32;
+            var stay: [32]u8 = @splat(0);
             cl = 0;
             while (cl < n_classes) : (cl += 1) {
                 if (out.trans[s][cl] == sid) {
@@ -1031,15 +1031,15 @@ test "computeReverse + reverseSearch == forward core.findLeftmost ($-anchored or
     // differential only compares reverse-vs-reverse; this pins the reverse
     // ALGORITHM against the pre-existing forward semantics.
     const pats = [_][]const u8{
-        "a+$",        "[a-z]+$",  "\\s+$",       "a*a*$",
-        "(a+)+$",     ".*a$",     "ab$",         "(cat|dog)$",
-        "[0-9]{2,4}$", "abc.*x$", "a*$",         "[ab]+c?$",
+        "a+$",         "[a-z]+$", "\\s+$", "a*a*$",
+        "(a+)+$",      ".*a$",    "ab$",   "(cat|dog)$",
+        "[0-9]{2,4}$", "abc.*x$", "a*$",   "[ab]+c?$",
     };
     const ins = [_][]const u8{
-        "",       "a",        "aaa",      "aaa!",     "  ",       "  x",
-        "xyz",    "ababab",   "cat",      "dog cat",  "12",       "1234",
-        "12345",  "abczzx",   "abcabcx",  "no",       " a a a ",  "ababx",
-        "cc",     "abcabc",
+        "",      "a",      "aaa",     "aaa!",    "  ",      "  x",
+        "xyz",   "ababab", "cat",     "dog cat", "12",      "1234",
+        "12345", "abczzx", "abcabcx", "no",      " a a a ", "ababx",
+        "cc",    "abcabc",
     };
     for (pats) |p| {
         var h = hir.Hir(null).initRuntime();

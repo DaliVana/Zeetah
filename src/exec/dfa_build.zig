@@ -22,8 +22,8 @@ const hasBit = common.hasBit;
 
 /// Byte equivalence classes + per-class representative byte.
 pub const Classes = struct {
-    class_of: [256]u8 = [_]u8{0} ** 256,
-    rep: [256]u8 = [_]u8{0} ** 256,
+    class_of: [256]u8 = @splat(0),
+    rep: [256]u8 = @splat(0),
     n_classes: usize = 1,
 };
 
@@ -32,7 +32,7 @@ pub const Classes = struct {
 /// representative member of class `c` (used to test set membership).
 pub fn classify(comptime cap: ?usize, nfa: *const thompson.Nfa(cap)) Classes {
     var r = Classes{ .n_classes = 0 };
-    var assigned = [_]bool{false} ** 256;
+    var assigned: [256]bool = @splat(false);
     var c: usize = 0;
     while (c < 256) : (c += 1) {
         if (assigned[c]) continue;
@@ -57,7 +57,7 @@ pub fn classify(comptime cap: ?usize, nfa: *const thompson.Nfa(cap)) Classes {
         }
         r.n_classes += 1;
     }
-    var seen = [_]bool{false} ** 256;
+    var seen: [256]bool = @splat(false);
     c = 0;
     while (c < 256) : (c += 1) {
         const cl = r.class_of[c];
@@ -83,8 +83,8 @@ pub fn buildForwardCsr(
     cnt_set: []u16,
     cnt_off: []usize,
 ) void {
-    var ecount = [_]usize{0} ** MAX_NFA;
-    var ccount = [_]usize{0} ** MAX_NFA;
+    var ecount: [MAX_NFA]usize = @splat(0);
+    var ccount: [MAX_NFA]usize = @splat(0);
     var ei: usize = 0;
     while (ei < nfa.n_edges) : (ei += 1) {
         if (nfa.e_kind[ei] == .eps) ecount[nfa.e_from[ei]] += 1 else ccount[nfa.e_from[ei]] += 1;
@@ -136,7 +136,7 @@ pub fn closure(
     out: []u16,
     acc: *bool,
 ) usize {
-    var seen = [_]bool{false} ** MAX_NFA;
+    var seen: [MAX_NFA]bool = @splat(false);
     var len: usize = 0;
     var stack: [MAX_EDGES]u16 = undefined;
     for (seeds) |sd| {

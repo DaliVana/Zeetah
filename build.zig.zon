@@ -1,8 +1,8 @@
 .{
     .name = .zeetah,
-    .version = "0.16.1",
+    .version = "0.17.0",
     .fingerprint = 0x2a26030839fa505f,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0-dev.2384+ac77c23af",
     .dependencies = .{},
     .paths = .{
         "build.zig",

@@ -23,8 +23,8 @@ pub const MAX_LIT: usize = 64;
 
 /// Up to `MAX_ALTS` literal alternatives, each up to `MAX_LIT` bytes.
 pub const Seq = struct {
-    lits: [MAX_ALTS][MAX_LIT]u8 = [_][MAX_LIT]u8{[_]u8{0} ** MAX_LIT} ** MAX_ALTS,
-    lens: [MAX_ALTS]u8 = [_]u8{0} ** MAX_ALTS,
+    lits: [MAX_ALTS][MAX_LIT]u8 = @splat(@splat(0)),
+    lens: [MAX_ALTS]u8 = @splat(0),
     /// Number of populated alternatives. `0` => no sequence.
     n: u8 = 0,
     /// True when matching one of these alternatives is *sufficient* (the Seq
@@ -178,8 +178,8 @@ const SMALL_CLASS_MAX: usize = 4;
 /// concatenation (cross-product) and union. Defaults are all-zero so an
 /// untouched byte tail is `0` (never `undefined` — safe to bake at comptime).
 const LitSet = struct {
-    lits: [MAX_ALTS][MAX_LIT]u8 = [_][MAX_LIT]u8{[_]u8{0} ** MAX_LIT} ** MAX_ALTS,
-    lens: [MAX_ALTS]u8 = [_]u8{0} ** MAX_ALTS,
+    lits: [MAX_ALTS][MAX_LIT]u8 = @splat(@splat(0)),
+    lens: [MAX_ALTS]u8 = @splat(0),
     n: usize = 0,
 };
 
@@ -396,7 +396,7 @@ pub fn suffix(comptime cap: ?usize, h: *const hir.Hir(cap)) Seq {
     const ln = trailingRun(cap, h, h.root, &buf, 0, &exact);
     if (ln == 0) return Seq{};
     // trailingRun filled from the right edge; left-align it.
-    var out: [MAX_LIT]u8 = [_]u8{0} ** MAX_LIT;
+    var out: [MAX_LIT]u8 = @splat(0);
     for (0..ln) |i| out[i] = buf[MAX_LIT - ln + i];
     s.lits[0] = out;
     s.lens[0] = @intCast(ln);
@@ -454,7 +454,7 @@ pub const ReqLit = struct {
     /// (reverse-inner anchoring). A multi-byte anchor occurs far less often than
     /// any single byte, so far fewer candidate positions reach the `runFrom`
     /// verifier (e.g. `[a-z]+/api/v2/[a-z]+` keys on `/api/v2/`, not on `/`).
-    lit: [MAX_REQLIT]u8 = [_]u8{0} ** MAX_REQLIT,
+    lit: [MAX_REQLIT]u8 = @splat(0),
     len: u8 = 1,
     /// The byte `prefilter.findLiteralOcc` locates the literal by (`memchr`, or
     /// the first byte of its two-byte SIMD filter), at offset `probe_off`. Picked
@@ -470,7 +470,7 @@ const MAXI = 64;
 const SpItem = struct {
     kind: enum { lit1, cls1, run, stop },
     byte: u8 = 0,
-    set: [32]u8 = [_]u8{0} ** 32,
+    set: [32]u8 = @splat(0),
 };
 
 fn flatten(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, out: *[MAXI]SpItem, n: *usize) void {
@@ -604,7 +604,7 @@ pub fn requiredLiteralBack(comptime cap: ?usize, h: *const hir.Hir(cap)) ?ReqLit
             while (m < hi) : (m += 1) score += rarity(items[m].byte);
             if (score > best_score) {
                 best_score = score;
-                var lit: [MAX_REQLIT]u8 = [_]u8{0} ** MAX_REQLIT;
+                var lit: [MAX_REQLIT]u8 = @splat(0);
                 var m2: usize = lo;
                 while (m2 < hi) : (m2 += 1) lit[m2 - lo] = items[m2].byte;
                 const len: u8 = @intCast(hi - lo);
@@ -688,8 +688,8 @@ pub fn requiredLeadingLookbehindSet(comptime cap: ?usize, h: *const hir.Hir(cap)
 pub const MAX_BL: usize = 128;
 
 pub const BoundaryLits = struct {
-    lits: [MAX_BL][MAX_LIT]u8 = [_][MAX_LIT]u8{[_]u8{0} ** MAX_LIT} ** MAX_BL,
-    lens: [MAX_BL]u8 = [_]u8{0} ** MAX_BL,
+    lits: [MAX_BL][MAX_LIT]u8 = @splat(@splat(0)),
+    lens: [MAX_BL]u8 = @splat(0),
     n: u16 = 0,
     /// Longest alternative — the window width the search must brute-scan
     /// around an Aho-Corasick hit to stay leftmost-correct.
@@ -754,7 +754,7 @@ pub fn BoundaryMatcher(comptime AcT: type) type {
         /// same `lookHolds(.word_boundary)` the bounded/tree backtrackers use, so
         /// the contract is identical to the engine this serves (no divergent copy).
         inline fn wbAt(input: []const u8, pos: usize) bool {
-            return cc.lookHolds(@intFromEnum(hir.LookKind.word_boundary), input, pos);
+            return cc.lookHolds(@backingInt(hir.LookKind.word_boundary), input, pos);
         }
 
         /// Leftmost-first match length at exactly `p`, or null. Tries the
@@ -766,10 +766,26 @@ pub fn BoundaryMatcher(comptime AcT: type) type {
             while (i < self.bl.n) : (i += 1) {
                 const L = self.bl.alt(i);
                 if (p + L.len <= input.len and
-                    std.mem.eql(u8, input[p .. p + L.len], L) and
+                    litEqAt(input, p, L) and
                     wbAt(input, p + L.len)) return L.len;
             }
             return null;
+        }
+
+        /// `input[p..p+L.len] == L` for a short literal, as a plain inline byte
+        /// loop with a first-byte early-out. The alternatives are keyword-sized
+        /// and almost every candidate mismatches on byte 0, so this beats the
+        /// generic `std.mem.eql` (whose vector `eqlBytes` LLVM 22 keeps out of
+        /// line — a 28% loss on `\b(?:kw|kw|…)\b` under Zig 0.17). Caller
+        /// guarantees `p + L.len <= input.len`.
+        inline fn litEqAt(input: []const u8, p: usize, L: []const u8) bool {
+            if (L.len == 0) return true;
+            if (input[p] != L[0]) return false;
+            var k: usize = 1;
+            while (k < L.len) : (k += 1) {
+                if (input[p + k] != L[k]) return false;
+            }
+            return true;
         }
 
         /// Leftmost match at/after absolute `from`. With the Teddy prefilter,
@@ -867,7 +883,7 @@ pub fn boundaryLiterals(comptime cap: ?usize, h: *const hir.Hir(cap)) ?BoundaryL
     var nf: usize = 0;
     if (!spineFactors(cap, h, h.root, &fac, &nf)) return null;
     if (nf != 3) return null;
-    const wb: u32 = @intFromEnum(hir.LookKind.word_boundary);
+    const wb: u32 = @backingInt(hir.LookKind.word_boundary);
     const f0 = h.node(fac[0]);
     const f2 = h.node(fac[2]);
     if (f0.tag != .look or f0.set_idx != wb) return null;

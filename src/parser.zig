@@ -36,7 +36,7 @@ fn foldCaseBitmap(s: *[32]u8) void {
 }
 
 fn singleByteSet(c: u8) [32]u8 {
-    var s = [_]u8{0} ** 32;
+    var s: [32]u8 = @splat(0);
     setBit(&s, c);
     return s;
 }
@@ -50,7 +50,7 @@ fn invertSet(s: [32]u8) [32]u8 {
 /// PCRE 8-bit `\h` (horizontal whitespace): TAB, SPACE, and NBSP (0xA0, the
 /// Latin-1 member). Higher Unicode spaces are multibyte → the `(?u)` phase.
 fn horizWsSet() [32]u8 {
-    var s = [_]u8{0} ** 32;
+    var s: [32]u8 = @splat(0);
     setBit(&s, '\t');
     setBit(&s, ' ');
     setBit(&s, 0xA0);
@@ -61,7 +61,7 @@ fn horizWsSet() [32]u8 {
 /// LF, VT, FF, CR, and NEL (0x85, Latin-1). U+2028/U+2029 are multibyte → the
 /// `(?u)` phase.
 fn vertWsSet() [32]u8 {
-    var s = [_]u8{0} ** 32;
+    var s: [32]u8 = @splat(0);
     setBit(&s, '\n');
     setBit(&s, 0x0B);
     setBit(&s, 0x0C);
@@ -91,7 +91,7 @@ fn escapedPunct(e: u8) ?u8 {
 
 /// `.` without dot_all: every byte except '\n' (matches `vm.zig`).
 fn anySet() [32]u8 {
-    var s = [_]u8{0xFF} ** 32;
+    var s: [32]u8 = @splat(0xFF);
     const nl: u8 = '\n';
     s[nl >> 3] &= ~(@as(u8, 1) << @as(u3, @intCast(nl & 7)));
     return s;
@@ -99,7 +99,7 @@ fn anySet() [32]u8 {
 
 /// `.` under dot_all / `(?s)`: every byte including '\n'.
 fn allBytesSet() [32]u8 {
-    return [_]u8{0xFF} ** 32;
+    return @splat(0xFF);
 }
 
 /// Whitespace ignored under extended / `(?x)` mode (outside `[...]` and
@@ -109,7 +109,7 @@ fn isExtWs(c: u8) bool {
 }
 
 fn classToSet(cc: common.CharClass) [32]u8 {
-    var s = [_]u8{0} ** 32;
+    var s: [32]u8 = @splat(0);
     cc.fillBitmap(&s);
     return s;
 }
@@ -160,7 +160,7 @@ fn posixClass(name: []const u8) ?common.CharClass {
 
 /// OR a `CharClass`'s post-negation membership into an accumulating bitmap.
 fn orClassInto(bm: *[32]u8, cc: common.CharClass) void {
-    var t = [_]u8{0} ** 32;
+    var t: [32]u8 = @splat(0);
     cc.fillBitmap(&t);
     var k: usize = 0;
     while (k < 32) : (k += 1) bm[k] |= t[k];
@@ -386,7 +386,7 @@ fn parseInner(
     // the standalone `scanGroups` byte-scanner used to recompute independently.
     if (out_ng) |p_ng| p_ng.* = p.n_groups;
     if (out_gnames) |g| {
-        g.* = [_]?[]const u8{null} ** (hir.groupsCap(cap) + 1);
+        g.* = @splat(null);
         var k: usize = 0;
         while (k < p.n_names) : (k += 1) g.*[p.name_g[k]] = p.names[k];
     }
@@ -626,7 +626,7 @@ fn Parser(comptime cap: ?usize) type {
             // epsilons) — `properties.has_look` ⇒ `requires_backtracking`
             // guarantees it doesn't. (Pre-comptime-backtracker this was a hard
             // `cap != null` reject; the backtracker made that unnecessary.)
-            return p.node(.{ .tag = .look, .set_idx = @intFromEnum(kind) });
+            return p.node(.{ .tag = .look, .set_idx = @backingInt(kind) });
         }
 
         fn peek(p: *const Self) ?u8 {
@@ -1156,7 +1156,7 @@ fn Parser(comptime cap: ?usize) type {
                 negated = true;
                 p.i += 1;
             }
-            var bm = [_]u8{0} ** 32;
+            var bm: [32]u8 = @splat(0);
 
             while (true) {
                 const c = p.peek() orelse return Error.Invalid;
@@ -1258,7 +1258,7 @@ fn Parser(comptime cap: ?usize) type {
             if (p.peek() != ']') return Error.Invalid;
             p.i += 1;
             const cc = posixClass(name) orelse return Error.Unsupported;
-            var t = [_]u8{0} ** 32;
+            var t: [32]u8 = @splat(0);
             cc.fillBitmap(&t);
             var k: usize = 0;
             while (k < 32) : (k += 1) bm[k] |= if (neg) ~t[k] else t[k];

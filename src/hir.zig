@@ -327,7 +327,7 @@ pub fn cloneSubtree(
 test "hir comptime store basic shape" {
     const H = Hir(64);
     var h = H.initComptime();
-    const s = try h.addSet(undefined, [_]u8{0} ** 32);
+    const s = try h.addSet(undefined, @splat(0));
     const leaf = try h.addNode(undefined, .{ .tag = .set, .set_idx = s });
     const star = try h.addNode(undefined, .{ .tag = .star, .a = leaf, .greedy = true });
     try std.testing.expectEqual(@as(usize, 2), h.node_count);

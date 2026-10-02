@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const regex = @import("zeetah");
+const rep = regex.common.repeat;
 const Regex = regex.Regex;
 
 fn slice(a: std.mem.Allocator, pat: []const u8, in: []const u8) !?[]const u8 {
@@ -128,7 +129,7 @@ test "bounded: repetition counts — two layered guards (runtime ceilings)" {
     for ([_][]const u8{ "a{64}", "a{65}", "a{300}", "a{1001}", "a{0,1001}", "[0-9A-Za-z_-]{20,1024}" }) |p| {
         var ok = try Regex.compile(a, p);
         defer ok.deinit();
-        try std.testing.expect(try ok.isMatch("x" ++ "a" ** 1100));
+        try std.testing.expect(try ok.isMatch("x" ++ rep("a", 1100)));
     }
     // Over the runtime parser ceiling: specifically NotImplemented.
     try std.testing.expectError(error.NotImplemented, Regex.compile(a, "a{65536}"));

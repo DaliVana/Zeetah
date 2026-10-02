@@ -74,8 +74,8 @@ pub fn isCaptureOnePass(comptime cap: ?usize, nfa: *const thompson.Nfa(cap)) boo
     if (nfa.n_states > MAX_NFA) return false;
     var s: usize = 0;
     while (s < nfa.n_states) : (s += 1) {
-        var seen = [_]bool{false} ** MAX_NFA;
-        var acc = [_]u8{0} ** 32; // union of consuming sets seen in this closure
+        var seen: [MAX_NFA]bool = @splat(false);
+        var acc: [32]u8 = @splat(0); // union of consuming sets seen in this closure
         if (!closureOk(cap, nfa, @intCast(s), &seen, &acc)) return false;
     }
     return true;
@@ -136,7 +136,7 @@ const Step = union(enum) { matched, fail, consume: u16 };
 pub fn SizedIndex(comptime ns: usize, comptime ne: usize) type {
     return struct {
         const Self = @This();
-        off: [ns + 1]u16 = [_]u16{0} ** (ns + 1),
+        off: [ns + 1]u16 = @splat(0),
         order: [ne]u16 = undefined,
 
         pub fn build(comptime cap: ?usize, nfa: *const thompson.Nfa(cap)) Self {
@@ -179,7 +179,7 @@ pub fn fillWith(comptime cap: ?usize, nfa: *const thompson.Nfa(cap), idx: anytyp
     var st: u16 = @intCast(nfa.start);
     var pos: usize = span.start;
     while (true) {
-        var seen = [_]bool{false} ** MAX_NFA;
+        var seen: [MAX_NFA]bool = @splat(false);
         switch (epsWalk(cap, nfa, input, pos, span.end, slots, &seen, st, idx)) {
             .matched => return true,
             .fail => return false,

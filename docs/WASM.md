@@ -90,7 +90,7 @@ pub fn build(b: *std.Build) void {
 
 `zig build` then emits your `.wasm` under `zig-out/bin/`.
 
-> Requires **Zig 0.16+** — the same minimum as Zeetah itself.
+> Requires **Zig 0.17+** — the same minimum as Zeetah itself.
 
 ---
 

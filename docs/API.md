@@ -1029,7 +1029,7 @@ defer allocator.free(matches);
 ## Version
 
 ```zig
-pub const version: std.SemanticVersion; // 0.16.1 (matches build.zig.zon)
+pub const version: std.SemanticVersion; // 0.17.0 (matches build.zig.zon)
 ```
 
 ```zig
@@ -1047,4 +1047,4 @@ std.debug.print("{d}.{d}.{d}\n", .{ v.major, v.minor, v.patch });
 
 ---
 
-**Requirements:** Zig 0.16+, zero external dependencies.
+**Requirements:** Zig 0.17+, zero external dependencies.
