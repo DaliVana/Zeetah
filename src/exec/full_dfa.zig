@@ -224,7 +224,7 @@ pub const PackedDfa = struct {
     /// stride)` are unreachable padding (`class_of` only emits `0..n_classes`).
     stride: usize,
     /// `log2(stride)` — the row-index shift used by `step`/`runFrom`.
-    shift: u6,
+    shift: std.math.Log2Int(usize),
     n_states: usize,
     start: usize,
     a_start: bool,
@@ -364,7 +364,7 @@ pub fn pack(allocator: std.mem.Allocator, src: *const Dfa256) !PackedDfa {
     const nc = src.n_classes;
     // Power-of-two row stride ⇒ index by shift, not multiply (see `stride` doc).
     const stride = std.math.ceilPowerOfTwoAssert(usize, @max(1, nc));
-    const shift: u6 = @intCast(std.math.log2_int(usize, stride));
+    const shift: std.math.Log2Int(usize) = std.math.log2_int(usize, stride);
     const trans = try allocator.alloc(u16, ns * stride);
     errdefer allocator.free(trans);
 
