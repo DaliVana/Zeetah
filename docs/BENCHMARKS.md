@@ -449,6 +449,6 @@ If a pattern is unexpectedly slow:
 
 ---
 
-**Library:** Zeetah · **Zig:** 0.16+ · See also the
+**Library:** Zeetah · **Zig:** 0.17.0+ · See also the
 [README](../README.md), [Architecture](ARCHITECTURE.md), and
 [API Reference](API.md).

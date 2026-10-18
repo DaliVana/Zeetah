@@ -44,7 +44,7 @@ Zeetah grew out of two earlier Zig projects and owes them a direct debt — see
 
 ## Installation
 
-Requires **Zig 0.17+** (0.17.0-dev.2384 or newer). Zeetah has no external dependencies.
+Requires **Zig 0.17.0** or newer. Zeetah has no external dependencies.
 
 ### As a package
 
@@ -583,7 +583,7 @@ zig build parity   # run the meta-engine smoke harness
 
 ## Requirements
 
-- Zig 0.17 or later (0.17.0-dev.2384+)
+- Zig 0.17.0 or later
 - No external dependencies
 
 ## Acknowledgments

@@ -30,11 +30,12 @@ env:
   BENCH_REPO_URL: https://github.com/DaliVana/zeetah-benchmark.git
   BENCH_REPO_REF: main
   # --- zig toolchain -----------------------------------------------------
-  # Must match the version that compiles BOTH the engine and the harness. The
-  # harness is validated on 0.16.0 (the benchmark's pinned toolchain). Note the
-  # engine's own ci.yml builds on 0.17.0-dev.56+a8226cd53 — if the engine source
-  # ever needs that newer toolchain, bump this to match. First knob on a build break.
-  ZIG_VERSION: '0.16.0'
+  # Must match the version that compiles BOTH the engine and the harness, on
+  # BOTH sides (candidate and base). Kept in lockstep with ci.yml (0.17.0); the
+  # harness builds on 0.17.0 as-is. A PR whose base predates the 0.17 port
+  # (base still on 0.16 syntax, e.g. `**`) cannot build its baseline with this
+  # toolchain. First knob on a build break.
+  ZIG_VERSION: '0.17.0'
   # Fail the job if any reliably-measured workload slows by more than this %.
   REGRESSION_PCT: '10'
 
