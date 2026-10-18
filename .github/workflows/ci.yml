@@ -18,7 +18,7 @@ jobs:
 
       - uses: mlugg/setup-zig@v2
         with:
-          version: '0.17.0-dev.56+a8226cd53'
+          version: '0.17.0'
 
       - name: Build
         run: zig build
@@ -46,12 +46,15 @@ jobs:
           - x86_64-macos
           - aarch64-macos
           - x86_64-windows
+          # 32-bit usize: catches shift-width / @intCast assumptions that only
+          # hold on 64-bit hosts (see docs/WASM.md).
+          - wasm32-wasi
     steps:
       - uses: actions/checkout@v6
 
       - uses: mlugg/setup-zig@v2
         with:
-          version: '0.17.0-dev.56+a8226cd53'
+          version: '0.17.0'
 
       - name: Build (${{ matrix.target }})
         run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast

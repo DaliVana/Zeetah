@@ -43,6 +43,6 @@ test "RegexError is exactly the returnable set (alpha-freeze guard)" {
     // an exhaustive `switch` is writable without dead arms. Removing a variant
     // post-alpha is breaking; adding one is not. If you intentionally add one,
     // bump this count.
-    const set = @typeInfo(RegexError).error_set.?;
+    const set = @typeInfo(RegexError).error_set.error_names.?;
     try std.testing.expectEqual(@as(usize, 7), set.len);
 }

@@ -63,14 +63,15 @@ For many common shapes, Zeetah avoids stepping an automaton entirely:
 
 | Executor | Chosen for | Why it's fast |
 |----------|-----------|---------------|
-| **literal** | a single literal or an exact literal alternation (`cat\|dog\|bird`) | SIMD substring / Teddy multi-literal scan — no automaton at all |
+| **literal** | a single literal or an exact literal alternation (`cat\|dog\|bird`), case-sensitive or `(?i)` | SIMD substring / Teddy multi-literal scan (case-folded needles under `(?i)`) — no automaton at all |
 | **lit_prefix** | a literal prefix ≥ 3 bytes, unanchored (`hello.*world`) | Teddy-locate the prefix, then verify with an anchored DFA only at candidates |
 | **reverse_suffix** | a selective trailing literal, weak prefix | the suffix is a sound fast-negative; the forward DFA runs only where the suffix occurs |
 | **dfa** | the general regular case | eager DFA table walk (`Dfa256`): one table lookup per byte |
 | **dense_search** | a bare unanchored DFA of narrow shape (`min_len ≥ 4`, ≤ 16 start bytes, no required literal, not lazy) | a frozen dense single-pass unanchored DFA — no restart loop |
 | **lazy_dfa** | when the eager DFA would exceed its state ceiling | the same subset construction, built on demand and **bit-identical** — never a fallback to backtracking |
-| **class_span** | one greedy single contiguous-range `class+` / `class*` | a SIMD member-run scan, no automaton |
-| **boundary_lits** | `\b(?:kw1\|kw2\|…)\b` keyword alternations | Aho-Corasick locate + O(1) `\b` verification |
+| **class_span** | the whole pattern is one repeated byte class (`[0-9]+`, `\w+`, `.+`, `[a-z]{2,}`, `[A-Za-z]{8,13}`, `\b\w+\b`) | one 64-byte membership bitmask per block; runs found with `ctz`, counted with `popCount` — no automaton (runtime and comptime) |
+| **class_seq** | a fixed-length sequence of byte classes (`[0-9]{2}:[0-9]{2}:[0-9]{2}`, `[0-9a-f]{8}-…`, `#[0-9a-fA-F]{6}`) | per-class 64-byte masks shifted and ANDed into all match ends of a block; a rare gate class (`:`/`-`/`#`) rejects most blocks first — no automaton |
+| **boundary_lits** | `\b(?:kw1\|kw2\|…)\b` keyword alternations | ≤ 8 keywords: Teddy locate; word-only keywords: one hash check per `\w` run (walked off a 64-byte mask, most words rejected by length / first+last byte bit tests); otherwise Aho-Corasick locate — each with an O(1) `\b` verification |
 | **bt_look** | plain look-assertions (`\b`, `\B`, mid-pattern `^`/`$`, `(?m)`) | bounded backtracker (the DFA does not fold look-assertions) |
 | **backtrack** | lookaround / backreferences | HIR tree backtracker with a `seek` prefilter + concat-internal regular "island" delegation |
 | **split_alt** | a top-level alternation mixing regular and non-regular branches | regular branches → anchored DFAs, the rest → the tree backtracker |
@@ -90,7 +91,7 @@ regions of the input cannot contain a match:
 - **Teddy** — a SIMD multi-substring locator (≤ 8 needles, adaptive nibble
   masks) backing the `literal` / `lit_prefix` / `reverse_suffix` executors.
 - **Aho-Corasick** — a multi-keyword locator backing the `boundary_lits`
-  executor.
+  executor when its keywords are not all word-only.
 - **Seek** — a regular over-approximation that skips proven-dead prefixes for
   the backtracking tier.
 
@@ -181,18 +182,25 @@ the meta engine; this is a guide to expectations, not a contract.
 
 ### Fastest — no automaton
 
-- **Plain literals** (`hello`, `error:`): SIMD substring / Teddy scan.
+- **Plain literals** (`hello`, `error:`): SIMD substring / Teddy scan — also
+  under `(?i)` (`(?i)sherlock holmes|john watson`), as case-folded Teddy needles;
+  a folded leading run (`(?i)error: \d+`) prefilters the DFA.
 - **Exact literal alternations** (`cat|dog|bird`): one Teddy multi-literal scan.
-- **`\b`-delimited keyword alternations** (`\b(?:GET|POST|PUT)\b`):
-  Aho-Corasick locate + O(1) boundary check.
-- **A single contiguous class repeat** (`[0-9]+`, `[a-z]*`): SIMD member-run
-  scan via `class_span`.
+- **`\b`-delimited keyword alternations** (`\b(?:GET|POST|PUT)\b`): a Teddy
+  locate for ≤ 8 keywords, one hash check per word for a large word-only list
+  (`\b(?:break|case|…)\b`), else Aho-Corasick — plus an O(1) boundary check.
+- **A whole-pattern class repeat** (`[0-9]+`, `\w+`, `[a-z]*`, `\S+`,
+  `[a-z]{3,}`, `[A-Za-z]{8,13}`, `\b\w+\b`, `\b\w{12,}\b`): a block-bitmask
+  run scan via `class_span` — in the runtime `Regex` and the comptime `Pattern`.
+- **A fixed-length class sequence** (`\d{3}-\d{2}-\d{4}`, `[0-9]{2}:[0-9]{2}`,
+  UUIDs, MAC addresses, `#[0-9a-f]{6}`): every match end of a 64-byte block from
+  shifted per-class masks via `class_seq`.
 - **Patterns with a rare required byte or literal**: a `memchr`-driven prefilter
   skips most of the input before any matching.
 
 ### Fast — compiled DFA, one lookup per byte
 
-- **General regular patterns** (`\d{3}-\d{4}`, `[A-Z][a-z]+`, anchored shapes):
+- **General regular patterns** (`\d{3}-\d+`, `[A-Z][a-z]+`, anchored shapes):
   the `dfa` / `dense_search` executors.
 - **Literal-prefixed unanchored patterns** (`hello.*world`): `lit_prefix`
   locates the prefix, then verifies only there.
@@ -271,7 +279,7 @@ var re = try Regex.compile(allocator, "[abc]");
 ```
 
 A class is an O(1) bitmap membership test per byte; the engine also recognizes a
-single contiguous class repeat as the SIMD `class_span` fast path.
+whole-pattern class repeat (`[abc]+`, `\w+`) as the `class_span` fast path.
 
 ---
 
@@ -441,6 +449,6 @@ If a pattern is unexpectedly slow:
 
 ---
 
-**Library:** Zeetah · **Zig:** 0.16+ · See also the
+**Library:** Zeetah · **Zig:** 0.17.0+ · See also the
 [README](../README.md), [Architecture](ARCHITECTURE.md), and
 [API Reference](API.md).

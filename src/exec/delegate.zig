@@ -96,7 +96,7 @@ inline fn copyReg(dst: *H, a: std.mem.Allocator, src: *const H, ref: NodeRef) hi
 
 pub const Plan = struct {
     allocator: std.mem.Allocator,
-    refs: [MAX_ISLANDS]NodeRef = [_]NodeRef{hir.none} ** MAX_ISLANDS,
+    refs: [MAX_ISLANDS]NodeRef = @splat(hir.none),
     /// Each island's anchored DFA, heap-packed (right-sized, not a 128 KB
     /// `Dfa256`); `runFrom` returns its greedy-maximal end at a position.
     dfas: [MAX_ISLANDS]*full_dfa.PackedDfa = undefined,

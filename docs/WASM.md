@@ -37,8 +37,9 @@ functions.
 
 So a "WASM build" of Zeetah is really *your* Wasm program with Zeetah linked in
 as a dependency. The library itself is allocator-driven and OS-agnostic, so it
-compiles cleanly to `wasm32-freestanding` and `wasm32-wasi` with no special
-configuration.
+compiles cleanly to `wasm32-freestanding` and `wasm32-wasi`. The one setting to
+be aware of is the **linear-memory stack size** on `wasm32-freestanding` — see
+[Stack size](#stack-size) below.
 
 ---
 
@@ -84,13 +85,17 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // `Regex.compile` builds its DFA tables on the stack and needs ~1.5 MiB.
+    // Zig's wasm32-freestanding default is 1 MiB (wasm32-wasi defaults to
+    // 16 MiB, so this line is only needed for the export-shim path).
+    exe.stack_size = 4 * 1024 * 1024;
     b.installArtifact(exe);
 }
 ```
 
 `zig build` then emits your `.wasm` under `zig-out/bin/`.
 
-> Requires **Zig 0.16+** — the same minimum as Zeetah itself.
+> Requires **Zig 0.17+** — the same minimum as Zeetah itself.
 
 ---
 
@@ -154,8 +159,8 @@ You are the one who designs and owns this ABI — Zeetah does not provide it.
 
 ### Writing an export shim
 
-This is a minimal, realistic sketch. It exports a fixed-buffer allocator for the
-JS side to write input bytes into, plus a stateless `isMatch` that compiles the
+This is a minimal, realistic sketch. It exports a fixed I/O buffer for the JS
+side to write input bytes into, plus a stateless `isMatch` that compiles the
 pattern, runs the match, and frees it in one call. Adapt it to your needs.
 
 ```zig
@@ -164,9 +169,15 @@ const std = @import("std");
 const zeetah = @import("zeetah");
 const Regex = zeetah.Regex;
 
-// A single linear-memory arena the JS host writes into and reads from.
-var buffer: [1 << 20]u8 = undefined; // 1 MiB scratch
-var fba = std.heap.FixedBufferAllocator.init(&buffer);
+// Host I/O region: the JS side writes pattern/input bytes here (and reads any
+// results back). 64 KiB is plenty for a stateless isMatch.
+var buffer: [64 * 1024]u8 = undefined;
+
+// Separate arena for Regex.compile's own allocations, reset per call. It must
+// NOT alias `buffer`: the compiler would allocate straight over the bytes the
+// host just wrote.
+var heap: [1 << 20]u8 = undefined; // 1 MiB
+var fba = std.heap.FixedBufferAllocator.init(&heap);
 
 /// JS calls this to learn where to write bytes; it then copies UTF-8 into
 /// `memory` at the returned offset (up to `buffer.len`).
@@ -214,6 +225,7 @@ zig build-exe src/shim.zig \
     -target wasm32-freestanding \
     -O ReleaseSmall \
     -fno-entry \
+    --stack 4194304 \
     --export=bufferPtr \
     --export=bufferLen \
     --export=isMatch \
@@ -223,8 +235,10 @@ zig build-exe src/shim.zig \
 ```
 
 (`-fno-entry` because there is no `main`; `--export=` makes each `export fn`
-visible to the host. You can wire the same flags into a `build.zig` executable
-via `exe.entry = .disabled;` and `exe.rdynamic = true;`.)
+visible to the host; `--stack` raises the 1 MiB freestanding default, which
+`Regex.compile` overflows — see [Stack size](#stack-size). You can wire the same
+flags into a `build.zig` executable via `exe.entry = .disabled;`,
+`exe.rdynamic = true;` and `exe.stack_size = 4 * 1024 * 1024;`.)
 
 ### Calling it from JavaScript
 
@@ -265,6 +279,26 @@ console.log('matched:', result === 1);
 
 ---
 
+## Stack size
+
+The runtime compiler (`Regex.compile`) builds its DFA tables in fixed-size
+stack arrays — the same code runs at comptime for `Pattern`, so it cannot take an
+allocator. Peak stack use during a compile is roughly **1–1.5 MiB**.
+
+- **`wasm32-wasi`**: Zig's default stack is 16 MiB. Nothing to do.
+- **`wasm32-freestanding`**: Zig's default stack is **1 MiB**, which is not
+  enough. Zig places the stack at the bottom of linear memory, so overflowing it
+  does not corrupt data — the module **traps** with `RuntimeError: memory access
+  out of bounds` on the first `Regex.compile`. Set `exe.stack_size =
+  4 * 1024 * 1024;` in `build.zig` (or pass `--stack 4194304` to
+  `zig build-exe`); 4 MiB costs 48 extra 64 KiB pages of initial memory and
+  leaves headroom for your own frames.
+
+Matching itself (`isMatch` / `find` / `count` on a compiled `Regex`, and every
+verb on a comptime `Pattern`) uses a few KiB of stack and is unaffected.
+
+---
+
 ## Compile-time patterns in WASM
 
 If your pattern is known at compile time, `Pattern` is an excellent fit for Wasm:
@@ -299,7 +333,10 @@ above.
   shim you choose the allocator — the example uses a fixed-size
   `FixedBufferAllocator` (reset per call, so nothing leaks across calls). You can
   instead use a `DebugAllocator` or wrap the host's memory growth, but a
-  reset-per-call arena is the simplest correct choice for a stateless ABI.
+  reset-per-call arena is the simplest correct choice for a stateless ABI. Keep
+  the arena separate from the region the host writes into: `Regex.compile`
+  allocates immediately, and an arena that aliases the host buffer would
+  overwrite the pattern/input bytes mid-call.
 - **No hidden allocation.** Every Zeetah heap allocation goes through the
   allocator you pass. On the comptime `Pattern` (ideal for Wasm), **every
   one-match verb is allocation-free** — `isMatch` / `find` / `count` / `startsWith`

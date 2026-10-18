@@ -89,9 +89,9 @@ pub const LazyMemo = struct {
     /// and identical for every search — recomputing it per match dominated
     /// match-dense searches.
     fstart: [4]u32 = undefined,
-    fstart_gen: [4]u64 = [_]u64{NO_GEN} ** 4,
+    fstart_gen: [4]u64 = @splat(NO_GEN),
     rstart: [4]u32 = undefined,
-    rstart_gen: [4]u64 = [_]u64{NO_GEN} ** 4,
+    rstart_gen: [4]u64 = @splat(NO_GEN),
 
     pub fn init(allocator: std.mem.Allocator) LazyMemo {
         return .{ .allocator = allocator };
@@ -146,8 +146,12 @@ pub const LazyMemo = struct {
     }
 
     /// Grow a dense transition cache so `sid*nc + cls` is in range for
-    /// every currently-interned `sid`; new rows start `UNKNOWN`.
-    pub fn ensureTrans(self: *LazyMemo, list: *std.ArrayListUnmanaged(i32), n_states: usize, nc: usize) !void {
+    /// every currently-interned `sid`; new rows start `UNKNOWN`. `inline`:
+    /// this sits in the lazy DFA's per-transition miss path and the common
+    /// case is the one-compare early return; left to the optimizer, LLVM 22
+    /// (Zig 0.17) emitted it as an out-of-line call, costing 20-30% on the
+    /// lazy-DFA tier (rebar capitals/noseyparker/long-english/aws-keys).
+    pub inline fn ensureTrans(self: *LazyMemo, list: *std.ArrayListUnmanaged(i32), n_states: usize, nc: usize) !void {
         const need = n_states * nc;
         if (list.items.len >= need) return;
         const old = list.items.len;

@@ -15,6 +15,7 @@ const common = @import("../common.zig");
 const pf = @import("../prefilter.zig");
 const cc = @import("charclass.zig");
 const search = @import("search.zig");
+const word_set = @import("word_set.zig");
 
 const NodeRef = hir.NodeRef;
 
@@ -23,14 +24,21 @@ pub const MAX_LIT: usize = 64;
 
 /// Up to `MAX_ALTS` literal alternatives, each up to `MAX_LIT` bytes.
 pub const Seq = struct {
-    lits: [MAX_ALTS][MAX_LIT]u8 = [_][MAX_LIT]u8{[_]u8{0} ** MAX_LIT} ** MAX_ALTS,
-    lens: [MAX_ALTS]u8 = [_]u8{0} ** MAX_ALTS,
+    lits: [MAX_ALTS][MAX_LIT]u8 = @splat(@splat(0)),
+    lens: [MAX_ALTS]u8 = @splat(0),
     /// Number of populated alternatives. `0` => no sequence.
     n: u8 = 0,
     /// True when matching one of these alternatives is *sufficient* (the Seq
     /// is the whole thing it describes — e.g. the entire pattern is the
     /// literal). False => it is only a leading/trailing necessary prefix.
     exact: bool = false,
+    /// Case-folded alternatives (`foldLiterals`): `fold[i][j]` is `0x20` where
+    /// byte j of alternative i is a case pair (`c` and `c ^ 0x20` both match),
+    /// else 0, and `lits` holds the canonical `c | fold`. A byte `x` matches
+    /// position j iff `x | fold[i][j] == lits[i][j]`. `folded` ⇔ any fold.
+    /// Only `core.buildLiteral` reads a folded Seq's bytes (→ `Teddy.buildFolded`).
+    fold: [MAX_ALTS][MAX_LIT]u8 = @splat(@splat(0)),
+    folded: bool = false,
 
     pub fn isEmpty(s: *const Seq) bool {
         return s.n == 0;
@@ -68,6 +76,126 @@ pub const Seq = struct {
 };
 
 const hasBit = common.hasBit;
+
+// --- Case-folded literals ----------------------------------------------------
+//
+// Under `(?i)` the parser folds every letter into a two-member set `{C, c}`, so
+// a case-insensitive literal is a concat of sets that are each a single byte or
+// a *case pair* — two bytes differing only in bit 5 (`0x20`). The cross-product
+// extractor above would expand such a literal into 2^letters alternatives and
+// give up after a few bytes; `foldLiterals` keeps it as ONE alternative plus a
+// fold mask, which Teddy's nibble masks match exactly (`Teddy.buildFolded`).
+
+/// A position's byte set as (canonical byte, fold mask): one member ⇒
+/// `(c, 0)`; a case pair `{c, c ^ 0x20}` ⇒ `(c | 0x20, 0x20)`; else null.
+fn foldPos(bm: *const [32]u8) ?struct { c: u8, f: u8 } {
+    var first: ?u8 = null;
+    var second: ?u8 = null;
+    for (0..256) |b| {
+        if (!hasBit(bm, @intCast(b))) continue;
+        if (first == null) {
+            first = @intCast(b);
+        } else if (second == null) {
+            second = @intCast(b);
+        } else return null; // ≥ 3 members
+    }
+    const a = first orelse return null;
+    const b = second orelse return .{ .c = a, .f = 0 };
+    if (a ^ b != 0x20) return null;
+    return .{ .c = a | 0x20, .f = 0x20 };
+}
+
+/// Walk a left-leaning concat chain rooted at `ref` in order, appending each
+/// `set` leaf that is a single byte or case pair to `lit`/`fold` from index
+/// `len`. With `stop_early`, the first other factor ends the walk (a leading
+/// run); otherwise it fails. Returns the new length and whether the whole
+/// chain was consumed, or null.
+fn foldedRun(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, lit: *[MAX_LIT]u8, fold: *[MAX_LIT]u8, stop_early: bool) ?struct { len: usize, whole: bool } {
+    var stack: [2 * MAX_LIT + 8]NodeRef = undefined;
+    var sp: usize = 1;
+    stack[0] = ref;
+    var n: usize = 0;
+    while (sp > 0) {
+        sp -= 1;
+        const nd = h.node(stack[sp]);
+        switch (nd.tag) {
+            .concat => {
+                if (sp + 2 > stack.len) return if (stop_early and n > 0) .{ .len = n, .whole = false } else null;
+                stack[sp] = nd.b;
+                stack[sp + 1] = nd.a; // popped first ⇒ left to right
+                sp += 2;
+            },
+            .empty => {},
+            .set => {
+                const bm = h.setBitmap(nd.set_idx);
+                const fp = foldPos(&bm) orelse return if (stop_early) .{ .len = n, .whole = false } else null;
+                if (n == MAX_LIT) return if (stop_early) .{ .len = n, .whole = false } else null;
+                lit[n] = fp.c;
+                fold[n] = fp.f;
+                n += 1;
+            },
+            else => return if (stop_early) .{ .len = n, .whole = false } else null,
+        }
+    }
+    return .{ .len = n, .whole = true };
+}
+
+/// Case-folded literal extraction (the `(?i)` peer of the exact literal / prefix
+/// `Seq`s). Returns, as a `folded` Seq:
+///   * the whole pattern, when it is a literal or an alternation of ≤ `MAX_ALTS`
+///     literals whose bytes are single bytes or case pairs (`exact = true`) —
+///     `(?i)sherlock holmes`, `(?i)sherlock|watson`;
+///   * otherwise its leading such run as a one-alternative prefix
+///     (`exact = false`) — `(?i)error: \d+` → `error: `;
+/// or an empty Seq when there is no case pair at all (plain literals keep the
+/// exact extractors), the pattern is anchored, or a capture group is involved.
+pub fn foldLiterals(comptime cap: ?usize, h: *const hir.Hir(cap)) Seq {
+    @setEvalBranchQuota(1_000_000);
+    if (h.root == hir.none or h.anchored_start or h.anchored_end) return .{};
+    var s = Seq{};
+    // Whole pattern: an alternation tree of folded literal branches (walked
+    // with a bounded stack — a 10 000-way alternation just fails the bound).
+    whole: {
+        var stack: [2 * MAX_ALTS + 4]NodeRef = undefined;
+        var sp: usize = 1;
+        stack[0] = h.root;
+        while (sp > 0) {
+            sp -= 1;
+            const ref = stack[sp];
+            const nd = h.node(ref);
+            if (nd.tag == .alt) {
+                if (sp + 2 > stack.len) break :whole;
+                stack[sp] = nd.b;
+                stack[sp + 1] = nd.a; // declared order
+                sp += 2;
+                continue;
+            }
+            if (s.n == MAX_ALTS) break :whole;
+            const r = foldedRun(cap, h, ref, &s.lits[s.n], &s.fold[s.n], false) orelse break :whole;
+            if (r.len == 0) break :whole;
+            s.lens[s.n] = @intCast(r.len);
+            s.n += 1;
+        }
+        s.exact = true;
+        s.folded = anyFold(&s);
+        return if (s.folded) s else .{};
+    }
+    // Leading run of the concat spine.
+    var p = Seq{};
+    const r = foldedRun(cap, h, h.root, &p.lits[0], &p.fold[0], true) orelse return .{};
+    if (r.len == 0 or r.whole) return .{}; // whole-literal cases were handled above
+    p.lens[0] = @intCast(r.len);
+    p.n = 1;
+    p.folded = anyFold(&p);
+    return if (p.folded) p else .{};
+}
+
+fn anyFold(s: *const Seq) bool {
+    for (0..s.n) |i| {
+        for (s.fold[i][0..s.lens[i]]) |f| if (f != 0) return true;
+    }
+    return false;
+}
 
 /// If `set_idx`'s bitmap has exactly one member, return that byte.
 fn singleByte(comptime cap: ?usize, h: *const hir.Hir(cap), set_idx: u32) ?u8 {
@@ -178,8 +306,8 @@ const SMALL_CLASS_MAX: usize = 4;
 /// concatenation (cross-product) and union. Defaults are all-zero so an
 /// untouched byte tail is `0` (never `undefined` — safe to bake at comptime).
 const LitSet = struct {
-    lits: [MAX_ALTS][MAX_LIT]u8 = [_][MAX_LIT]u8{[_]u8{0} ** MAX_LIT} ** MAX_ALTS,
-    lens: [MAX_ALTS]u8 = [_]u8{0} ** MAX_ALTS,
+    lits: [MAX_ALTS][MAX_LIT]u8 = @splat(@splat(0)),
+    lens: [MAX_ALTS]u8 = @splat(0),
     n: usize = 0,
 };
 
@@ -396,7 +524,7 @@ pub fn suffix(comptime cap: ?usize, h: *const hir.Hir(cap)) Seq {
     const ln = trailingRun(cap, h, h.root, &buf, 0, &exact);
     if (ln == 0) return Seq{};
     // trailingRun filled from the right edge; left-align it.
-    var out: [MAX_LIT]u8 = [_]u8{0} ** MAX_LIT;
+    var out: [MAX_LIT]u8 = @splat(0);
     for (0..ln) |i| out[i] = buf[MAX_LIT - ln + i];
     s.lits[0] = out;
     s.lens[0] = @intCast(ln);
@@ -454,7 +582,7 @@ pub const ReqLit = struct {
     /// (reverse-inner anchoring). A multi-byte anchor occurs far less often than
     /// any single byte, so far fewer candidate positions reach the `runFrom`
     /// verifier (e.g. `[a-z]+/api/v2/[a-z]+` keys on `/api/v2/`, not on `/`).
-    lit: [MAX_REQLIT]u8 = [_]u8{0} ** MAX_REQLIT,
+    lit: [MAX_REQLIT]u8 = @splat(0),
     len: u8 = 1,
     /// The byte `prefilter.findLiteralOcc` locates the literal by (`memchr`, or
     /// the first byte of its two-byte SIMD filter), at offset `probe_off`. Picked
@@ -470,7 +598,7 @@ const MAXI = 64;
 const SpItem = struct {
     kind: enum { lit1, cls1, run, stop },
     byte: u8 = 0,
-    set: [32]u8 = [_]u8{0} ** 32,
+    set: [32]u8 = @splat(0),
 };
 
 fn flatten(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, out: *[MAXI]SpItem, n: *usize) void {
@@ -604,7 +732,7 @@ pub fn requiredLiteralBack(comptime cap: ?usize, h: *const hir.Hir(cap)) ?ReqLit
             while (m < hi) : (m += 1) score += rarity(items[m].byte);
             if (score > best_score) {
                 best_score = score;
-                var lit: [MAX_REQLIT]u8 = [_]u8{0} ** MAX_REQLIT;
+                var lit: [MAX_REQLIT]u8 = @splat(0);
                 var m2: usize = lo;
                 while (m2 < hi) : (m2 += 1) lit[m2 - lo] = items[m2].byte;
                 const len: u8 = @intCast(hi - lo);
@@ -688,8 +816,8 @@ pub fn requiredLeadingLookbehindSet(comptime cap: ?usize, h: *const hir.Hir(cap)
 pub const MAX_BL: usize = 128;
 
 pub const BoundaryLits = struct {
-    lits: [MAX_BL][MAX_LIT]u8 = [_][MAX_LIT]u8{[_]u8{0} ** MAX_LIT} ** MAX_BL,
-    lens: [MAX_BL]u8 = [_]u8{0} ** MAX_BL,
+    lits: [MAX_BL][MAX_LIT]u8 = @splat(@splat(0)),
+    lens: [MAX_BL]u8 = @splat(0),
     n: u16 = 0,
     /// Longest alternative — the window width the search must brute-scan
     /// around an Aho-Corasick hit to stay leftmost-correct.
@@ -724,12 +852,17 @@ pub fn BoundaryMatcher(comptime AcT: type) type {
         /// large sets like `deep_alternation` (40 kw) stay on pure AC — no
         /// prefilter rather than a gamble. Teddy, by contrast, keys on 3 bytes
         /// so it stays selective regardless of input (A/B: 12–16× either way).
+        /// Larger sets of word-only keywords (`deep_alternation`) take `.words`
+        /// instead: a match is then a whole `\w` run, so walk the runs off a
+        /// 64-byte `\w` bitmask and hash-check each (`word_set.zig`) — cost per
+        /// input word, not per byte, and independent of the keyword count.
         /// Shared runtime+comptime.
         pre: Pre = .none,
 
         const Pre = union(enum) {
             none,
             teddy: pf.Teddy,
+            words: word_set.WordSet,
         };
 
         /// Build the matcher and choose its prefilter from the literal set.
@@ -743,10 +876,14 @@ pub fn BoundaryMatcher(comptime AcT: type) type {
         /// `.rodata` exactly as runtime does. Teddy needs ≤ 8 needles, each ≥ 2
         /// bytes (it returns `null` otherwise ⇒ pure AC).
         fn buildPre(bl: *const BoundaryLits) Pre {
-            if (bl.n == 0 or bl.n > pf.Teddy.MAX_NEEDLES) return .none;
-            var needles: [pf.Teddy.MAX_NEEDLES][]const u8 = undefined;
+            if (bl.n == 0) return .none;
+            var needles: [MAX_BL][]const u8 = undefined;
             for (0..bl.n) |i| needles[i] = bl.alt(i);
-            if (pf.Teddy.build(needles[0..bl.n])) |t| return .{ .teddy = t };
+            if (bl.n <= pf.Teddy.MAX_NEEDLES) {
+                if (pf.Teddy.build(needles[0..bl.n])) |t| return .{ .teddy = t };
+            }
+            // Word-only keywords (≤ 16 bytes each): whole-run hash lookups.
+            if (word_set.WordSet.build(needles[0..bl.n])) |w| return .{ .words = w };
             return .none;
         }
 
@@ -754,7 +891,7 @@ pub fn BoundaryMatcher(comptime AcT: type) type {
         /// same `lookHolds(.word_boundary)` the bounded/tree backtrackers use, so
         /// the contract is identical to the engine this serves (no divergent copy).
         inline fn wbAt(input: []const u8, pos: usize) bool {
-            return cc.lookHolds(@intFromEnum(hir.LookKind.word_boundary), input, pos);
+            return cc.lookHolds(@backingInt(hir.LookKind.word_boundary), input, pos);
         }
 
         /// Leftmost-first match length at exactly `p`, or null. Tries the
@@ -766,10 +903,26 @@ pub fn BoundaryMatcher(comptime AcT: type) type {
             while (i < self.bl.n) : (i += 1) {
                 const L = self.bl.alt(i);
                 if (p + L.len <= input.len and
-                    std.mem.eql(u8, input[p .. p + L.len], L) and
+                    litEqAt(input, p, L) and
                     wbAt(input, p + L.len)) return L.len;
             }
             return null;
+        }
+
+        /// `input[p..p+L.len] == L` for a short literal, as a plain inline byte
+        /// loop with a first-byte early-out. The alternatives are keyword-sized
+        /// and almost every candidate mismatches on byte 0, so this beats the
+        /// generic `std.mem.eql` (whose vector `eqlBytes` LLVM 22 keeps out of
+        /// line — a 28% loss on `\b(?:kw|kw|…)\b` under Zig 0.17). Caller
+        /// guarantees `p + L.len <= input.len`.
+        inline fn litEqAt(input: []const u8, p: usize, L: []const u8) bool {
+            if (L.len == 0) return true;
+            if (input[p] != L[0]) return false;
+            var k: usize = 1;
+            while (k < L.len) : (k += 1) {
+                if (input[p + k] != L[k]) return false;
+            }
+            return true;
         }
 
         /// Leftmost match at/after absolute `from`. With the Teddy prefilter,
@@ -782,6 +935,7 @@ pub fn BoundaryMatcher(comptime AcT: type) type {
         pub fn find(self: *const Self, input: []const u8, from: usize) ?search.Span {
             switch (self.pre) {
                 .none => return self.findAC(input, from),
+                .words => |*w| return w.find(input, from),
                 .teddy => |*t| {
                     var pos = from;
                     while (t.find(input, pos)) |hit| {
@@ -867,7 +1021,7 @@ pub fn boundaryLiterals(comptime cap: ?usize, h: *const hir.Hir(cap)) ?BoundaryL
     var nf: usize = 0;
     if (!spineFactors(cap, h, h.root, &fac, &nf)) return null;
     if (nf != 3) return null;
-    const wb: u32 = @intFromEnum(hir.LookKind.word_boundary);
+    const wb: u32 = @backingInt(hir.LookKind.word_boundary);
     const f0 = h.node(fac[0]);
     const f2 = h.node(fac[2]);
     if (f0.tag != .look or f0.set_idx != wb) return null;

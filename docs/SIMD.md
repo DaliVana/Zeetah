@@ -21,8 +21,11 @@ where it deliberately is not.
 
 | File | Role | SIMD primitive |
 |------|------|----------------|
-| [`src/prefilter.zig`](../src/prefilter.zig) | First-byte set scan + Teddy multi-literal kernel + (scalar) Aho-Corasick | portable `@Vector` compare/`@reduce` + arch byte-shuffle (`pshufb`/`vpshufb`/`tbl`) |
-| [`src/exec/class_span.zig`](../src/exec/class_span.zig) | `class+` / `class*` member-run scanner (whole pattern is one greedy class repetition) | portable `@Vector` + NEON-shaped `@reduce(.Max/.Min)` |
+| [`src/simd.zig`](../src/simd.zig) | The one shared arch primitive: `simd.shuffle(W, table, idx)` (16- or 32-byte per-lane table lookup) + the comptime `has_shuffle` capability flag | inline asm `pshufb` / `vpshufb` / `tbl`, portable fallback |
+| [`src/prefilter.zig`](../src/prefilter.zig) | First-byte set scan + Teddy multi-literal kernel + (scalar) Aho-Corasick | portable `@Vector` compare/`@reduce` + `simd.shuffle` |
+| [`src/exec/class_span.zig`](../src/exec/class_span.zig) | `class+` / `class*` member-run scanner (whole pattern is one greedy class repetition) | 64-byte block → `u64` mask (`ld4`+`sri`+`shrn` on NEON, `pmovmskb` on x86) + nibble `tbl`/`pshufb` classify; `Ranges` keeps the 16-byte `@reduce` scan for `seek` |
+| [`src/exec/class_seq.zig`](../src/exec/class_seq.zig) | Fixed-length class-sequence matcher (`[0-9]{2}:[0-9]{2}:[0-9]{2}`, UUIDs, MACs) | `class_span`'s block masks, one shared load per block; shifted 128-bit mask pairs ANDed per run; gate filter + `memchr` skip |
+| [`src/exec/word_set.zig`](../src/exec/word_set.zig) | `\b(?:kw1\|kw2\|…)\b` with word-only keywords (`boundary_lits` `.words`) | `class_span`'s `\w` block mask walked with `ctz`; length + (first, last) byte bit filters; open-addressing keyword table |
 | [`src/exec/full_dfa.zig`](../src/exec/full_dfa.zig) | Adaptive self-loop **spin-skip** in the DFA hot loop (`runFromSpin`) | consumes `prefilter.runEnd` (§7) |
 | [`src/exec/search.zig`](../src/exec/search.zig) | Wires the prefilters into both DFA front-ends; reverse-inner literal anchor (§8) | consumes the above + `memchr` |
 | [`src/exec/seek.zig`](../src/exec/seek.zig) | Over-approximation prefilter for the backtracker tier | consumes `class_span.Ranges.firstMember` |
@@ -65,10 +68,10 @@ The portability strategy has three layers:
    ```
 
 3. **Inline asm only for the one primitive the portable layer can't express
-   well**: the byte-shuffle that the Teddy kernel is built on (`pshufb` /
-   `vpshufb` / `tbl`). Even that is selected by a comptime `switch`
-   ([`prefilter.zig:520`](../src/prefilter.zig#L520)), so a non-shuffle target
-   never references it.
+   well**: the byte-shuffle that the Teddy kernel and the `class_span` nibble
+   classifier are built on (`pshufb` / `vpshufb` / `tbl`). It lives once, in
+   [`src/simd.zig`](../src/simd.zig) (`simd.shuffle`), selected by comptime
+   conditions on the target, so a non-shuffle target never emits it.
 
 The net result: the *same* `.zig` source compiles to a NEON kernel on Apple
 Silicon and an SSE2/AVX2 kernel on Linux x86-64, with the widths and the Teddy
@@ -214,20 +217,25 @@ engine re-runs from the reported offset, keeping an over-approximation correct.
 ### 4.1 The shuffle primitive
 
 Teddy is built on a one-instruction 16-byte table lookup
-`out[k] = table[idx[k] & 0x0F]` (our indices are nibbles, 0..15):
+`out[k] = table[idx[k] & 0x0F]` (our indices are nibbles, 0..15). The primitive
+is shared with the `class_span` nibble classifier (§5) and lives in
+[`src/simd.zig`](../src/simd.zig):
 
 ```zig
-const shuf = switch (builtin.cpu.arch) {                         // prefilter.zig:520
-    .aarch64 => /* tbl  v.16b, {t.16b}, i.16b */ ,
-    .x86_64  => if (teddy_avx2) /* vpshufb ymm (3-operand) */
-                else            /* pshufb xmm (2-operand) */ ,
-    else     => unreachable,
-};
+pub inline fn shuffle(comptime W: usize, table: @Vector(W, u8), idx: @Vector(W, u8)) @Vector(W, u8)
+//  aarch64 + NEON            → tbl  v.16b, {t.16b}, i.16b        (W == 16 only)
+//  x86_64 + AVX (W=16) /     → vpshufb xmm/ymm (3-operand)
+//           AVX2 (W=32)
+//  x86_64 + SSSE3            → pshufb xmm (2-operand, W == 16)
+//  otherwise                 → portable per-lane scalar lookup
 ```
 
 `pshufb` (SSSE3) and `tbl` (NEON) both zero a lane whose index has bit 7 set / is
 ≥ 16; since our indices are nibbles the two are bit-identical, so one algorithm
-serves both ISAs.
+serves both ISAs. `prefilter.shuf` and `class_span.shuf` are one-line wrappers
+that fix `W` to the kernel width (`TW` for Teddy, 16 for `class_span`), and the
+comptime `simd.has_shuffle` flag is what both planners consult before choosing
+a shuffle-based kernel.
 
 ### 4.2 Fat Teddy (AVX2, 256-bit)
 
@@ -328,6 +336,39 @@ repetitive, len-1, prefix-colliding, 8-needle, prefix sets that force `nmask` to
 deepen) and lengths straddling both the 16/32 kernel boundaries and the portable
 VLEN boundaries.
 
+### 4.10 Case-folded needles (`Teddy.buildFolded`)
+
+Under `(?i)` every letter is a two-byte set `{C, c}`, so the exact literal
+extractors could only represent `(?i)sherlock holmes` as 2^14 alternatives and
+gave up — the planner then sent case-insensitive literals to the DFA behind a
+`{S, s}` first-byte filter (rebar `01-literal/sherlock-casei-en`: 0.05× of
+PCRE2-JIT). `seq_extract.foldLiterals` instead keeps such a literal (or an
+alternation of ≤ 8, or a leading run) as **one alternative plus a fold mask**:
+`0x20` where the position is a case pair `{c, c ^ 0x20}`, with the canonical byte
+`c | 0x20` stored. The planner routes it through the ordinary `.literal` /
+`.prefix_prefilter` → `.lit_prefix` routes, so the runtime `Regex` and the
+comptime `Pattern` both pick it up from the shared `core.buildLiteral`.
+
+- **Masks stay exact.** The two bytes of a case pair share their low nibble and
+  differ only in bit 1 of the high nibble, so setting both high-nibble bits in a
+  needle's bucket matches exactly `{C, c}` — no 2^k needle blow-up; each
+  alternative is still one bucket.
+- **Verification** is `x | fold == canonical` per byte — for a needle of ≤ 16
+  bytes, one 16-byte OR + compare + `@reduce(.And)` (pad lanes are `0xFF` in
+  both vectors, so they always agree).
+- **Dispatch.** The memchr-on-rare-byte and two-byte-equality paths compare
+  exact bytes, so a folded set always takes the nibble kernel (or the
+  first-byte-set reference scan without a byte shuffle; the first-byte set holds
+  both cases).
+- A deeper mask for folded sets (4–6 bytes instead of 3) was measured and
+  rejected: the extra shuffles cost more than the false positives they remove.
+
+rebar (M4 Pro), against the same `feat/zig-0.17` build: `01-literal/sherlock-casei-en`
+950 → 96.5 µs (**9.8×**, level with rust/regex; PCRE2-JIT 46 µs) and
+`02-literal-alternate/sherlock-casei-en` 2,080 → 120 µs (**17.4×**, 2nd behind
+.NET compiled 109 µs; rust/regex 665 µs, PCRE2-JIT 1,070 µs). The case-sensitive
+`sherlock-en` rows are unchanged (0.98×/0.99×).
+
 ---
 
 ## 5. The class-span scanner (`class_span.zig`)
@@ -336,48 +377,206 @@ For the trivial shape where the *whole* unanchored pattern is one greedy
 repetition of a single byte class — `[0-9]+`, `\w+`, `.+`, `[^/\s?#]+` — the
 match is just a maximal run of class members, so no automaton is needed at all.
 `regex.zig` routes this directly to the `class_span` executor
-([regex.zig:666](../src/regex.zig#L666)).
+(`tryClassSpan`, [regex.zig:842](../src/regex.zig#L842)) for **any** byte class —
+and so does the comptime `Pattern` (`tryClassSpanBuilt`), through the same
+recogniser.
 
-### 5.1 The AArch64 design constraint (important)
+The recognised shape is wider than `S+` (`class_span.RunSpec`): any flat
+concatenation of greedy single-class pieces (`S`, `S?`, `S*`, `S+` — what the
+parser lowers `{m,n}` to) adds up to a count interval `[m, n]`, optionally
+bracketed by `\b … \b`:
 
-This scanner is shaped by a hard NEON fact: **NEON has no `PMOVMSKB`**
-(vector→bitmask). The x86 idiom "compare → movemask → ctz" lowers on Apple
-Silicon to ~16 per-lane scalar moves per chunk — slower than the scalar DFA. So
-this code **never bitcasts a bool-vector to an integer.** Instead:
+| Pattern | Matches (leftmost-first, non-overlapping) |
+|---------|-------------------------------------------|
+| `S+`, `S{m,}` | every maximal `S` run of length ≥ `m` |
+| `S{m,n}` | each run cut greedily into `n`-byte pieces, plus a last piece of ≥ `m` bytes |
+| `S*` | the (possibly empty) run at each search position |
+| `\bS{m,n}\b`, `S ⊆ \w` | the whole `\w` runs of length `[m, n]` made only of `S` bytes (the `\b`s forbid starting or ending inside a word) |
 
-- Membership is computed as a `0xFF`/`0x00` byte vector via `memberVec`
-  ([`:62`](../src/exec/class_span.zig#L62)) using `cmhs` (`>=`/`<=`) + `bsl`
-  (`@select`) + `orr` (`|`) — all single NEON instructions.
-- Each 16-byte chunk is reduced with **one horizontal `@reduce`**: `.Max` ("any
-  member?" → `umaxv`) for `firstMember` ([`:78`](../src/exec/class_span.zig#L78)),
-  `.Min` ("any non-member?" → `uminv`) for `runEnd`
-  ([`:97`](../src/exec/class_span.zig#L97)).
+So `\b[0-9A-Za-z_]+\b`, `\b\w{12,}\b`, `[A-Za-z]{8,13}` and `[0-9]{4}` all run off
+the run boundaries of one mask — popcount for the plain run shapes, a `ctz` walk
+with a length test (and, for `S ⊊ \w`, a byte check) otherwise.
 
-Whole member / non-member chunks are skipped at full NEON rate; a ≤16-byte scalar
-loop only pins the exact index at a run/gap boundary (negligible vs the run
-length).
+### 5.1 One bitmask per 64 bytes (`Class`)
 
-### 5.2 Why it's gated to a single range
+The executor (`Class`, [class_span.zig:250](../src/exec/class_span.zig#L250))
+classifies 64 bytes into one `u64` — bit `k` ⇔ byte `k` is a member — and
+answers every query with scalar bit arithmetic on that mask:
 
-`regex.zig` only routes to `class_span` when the class is a **single contiguous
-range** ([regex.zig:687](../src/regex.zig#L687)). The chunk-skip scan wins when
-the class is *sparse with long gaps* (`[0-9]+` amid prose: **+118%**, measured).
-For a dense/short-run class (`\w+`, where word chars are most of the text and
-runs/gaps are < 16 B), the per-chunk scalar boundary fallback is pure overhead
-and it *loses* to the DFA's tight per-byte loop (**−51%**). That is structural,
-not a codegen bug — the NEON-correct `memberVec` did not change it. Multi-range
-classes keep the DFA.
+| Query | Bit trick |
+|-------|-----------|
+| next member (`firstMember`) | `ctz(m)` |
+| run end (`runEnd`) | `ctz(~m)` |
+| next run (`nextRun`, the iterator) | `ctz(m)`, then `ctz(~(m >> off))` — usually one block for both |
+| `count` of `class+` (`countRuns`) | `popCount(m & ~(m << 1 \| carry))` per block — no per-run branch |
+| `findAll` of `class+` (`appendRuns`) | walk run starts `m & ~prev` and ends `~m & prev` with `ctz` / `x & (x-1)` |
 
-`class_span.Ranges` is also consumed by the **backtracker tier's** seek prefilter
-via `firstMember` ([seek.zig:127](../src/exec/seek.zig#L127)).
+This is the "heat-seeking / compacting tokenizer" idea from Niles Salter's
+*Accelerating the Zig Tokenizer* talk: separate *producing* the class bits
+(data-parallel) from *consuming* them (the `ctz` loop), so one mask serves
+every short run inside the block. That is what flipped the old verdict below:
+the per-run cost is now a few scalar ops, not a vector scan restarted per run,
+so dense / short-run classes (`\w+`, words ≈ 5 B) are the *best* case.
+
+**Classification** (`Class.Method`, chosen once by `fromBitmap`
+[`:273`](../src/exec/class_span.zig#L273)): one or two contiguous ranges use a
+wrapping subtract + unsigned compare per range (`range` / `range2` — `[0-9]`,
+`[^\n]`, `[a-zA-Z]`); any other ASCII class uses two nibble lookups
+(`tbl`/`pshufb`, the Teddy primitive) — `t_lo[c & 15] & t_hi[c >> 4]`
+(`nibble`, `\w`); a class with bytes ≥ 0x80 uses four (`nibble2`, Latin-1
+`\p{L}`, `\S`, `[^"]`). Without a byte shuffle (`portable` targets) only the
+range methods exist and `fromBitmap` returns null otherwise, so the planner
+keeps the DFA there.
+
+**The AArch64 mask** (`pack`, [`:217`](../src/exec/class_span.zig#L217)). NEON
+has no `PMOVMSKB`, and a bool-vector `@bitCast` lowers to ~36 instructions per 64
+bytes. Instead the block is loaded with **`ld4`** (de-interleaving: lane `j` of
+vector `k` = byte `4j+k`), classified, and folded with a **`sri` chain** into one
+nibble per 4-byte group, duplicated into both halves of the byte; one **`shrn
+#4`** then packs the nibble pairs into the natural-order `u64` — ~10
+instructions for 64 bytes. Zig/LLVM do not form `ld4` from stride-4 `@shuffle`s
+(they emit ~64 lane moves), so `ld4` and `sri` are tiny comptime-gated inline asm
+like the Teddy `tbl`. On x86_64 the mask is four `pmovmskb`.
+
+**Gaps and long runs** stay at full rate: `firstMember` / `runEnd` test each
+block with one `umaxv` / `uminv` of the four membership vectors and pack the mask
+only for the block holding the boundary. **Tails** need no scalar loop: a window
+that runs past the end reuses the overlapping last 64 bytes (shifted down), or a
+zero-padded copy when the whole input is shorter than a block; bits past
+`input.len` are clear, so a run reaching EOF ends there. `findAll` pre-counts
+the runs (the `popCount` pass is ~30× cheaper than the walk) and allocates the
+result once — a dense `\w+` over 1 MiB is ~200K matches, and the regrowth copies
+had cost ~1.8× at that size.
+
+### 5.2 Results (and the old single-range gate)
+
+Before this design, `class_span` was gated to a **single contiguous range**: its
+16-byte chunk scan restarted per run with a ≤16-byte scalar boundary loop, which
+won on sparse classes (`[0-9]+`, +118%) but lost to the DFA on dense short-run
+ones (`\w+`, −51%), so multi-range classes kept the DFA. The block mask removes
+the restart, so the gate is gone.
+
+`run_compare.sh` against `feat/zig-0.17` (M4 Pro, Zig 0.17.0-dev.2384, 1 MiB,
+best of 3; the 633 untouched rows have geomean 1.000×, p5/p95 0.945×/1.049×):
+
+| Workload | Before | `count` MB/s | `findAll` (`count-spans`) MB/s |
+|----------|--------|--------------|--------------------------------|
+| `word` `\w+` | DFA | 280 → 27,443 (**98×**) | 240 → 2,070 (**8.6×**) |
+| `unicode_prop` `[\p{L}\p{N}_]+` | DFA | 304 → 17,772 (**59×**) | 252 → 1,857 (**7.4×**) |
+| `digits` `[0-9]+` | `class_span` (16-byte) | 748 → 42,367 (**57×**) | 473 → 3,827 (**8.1×**) |
+| `quantifier` `a+` | `class_span` (16-byte) | 1,143 → 39,820 (**35×**) | 861 → 8,004 (**9.3×**) |
+
+`grep` mode (`isMatch` per short line) moves 1.0–1.5×: a line is one block.
+
+`class_span.Ranges` — the original 16-byte scanner — is still what the
+**backtracker tier's** seek prefilter uses via `firstMember`
+([seek.zig:127](../src/exec/seek.zig#L127)).
 
 ### 5.3 Correctness
 
-`Ranges.fromBitmap` ([`:29`](../src/exec/class_span.zig#L29)) extracts member
-ranges from the 256-bit class bitmap (up to `MAXR = 16`). The unit tests
-([`:115`](../src/exec/class_span.zig#L115)) check single- and multi-range
-(`\w`-like) scans on inputs that exercise both the 16-byte vector path and the
-scalar tail on both `firstMember` and `runEnd`.
+`Class == scalar oracle` ([`:617`](../src/exec/class_span.zig#L617)) checks every
+query (`firstMember`, `runEnd`, `nextRun` from every offset, `countRuns`,
+`appendRuns`) for 160 random classes covering every method — single bytes, the
+full class, complements, `0x00`/`0xFF` edges — on unaligned inputs whose lengths
+straddle the 64-byte block and tail paths. The engine-level
+`class_span == DFA on language-equivalent patterns`
+([regex.zig:1945](../src/regex.zig#L1945)) pins `find` / `findAll` / `count` /
+`isMatch` / the iterator against the same language on the DFA (`C+` ≡ `CC*`,
+`C*` ≡ `(?:CC*)?`). The `Ranges` tests ([`:514`](../src/exec/class_span.zig#L514))
+are unchanged.
+
+### 5.4 Fixed-length class sequences (`class_seq.zig`)
+
+The same block masks answer a second shape: a whole pattern that is a fixed
+sequence of byte classes — `[0-9]{2}:[0-9]{2}:[0-9]{2}`,
+`[0-9a-f]{8}-[0-9a-f]{4}-…`, `(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}`,
+`([0-9]{4})-([0-9]{2})-([0-9]{2})`. Every match has the same length `L`, so a
+match *ends* at byte `e` iff each pattern position `k` holds a member of its
+class at `e - (L-1-k)`: the end mask of a whole block is
+`AND_k (mask[class_k] << (L-1-k))`, the shifts pulling in the previous block's
+bits. This is the multi-character-symbol matcher of Niles Salter's accelerated
+Zig tokenizer (per-position class bits, shifted and ANDed — "`x << 1` tells you
+about the previous byte"), applied to regex.
+
+- **Recognition** (`ClassSeq.fromHir`): only `set` leaves under `concat` /
+  `cap` (the parser has already expanded `{n}`), unanchored, `L` ∈ [2, 64],
+  ≤ 4 distinct classes, not a pure literal (Teddy/`memchr` stay faster there).
+- **Runs, not positions.** Consecutive positions of one class form a run;
+  "the last `r` bytes are all members" is a `log2(r)`-step doubling
+  (`R_2a = R_a & (R_a << a)`) over the (previous, current) mask pair held as a
+  128-bit value in registers (`runMask`). Per-block cost scales with the number
+  of runs (UUID: 9), not with `L` (UUID: 36).
+- **Gate filter.** The class with the fewest members (`:`, `-`, `#`) is the
+  *gate*: each block first evaluates only the gate's runs — "two `-` exactly 3
+  bytes apart" — a necessary condition that rejects most blocks after
+  classifying one class; the other classes are classified only for surviving
+  blocks (the previous block's lazily). A one-byte gate absent from a block
+  jumps to its next occurrence with `memchr`, so a sparse anchor
+  (`#[0-9a-fA-F]{6}`) scans at `memchr` speed.
+- **Leftmost non-overlapping** matches fall out of a `ctz` walk over the end
+  mask: fixed length ⇒ ascending ends are ascending starts, and an end is kept
+  iff its start is at/after the previous match's end.
+- **Captures** keep the two-phase path: the span comes from `class_seq`, the
+  retained NFA refills the slots one-pass (a fixed sequence always is).
+
+`run_compare.sh` against `feat/zig-0.17` (M4 Pro, Zig 0.17.0-dev.2384, 1 MiB,
+best of 3; the 591 untouched rows have geomean 1.001×, p5/p95 0.949×/1.046×;
+every match count identical):
+
+| Workload | Before | `count` MB/s | `findAll` (`count-spans`) MB/s |
+|----------|--------|--------------|--------------------------------|
+| `credit_card` `[0-9]{4}[ -]…` | `dense_search` | 477 → 5,368 (**11.3×**) | 473 → 6,049 (**12.8×**) |
+| `time_hms` `[0-9]{2}:[0-9]{2}:[0-9]{2}` | DFA + req. literal | 4,132 → 12,258 (**3.0×**) | 3,492 → 10,645 (**3.0×**) |
+| `uuid` | DFA + req. literal | 4,269 → 11,502 (**2.7×**) | 4,681 → 10,070 (**2.2×**) |
+| `mac_addr` | DFA + req. literal | 4,882 → 12,925 (**2.6×**) | 4,888 → 11,899 (**2.4×**) |
+| `date_iso` `[0-9]{4}-[0-9]{2}-[0-9]{2}` | DFA + req. literal | 4,949 → 11,290 (**2.3×**) | 4,991 → 8,809 (**1.8×**) |
+| `ssn` `[0-9]{3}-[0-9]{2}-[0-9]{4}` | DFA + req. literal | 5,220 → 10,655 (**2.0×**) | 5,438 → 9,092 (**1.7×**) |
+| `date_fields` (3 groups, logs) | DFA | 8,471 → 16,502 (**1.9×**) | 8,557 → 14,075 (**1.6×**) |
+| `hex_color` `#[0-9a-fA-F]{6}` | DFA + `memchr('#')` | 14,821 → 16,622 (1.1×) | 13,927 → 14,847 (1.1×) |
+
+`grep` mode (`isMatch` per short line) moves 0.96–1.22× (`credit_card` 3.6×);
+`date_fields` `count-captures` 1.05× (slot reconstruction dominates).
+
+### 5.5 Keyword sets as whole words (`word_set.zig`)
+
+`\b(?:break|case|…|let)\b` with **word-only** keywords is the tokenizer's
+keyword step. The first and last byte of each keyword are word bytes, so `\b` on
+both sides forces a match to be a whole maximal `\w` run; the matches are exactly
+the `\w` runs equal to some keyword (at most one keyword equals a given run, so
+source-order tie-breaking never arises). `boundary_lits` therefore takes a
+`.words` strategy for keyword lists larger than Teddy's 8 (`buildPre` keeps
+Teddy for ≤ 8; any keyword with a non-word byte, or longer than 16 bytes, keeps
+Aho-Corasick):
+
+- **Walk the words, not the bytes.** `class_span`'s `\w` class gives one mask
+  per 64-byte block; run starts `m & ~(m << 1 | carry)` and ends
+  `~m & (m << 1 | carry)` are visited with `ctz` — the cost is per word of input
+  and independent of the keyword count (Aho-Corasick pays a scalar table step per
+  byte).
+- **Reject cheaply, then look up.** Two bit tests turn away almost every ordinary
+  word with a predictable branch: its length (`len_bits`) and its (first, last)
+  byte pair (`pair_bits`, 512 bytes, low 6 bits of each byte). Only survivors hash
+  (first 8 bytes + length) into a half-full open-addressing table whose entries
+  hold the whole keyword (≤ 16 bytes) for an exact two-word compare. Without the
+  pair filter nearly every English word reached the table and its data-dependent
+  probe loop — 0.8 GB/s; with it, 1.45 GB/s on the same walk.
+- **Shared runtime + comptime.** The set is built allocation-free, so the comptime
+  `Pattern.boundary_lits` arm bakes the same matcher into `.rodata`.
+
+`run_compare.sh` against `feat/zig-0.17`, `deep_alternation` (39 JS keywords;
+best of 3; the 578 untouched rows have geomean 1.000×, p5/p95 0.959×/1.048×;
+every match count identical):
+
+| Engine | Model | 256 KiB MB/s | 1 MiB MB/s |
+|--------|-------|--------------|------------|
+| runtime `Regex` | `count` | 339 → 2,392 (**7.1×**) | 330 → 1,297 (**3.9×**) |
+| runtime `Regex` | `count-spans` | 338 → 2,386 (**7.1×**) | 327 → 1,290 (**3.9×**) |
+| runtime `Regex` | `grep` | 432 → 1,372 (**3.2×**) | 423 → 1,095 (**2.6×**) |
+| comptime `Pattern` | `count` | 297 → 2,540 (**8.6×**) | 295 → 1,352 (**4.6×**) |
+| comptime `Pattern` | `count-spans` | 302 → 2,500 (**8.3×**) | 293 → 1,504 (**5.1×**) |
+
+(RE2, the fastest competitor on this workload in the Oct 1 cross-engine run:
+598 MB/s.) Small keyword sets keep their Teddy path unchanged.
 
 ---
 
@@ -513,7 +712,10 @@ SIMD width. SIMD-on-short-data loses.
    AND to skip a long self-loop run *inside* it (the spin-skip) — both skip a long
    stretch in one scan. It never pays on the per-byte DFA transition, already a
    single cache-hot lookup. "Inside vs outside" is the wrong axis; "long run vs
-   short run" is the right one.
+   short run" is the right one — **unless the vector work is shared across the
+   short runs**: one 64-byte bitmask, consumed with `ctz` / `popCount`, serves
+   every run in the block, so short runs cost scalar bit ops instead of a vector
+   scan each (§5.1 — `\w+` went from the DFA's 280 MB/s to ~27 GB/s `count`).
 
 2. **Always measure inside the real engine.** A `@Vector` primitive that
    benchmarks *neutral in isolation* can regress several-fold once it sits behind
@@ -565,8 +767,14 @@ vector-width / trigger boundary:
 | `teddy: SIMD find == scalar reference` | [prefilter.zig:928](../src/prefilter.zig#L928) | Teddy kernel, all dispatch arms |
 | `teddy: build rejects degenerate inputs` | [prefilter.zig:921](../src/prefilter.zig#L921) | build guards |
 | `aho-corasick: finds leftmost needle` | [prefilter.zig:1114](../src/prefilter.zig#L1114) | AC automaton |
-| `class_span: ranges + scan basics` | [class_span.zig:115](../src/exec/class_span.zig#L115) | member-run scan |
-| `class_span: multi-range class` | [class_span.zig:134](../src/exec/class_span.zig#L134) | `\w`-like multi-range |
+| `class_span: ranges + scan basics` | [class_span.zig:514](../src/exec/class_span.zig#L514) | `Ranges` member-run scan |
+| `class_span: multi-range class` | [class_span.zig:534](../src/exec/class_span.zig#L534) | `Ranges` `\w`-like multi-range |
+| `class_span: Class == scalar oracle` | [class_span.zig:617](../src/exec/class_span.zig#L617) | every `Class` query × every method, lengths/offsets across 64-byte blocks |
+| `class_span == DFA on language-equivalent patterns` | [regex.zig:1945](../src/regex.zig#L1945) | `find`/`findAll`/`count`/`isMatch`/iterator vs `CC*` on the DFA |
+| `class_seq: every query == naive matcher` | [class_seq.zig:414](../src/exec/class_seq.zig#L414) | `nextFrom` from every offset / `count` / `appendAll` / `isMatch`, 400 random sequences (lengths 2–64), haystacks across block edges |
+| `class_seq == naive matcher on random fixed-length patterns` | [regex.zig:2042](../src/regex.zig#L2042) | routing + every public API on random `\d`/`[a-f]`/`.`/`[^"]`/`{n}`/group patterns |
+| `word_set: find == naive \b(?:…)\b` | [word_set.zig:201](../src/exec/word_set.zig#L201) | `find` from every offset, 60 random keyword sets (prefix-sharing, inside longer words), across block edges |
+| `boundary_lits (words / Teddy / Aho-Corasick) == naive` | [regex.zig:2160](../src/regex.zig#L2160) | all three strategies through the public API vs the `\b(?:…)\b` definition |
 | `runFromSpin == runFromPlain` | [full_dfa.zig:610](../src/exec/full_dfa.zig#L610) | spin-skip (§7) ≡ scalar, runs ≫ trigger |
 | `requiredLiteralBack picks most selective literal` | [seq_extract.zig:753](../src/exec/seq_extract.zig#L753) | reverse-inner anchor selection (§8) |
 | `reverse-inner req_lit on/off agree` | [core.zig:178](../src/exec/core.zig#L178) | anchor (§8) ≡ brute-force `findAll` |

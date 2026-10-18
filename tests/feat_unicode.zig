@@ -97,12 +97,13 @@ test "unicode: comptime Pattern bakes \\p and agrees with runtime Regex" {
     // \p{^L}==\P{L} internal-negation identity.
     const pats = .{ "\\p{L}+", "\\P{N}+", "\\pL", "\\p{Lu}+", "[\\p{L}\\p{N}]+", "\\p{^L}+" };
     const ins = [_][]const u8{
-        "",       "  abc 123",  "ab  123!cd", "7x9",
-        "ABCdef", "\xC0\xB7z",  "Word42 ",    "ab 12!",
+        "",       "  abc 123", "ab  123!cd", "7x9",
+        "ABCdef", "\xC0\xB7z", "Word42 ",    "ab 12!",
     };
     inline for (pats) |p| {
         const P = regex.Pattern(p, .{});
-        comptime std.debug.assert(P.has_dfa); // baked, not rejected
+        // baked, not rejected (a DFA, or the DFA-free `.class_span` arm for `\p{L}+`)
+        comptime std.debug.assert(P.has_dfa or @hasDecl(P, "class_span_mode"));
         var rx = try Regex.compile(a, p);
         defer rx.deinit();
         for (ins) |in| {

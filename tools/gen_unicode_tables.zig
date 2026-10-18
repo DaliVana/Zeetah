@@ -29,11 +29,10 @@ const ucd_data = @embedFile("ucd/DerivedGeneralCategory.txt");
 
 const categories = [_][]const u8{
     "Lu", "Ll", "Lt", "Lm", "Lo",
-    "Mn", "Mc", "Me",
-    "Nd", "Nl", "No",
-    "Pc", "Pd", "Ps", "Pe", "Pi", "Pf", "Po",
-    "Sm", "Sc", "Sk", "So",
-    "Zs", "Zl", "Zp",
+    "Mn", "Mc", "Me", "Nd", "Nl",
+    "No", "Pc", "Pd", "Ps", "Pe",
+    "Pi", "Pf", "Po", "Sm", "Sc",
+    "Sk", "So", "Zs", "Zl", "Zp",
     "Cc", "Cf", "Cs", "Co", "Cn",
 };
 
@@ -93,8 +92,7 @@ pub fn main() !void {
     try out.appendSlice(a, "//! Regenerate with: zig run tools/gen_unicode_tables.zig\n");
     // Hand-written module overview, emitted here so a regeneration preserves it
     // (the committed header must round-trip through this generator unchanged).
-    try out.appendSlice(a,
-        "//!\n" ++
+    try out.appendSlice(a, "//!\n" ++
         "//! Exports, per Unicode General_Category, a sorted slice of inclusive codepoint\n" ++
         "//! `Range`s named `gc_<Category>` — the two-letter categories `gc_Lu`, `gc_Ll`,\n" ++
         "//! `gc_Lt`, `gc_Lm`, `gc_Lo`, `gc_Mn`, … through `gc_Cn`. Consumed by\n" ++

@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Zig Regex Guide: How to Use the Zeetah Library</title>
+  <meta name="description" content="How to use regular expressions in Zig with Zeetah: install, find matches, capture groups, replace, split, flags, compile-time regex and errors.">
+  <link rel="canonical" href="%SITE_URL%guide.html">
+  <meta name="robots" content="index, follow, max-image-preview:large">
+  <meta name="theme-color" content="#f4f5f7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0d1015" media="(prefers-color-scheme: dark)">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="Zeetah">
+  <meta property="og:title" content="Zig Regex Guide: Using Zeetah">
+  <meta property="og:description" content="Install Zeetah and use regular expressions in Zig: matching, capture groups, replace, split, flags and compile-time regex.">
+  <meta property="og:url" content="%SITE_URL%guide.html">
+  <meta property="og:image" content="%SITE_URL%og-image.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="Zeetah, fast regex for Zig: a cheetah running through regex symbols">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Zig Regex Guide: Using Zeetah">
+  <meta name="twitter:description" content="Install Zeetah and use regular expressions in Zig: matching, capture groups, replace, split, flags and compile-time regex.">
+  <meta name="twitter:image" content="%SITE_URL%og-image.jpg">
+  <link rel="icon" type="image/png" href="favicon.png">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <link rel="alternate" type="text/plain" title="Zeetah summary for language models" href="llms.txt">
+  <link rel="stylesheet" href="style.css">
+  <script>
+    try {
+      const t = localStorage.getItem('zeetah:theme');
+      if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+    } catch (_) {}
+  </script>
+  <script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "TechArticle",
+      "@id": "%SITE_URL%guide.html#article",
+      "headline": "How to use Zeetah, the regex library for Zig",
+      "description": "Install Zeetah and use regular expressions in Zig: matching, capture groups, replace, split, flags, compile-time regex and error handling.",
+      "url": "%SITE_URL%guide.html",
+      "image": "%SITE_URL%og-image.jpg",
+      "inLanguage": "en",
+      "dateModified": "2026-10-18",
+      "proficiencyLevel": "Beginner",
+      "dependencies": "Zig 0.17.0",
+      "author": { "@type": "Person", "name": "DaliVana", "url": "https://github.com/DaliVana" },
+      "about": { "@type": "SoftwareSourceCode", "name": "Zeetah", "codeRepository": "https://github.com/DaliVana/Zeetah", "programmingLanguage": "Zig" },
+      "isPartOf": { "@id": "%SITE_URL%#website" }
+    },
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        { "@type": "ListItem", "position": 1, "name": "Zeetah", "item": "%SITE_URL%" },
+        { "@type": "ListItem", "position": 2, "name": "Guide", "item": "%SITE_URL%guide.html" }
+      ]
+    }
+  ]
+}
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="./" aria-label="Zeetah regex tester home">
+      <img class="logo" src="zeetah-logo.webp" width="40" height="40" alt="">
+      <span class="brand-text">
+        <span class="brand-name">Zeetah</span>
+        <span class="brand-sub">Regex library for Zig</span>
+      </span>
+    </a>
+    <nav class="nav" aria-label="Site">
+      <a href="./">Tester</a>
+      <a href="guide.html" aria-current="page">Guide</a>
+      <a href="how-it-works.html">How it works</a>
+    </nav>
+    <div class="topbar-right">
+      <a class="link" href="https://github.com/DaliVana/Zeetah" target="_blank" rel="noopener">GitHub</a>
+      <button class="icon-btn" id="themeBtn" type="button" aria-label="Toggle dark mode" title="Toggle dark mode">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main class="doc-page">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="./">Zeetah</a><span aria-hidden="true">/</span><span>Guide</span></nav>
+    <div class="doc-grid">
+      <article class="doc">
+        <h1>How to use Zeetah, the regex library for Zig</h1>
+        <p class="lede">Zig's standard library has no regular expression module. <strong>Zeetah</strong> fills that gap: a fast,
+          dependency-free regex engine with one small API. This guide shows how to use it from your own Zig code. Every
+          example has an <em>Open in tester</em> link that loads it into the <a href="./">online regex tester</a>.</p>
+        <p class="doc-meta">Written for Zeetah 0.17.0 and Zig 0.17.0 · Updated 18 October 2026</p>
+
+        <h2 id="install">Add Zeetah to a Zig project</h2>
+        <p>Zeetah needs Zig 0.17.0 or newer and has no other dependencies. Fetch it into your <code>build.zig.zon</code>:</p>
+        <pre><code class="sh">zig fetch --save git+https://github.com/DaliVana/Zeetah.git#v0.17.0</code></pre>
+        <p>Then import the module in <code>build.zig</code>:</p>
+        <pre><code class="zig">const zeetah = b.dependency("zeetah", .{
+    .target = target,
+    .optimize = optimize,
+});
+exe.root_module.addImport("zeetah", zeetah.module("zeetah"));</code></pre>
+        <p>In your code it is <code>@import("zeetah")</code>. The main type is <code>zeetah.Regex</code>.</p>
+
+        <h2 id="match">Find matches</h2>
+        <p>Compile a pattern once, then reuse it. <code>find</code> returns the first match, <code>isMatch</code> answers yes or
+          no, and <code>count</code> counts non-overlapping matches. None of them allocate.</p>
+        <pre><code class="zig">const std = @import("std");
+const zeetah = @import("zeetah");
+
+pub fn example(allocator: std.mem.Allocator) !void {
+    var re = try zeetah.Regex.compile(allocator, "\\d{3}-\\d{4}");
+    defer re.deinit();
+
+    // The Match borrows from the input: slice, start and end (byte offsets).
+    if (try re.find("call 555-1234 now")) |m| {
+        std.debug.print("{s} at {d}..{d}\n", .{ m.slice, m.start, m.end }); // 555-1234 at 5..13
+    }
+
+    const yes = try re.isMatch("call 555-1234 now"); // true
+    const n = try re.count("555-1234 or 555-9876"); // 2
+    std.debug.print("{} {d}\n", .{ yes, n });
+}</code></pre>
+        <div class="callout">
+          <b>Offsets are bytes.</b> Zeetah is byte-oriented: <code>.</code> matches one byte, <code>\w</code> and <code>\d</code>
+          are ASCII, and positions are offsets into the UTF-8 text. For ASCII text that is the same as character positions.
+        </div>
+        <p>To walk every match, use the iterator (or <code>findAll</code> for an allocated slice):</p>
+        <pre><code class="zig">var it = re.iterator("555-1234 or 555-9876");
+while (try it.next(allocator)) |m| {
+    std.debug.print("{s}\n", .{m.slice});
+}</code></pre>
+        <p><a class="try" href="./#s=eyJwIjoiXFxkezN9LVxcZHs0fSIsImYiOiJnIiwidCI6ImNhbGwgNTU1LTEyMzQgbm93LCBvciA1NTUtOTg3NiBsYXRlciJ9">Open in tester</a></p>
+
+        <h2 id="captures">Capture groups</h2>
+        <p><code>find</code> and friends return only the whole match, which keeps them fast. Ask for groups with
+          <code>captures</code>. The returned match owns its groups, so free it with <code>deinit</code>. <code>groups[0]</code> is the
+          whole match, <code>groups[1]</code> the first group, and a group that did not participate is <code>null</code>.</p>
+        <pre><code class="zig">var re = try zeetah.Regex.compile(allocator, "(?&lt;year&gt;\\d{4})-(\\d{2})-(\\d{2})");
+defer re.deinit();
+
+if (try re.captures(allocator, "Date: 2024-03-15")) |found| {
+    var m = found;
+    defer m.deinit(allocator);
+    std.debug.print("{s}\n", .{m.groups[2].?.slice}); // 03
+    std.debug.print("{s}\n", .{m.groupByName("year").?.slice}); // 2024
+}</code></pre>
+        <p>For groups on every match, use <code>capturesIterator</code> and free each match as you go:</p>
+        <pre><code class="zig">var it = re.capturesIterator("2024-03-15 and 2025-01-02");
+while (try it.next(allocator)) |found| {
+    var m = found;
+    defer m.deinit(allocator);
+    std.debug.print("{s}\n", .{m.groupByName("year").?.slice});
+}</code></pre>
+        <p><a class="try" href="./#s=eyJwIjoiKD88eWVhcj5cXGR7NH0pLShcXGR7Mn0pLShcXGR7Mn0pIiwiZiI6ImciLCJ0IjoiRGF0ZTogMjAyNC0wMy0xNSwgZHVlIDIwMjQtMDQtMDEifQ">Open in tester</a></p>
+
+        <h2 id="replace">Replace and split</h2>
+        <p><code>replace</code> rewrites the first match and <code>replaceAll</code> every match. The replacement is a template:
+          <code>$0</code> or <code>$&amp;</code> is the whole match, <code>$1</code>…<code>$N</code> are numbered groups,
+          <code>${name}</code> is a named group and <code>$$</code> is a literal dollar sign. <code>replaceLiteral</code> and
+          <code>replaceAllLiteral</code> insert the text as-is. The result is newly allocated.</p>
+        <pre><code class="zig">var date = try zeetah.Regex.compile(allocator, "(\\d{4})-(\\d{2})-(\\d{2})");
+defer date.deinit();
+
+const out = try date.replaceAll(allocator, "released 2024-03-15", "$3/$2/$1");
+defer allocator.free(out); // "released 15/03/2024"</code></pre>
+        <p><a class="try" href="./#s=eyJwIjoiKFxcZHs0fSktKFxcZHsyfSktKFxcZHsyfSkiLCJmIjoiZyIsInQiOiJyZWxlYXNlZCAyMDI0LTAzLTE1LCBwYXRjaGVkIDIwMjQtMDQtMDIiLCJyIjoiJDMvJDIvJDEifQ">Open in tester</a></p>
+        <p><code>split</code> returns the pieces between matches. The pieces point into your input; free only the outer slice.</p>
+        <pre><code class="zig">var sep = try zeetah.Regex.compile(allocator, "\\s*,\\s*");
+defer sep.deinit();
+
+const parts = try sep.split(allocator, "red, green ,blue");
+defer allocator.free(parts); // "red", "green", "blue"</code></pre>
+        <p><a class="try" href="./#s=eyJwIjoiXFxzKixcXHMqIiwiZiI6ImciLCJ0IjoicmVkLCBncmVlbiAsYmx1ZSwgIHllbGxvdyJ9">Open in tester</a></p>
+
+        <h2 id="flags">Flags</h2>
+        <p>Pass flags to <code>compileWithFlags</code>, or write them inline in the pattern. Both forms are equivalent, and inline
+          flags can also be scoped to part of a pattern, as in <code>(?i:hello) World</code>.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Field</th><th>Inline</th><th>Effect</th></tr></thead>
+            <tbody>
+              <tr><td><code>.case_insensitive</code></td><td><code>(?i)</code></td><td>ASCII case-insensitive matching</td></tr>
+              <tr><td><code>.multiline</code></td><td><code>(?m)</code></td><td><code>^</code> and <code>$</code> match at every line</td></tr>
+              <tr><td><code>.dot_all</code></td><td><code>(?s)</code></td><td><code>.</code> also matches <code>\n</code></td></tr>
+              <tr><td><code>.extended</code></td><td><code>(?x)</code></td><td>whitespace is ignored and <code>#</code> starts a comment</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre><code class="zig">var re = try zeetah.Regex.compileWithFlags(allocator, "^item", .{
+    .case_insensitive = true,
+    .multiline = true,
+});
+defer re.deinit();
+const n = try re.count("Item one\nitem two\nnot an item"); // 2</code></pre>
+        <p><a class="try" href="./#s=eyJwIjoiXml0ZW0iLCJmIjoiZ2ltIiwidCI6Ikl0ZW0gb25lXG5pdGVtIHR3b1xubm90IGFuIGl0ZW0ifQ">Open in tester</a></p>
+
+        <h2 id="comptime">Compile-time regex with Pattern</h2>
+        <p>When the pattern is known at compile time, <code>zeetah.Pattern</code> compiles it during <code>zig build</code> and bakes
+          the matcher into your binary. Its methods are static, need no allocator and cannot fail at run time; an invalid pattern
+          is a compile error. Use <code>Regex</code> when the pattern comes from user input or configuration.</p>
+        <pre><code class="zig">const Date = zeetah.Pattern("(?&lt;year&gt;\\d{4})-(\\d{2})-(\\d{2})", .{});
+
+pub fn report(input: []const u8) void {
+    if (Date.captures(input)) |c| {
+        std.debug.print("{s} (year {s})\n", .{ c.slice(), c.getName("year").?.slice });
+    }
+    std.debug.print("{d} dates\n", .{Date.count(input)});
+}</code></pre>
+        <p><code>Pattern</code> options are <code>.case_insensitive</code> and <code>.multiline</code>; use inline <code>(?s)</code> and
+          <code>(?x)</code> for the others.</p>
+
+        <h2 id="errors">Errors and safety</h2>
+        <p>Zeetah returns a small, typed error set, so you can tell a broken pattern from an unsupported one:</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Error</th><th>When</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code>EmptyPattern</code></td><td>compile</td><td>the pattern was <code>""</code></td></tr>
+              <tr><td><code>InvalidPattern</code></td><td>compile</td><td>malformed syntax, such as <code>abc(</code> or <code>a{3,2}</code></td></tr>
+              <tr><td><code>NotImplemented</code></td><td>compile</td><td>valid but unsupported, such as <code>\p{Greek}</code> or code points above 0xFF</td></tr>
+              <tr><td><code>PatternTooComplex</code></td><td>compile</td><td>too large to build within the engine's limits</td></tr>
+              <tr><td><code>MatchBudgetExceeded</code></td><td>match</td><td>a backtracking pattern hit its step budget on this input</td></tr>
+              <tr><td><code>OutOfMemory</code></td><td>either</td><td>an allocation failed</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Patterns without backreferences or lookaround compile to a DFA and match in linear time, so classic catastrophic
+          patterns are safe: <code>(a+)+$</code> runs as fast as <code>a+$</code>. The features that need backtracking run under a step
+          budget and fail with <code>MatchBudgetExceeded</code> instead of hanging, which makes Zeetah suitable for untrusted input.</p>
+        <pre><code class="zig">const hit = re.isMatch(untrusted_input) catch |err| switch (err) {
+    error.MatchBudgetExceeded => false, // treat a pathological input as no match
+    else => return err,
+};</code></pre>
+        <p><a class="try" href="./#s=eyJwIjoiKGErKSskIiwiZiI6ImciLCJ0IjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYVgifQ">Open <code>(a+)+$</code> in tester</a></p>
+
+        <h2 id="syntax">Regex syntax reference</h2>
+        <p>Zeetah uses Perl and PCRE style syntax. All of the following works in both <code>Regex</code> and <code>Pattern</code>.</p>
+        <div class="table-wrap">
+          <table class="syntax">
+            <thead><tr><th>Syntax</th><th>Matches</th></tr></thead>
+            <tbody>
+              <tr><td><code>.</code></td><td>any byte except newline (any byte with <code>(?s)</code>)</td></tr>
+              <tr><td><code>\d \w \s</code></td><td>digit, word character, whitespace (ASCII); <code>\D \W \S</code> negate them</td></tr>
+              <tr><td><code>\h \v \R \N</code></td><td>horizontal whitespace, vertical whitespace, any line break, any byte but newline</td></tr>
+              <tr><td><code>[abc] [^abc] [a-z]</code></td><td>a set, a negated set, a range</td></tr>
+              <tr><td><code>[[:alpha:]]</code></td><td>POSIX classes such as alpha, digit, alnum, space, punct, xdigit</td></tr>
+              <tr><td><code>\p{L} \P{Nd}</code></td><td>Unicode general categories, restricted to the Latin-1 byte range</td></tr>
+              <tr><td><code>^ $ \A \z \Z</code></td><td>start and end of text (of a line with <code>(?m)</code>)</td></tr>
+              <tr><td><code>\b \B</code></td><td>word boundary, not a word boundary</td></tr>
+              <tr><td><code>* + ? {n} {n,} {n,m}</code></td><td>greedy repetition</td></tr>
+              <tr><td><code>*? +? ?? {n,m}?</code></td><td>lazy repetition (as few as possible)</td></tr>
+              <tr><td><code>*+ ++ ?+ {n,m}+</code></td><td>possessive repetition (never gives back)</td></tr>
+              <tr><td><code>a|b</code></td><td>alternation (leftmost-first)</td></tr>
+              <tr><td><code>(…) (?:…) (?&lt;name&gt;…)</code></td><td>capturing, non-capturing and named groups (also <code>(?P&lt;name&gt;…)</code>)</td></tr>
+              <tr><td><code>\1 \k&lt;name&gt;</code></td><td>backreferences</td></tr>
+              <tr><td><code>(?=…) (?!…)</code></td><td>lookahead, negative lookahead</td></tr>
+              <tr><td><code>(?&lt;=…) (?&lt;!…)</code></td><td>lookbehind, negative lookbehind (fixed width)</td></tr>
+              <tr><td><code>(?&gt;…)</code></td><td>atomic group</td></tr>
+              <tr><td><code>(?i) (?m) (?s) (?x) (?i:…)</code></td><td>inline flags, for the rest of the group or scoped</td></tr>
+              <tr><td><code>\xHH \x{HH} \0 \n \t \r</code></td><td>byte escapes</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="next">
+          <a class="next-card" href="how-it-works.html"><span>Next</span><b>How Zeetah works</b>
+            <small>The meta engine, its SIMD tricks and the linear-time guarantee.</small></a>
+          <a class="next-card" href="./"><span>Try it</span><b>Open the regex tester</b>
+            <small>Live matching, explanations and Zig code in your browser.</small></a>
+        </div>
+      </article>
+
+      <aside class="toc" aria-label="On this page">
+        <h2>On this page</h2>
+        <ol>
+          <li><a href="#install">Add Zeetah to a project</a></li>
+          <li><a href="#match">Find matches</a></li>
+          <li><a href="#captures">Capture groups</a></li>
+          <li><a href="#replace">Replace and split</a></li>
+          <li><a href="#flags">Flags</a></li>
+          <li><a href="#comptime">Compile-time regex</a></li>
+          <li><a href="#errors">Errors and safety</a></li>
+          <li><a href="#syntax">Syntax reference</a></li>
+        </ol>
+      </aside>
+    </div>
+  </main>
+
+  <footer class="foot">
+    <p class="foot-links"><a href="./">Regex tester</a> · <a href="guide.html">Guide</a> · <a href="how-it-works.html">How it works</a> ·
+      <a href="https://github.com/DaliVana/Zeetah" rel="noopener">GitHub</a> · <a href="llms.txt">llms.txt</a> · MIT license</p>
+  </footer>
+
+  <script src="site.js"></script>
+</body>
+</html>

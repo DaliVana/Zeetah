@@ -59,7 +59,7 @@ pub const Spec = struct {
     // Filled by `buildDfa` from the folded DFA (state ids survive packing and
     // the comptime compression unchanged):
     /// The bytes that can begin a match (the first-byte skip in `nextFrom`).
-    first: [32]u8 = [_]u8{0} ** 32,
+    first: [32]u8 = @splat(0),
     /// Lookbehind: whether the empty core can match in some context (then
     /// nothing is skipped). A lookahead match always consumes the look byte or
     /// reaches end of input, so it needs no nullable flag.
@@ -246,7 +246,7 @@ pub fn buildDfa(comptime cap: ?usize, core_nfa: *const thompson.Nfa(cap), spec: 
     } else full_dfa.compute(thompson.MAX_NFA, &folded, spec.anchored, false);
     if (d.outcome != .ok) return null;
 
-    spec.first = [_]u8{0} ** 32;
+    spec.first = @splat(0);
     spec.nullable = false;
     if (spec.behind) {
         // The walk begins after the leading state consumed the context byte.

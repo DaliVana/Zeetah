@@ -185,11 +185,12 @@ test "boundary: \\b(keyword list)\\b engine — accepts + leftmost-correct" {
     try std.testing.expectEqualStrings("if", (try rx.find(src)).?.slice);
     // non-overlapping leftmost count == brute-force reference.
     const lits = [_][]const u8{
-        "break", "case", "catch", "class", "const", "continue", "debugger", "default",
-        "delete", "do", "else", "export", "extends", "finally", "for", "function", "if",
-        "import", "in", "instanceof", "new", "return", "super", "switch", "this", "throw",
-        "try", "typeof", "var", "void", "while", "with", "yield", "let", "static", "enum",
-        "await", "async", "null", "true", "false",
+        "break",  "case",   "catch",  "class",      "const",   "continue", "debugger", "default",
+        "delete", "do",     "else",   "export",     "extends", "finally",  "for",      "function",
+        "if",     "import", "in",     "instanceof", "new",     "return",   "super",    "switch",
+        "this",   "throw",  "try",    "typeof",     "var",     "void",     "while",    "with",
+        "yield",  "let",    "static", "enum",       "await",   "async",    "null",     "true",
+        "false",
     };
     try std.testing.expectEqual(refCount(&lits, src), try rx.count(src));
 

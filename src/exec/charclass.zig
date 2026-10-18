@@ -26,7 +26,7 @@ pub inline fn isWord(c: u8) bool {
 pub fn lookHolds(kind: u8, input: []const u8, pos: usize) bool {
     const bw = pos > 0 and isWord(input[pos - 1]);
     const aw = pos < input.len and isWord(input[pos]);
-    return switch (@as(hir.LookKind, @enumFromInt(kind))) {
+    return switch (@as(hir.LookKind, @fromBackingInt(@intCast(kind)))) {
         .word_boundary => bw != aw,
         .non_word_boundary => bw == aw,
         .start_text => pos == 0,

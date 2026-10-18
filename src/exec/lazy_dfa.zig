@@ -81,8 +81,8 @@ pub const LazyProg = struct {
     eps_look: []u8 = &.{},
     reps_look: []u8 = &.{},
 
-    class_of: [256]u8 = [_]u8{0} ** 256,
-    rep: [256]u8 = [_]u8{0} ** 256,
+    class_of: [256]u8 = @splat(0),
+    rep: [256]u8 = @splat(0),
     n_classes: usize = 1,
 
     eps_to: []u16,
@@ -193,11 +193,11 @@ pub const LazyProg = struct {
     /// O(256² × n_sets) (≈ 0.3 G steps for a 9 K-set NFA). Ids are assigned in
     /// first-occurrence byte order, the same numbering as `dfa_build.classify`.
     fn classify(self: *LazyProg) void {
-        var class_of = [_]u16{0} ** 256;
+        var class_of: [256]u16 = @splat(0);
         var n: usize = 1;
         for (self.nfa.sets[0..self.nfa.n_sets]) |*set| {
             if (n == 256) break;
-            var remap = [_]i16{-1} ** 512;
+            var remap: [512]i16 = @splat(-1);
             var nn: usize = 0;
             for (&class_of, 0..) |*c, b| {
                 const key = @as(usize, c.*) * 2 + @intFromBool(hasBit(set, @intCast(b)));
@@ -209,7 +209,7 @@ pub const LazyProg = struct {
             }
             n = nn;
         }
-        var seen = [_]bool{false} ** 256;
+        var seen: [256]bool = @splat(false);
         for (class_of, 0..) |c, b| {
             self.class_of[b] = @intCast(c);
             if (!seen[c]) {
@@ -634,7 +634,7 @@ pub const LazyProg = struct {
     /// `after` (`CTX_EDGE` = the text edge on that side). Mirrors
     /// `charclass.lookHolds`.
     fn lookOk(kind: u8, before: u2, after: u2) bool {
-        return switch (@as(LookKind, @enumFromInt(kind))) {
+        return switch (@as(LookKind, @fromBackingInt(@intCast(kind)))) {
             .word_boundary => (before == CTX_WORD) != (after == CTX_WORD),
             .non_word_boundary => (before == CTX_WORD) == (after == CTX_WORD),
             .start_text => before == CTX_EDGE,
@@ -656,7 +656,7 @@ pub const LazyProg = struct {
         var ei: usize = 0;
         while (ei < nfa.n_edges) : (ei += 1) {
             if (nfa.e_kind[ei] == .look and
-                @as(LookKind, @enumFromInt(nfa.e_look[ei])) == .end_text_before_nl) return false;
+                @as(LookKind, @fromBackingInt(@intCast(nfa.e_look[ei]))) == .end_text_before_nl) return false;
         }
         return true;
     }
@@ -731,7 +731,7 @@ pub const LazyProg = struct {
     /// Split every byte class so all members share one `ctxOf` (word-ness and
     /// `\n`), making a transition's look evaluation a function of the class.
     fn refineClassesForLooks(self: *LazyProg) void {
-        var map = [_]i16{-1} ** (256 * 4);
+        var map: [256 * 4]i16 = @splat(-1);
         var n: usize = 0;
         var b: usize = 0;
         while (b < 256) : (b += 1) {
@@ -1231,19 +1231,18 @@ test "lazy_dfa: memoized single-pass == core.findLeftmost (findLeftmostFrom / is
     // alternation (leftmost-first vs longest), greedy/lazy quantifiers,
     // dotstar, optional/empty-capable, literals, anchored-end (delegates).
     const pats = [_][]const u8{
-        "a",          "abc",         "[a-z]+",      "[0-9]{2,4}",
-        "a|ab",       "ab|a",        "cat|dog|c",   "a.*b",
-        "a.*?b",      "x?y",         "a*",          "(ab)+",
-        "[a-z]+@[a-z]+\\.[a-z]+",    "\\d+",        "a+b+",
-        "(foo|foobar)x",             "z*",          "a.b",
-        "ab$",        "[^x]+",
+        "a",                      "abc",  "[a-z]+",    "[0-9]{2,4}",
+        "a|ab",                   "ab|a", "cat|dog|c", "a.*b",
+        "a.*?b",                  "x?y",  "a*",        "(ab)+",
+        "[a-z]+@[a-z]+\\.[a-z]+", "\\d+", "a+b+",      "(foo|foobar)x",
+        "z*",                     "a.b",  "ab$",       "[^x]+",
     };
     const ins = [_][]const u8{
-        "",            "a",            "xxabbcyy",      "ab",
-        "the cat dog", "  abc  ",       "foobarx foox",  "a@b.com here",
-        "1234 56",     "zzz",           "xyy y",         "no match here",
-        "aaabbb",      "x y a.b ab",    "fin: ab",       "....abXcd",
-        "ababab",      "qqqqq",         "aXbYc",         "a",
+        "",            "a",          "xxabbcyy",     "ab",
+        "the cat dog", "  abc  ",    "foobarx foox", "a@b.com here",
+        "1234 56",     "zzz",        "xyy y",        "no match here",
+        "aaabbb",      "x y a.b ab", "fin: ab",      "....abXcd",
+        "ababab",      "qqqqq",      "aXbYc",        "a",
     };
 
     for (pats) |p| {
@@ -1339,23 +1338,26 @@ test "lazy_dfa: DenseSearch (lever A) == core.findLeftmost (spans / resume / fin
 
     // Floor-cluster shapes + the alternation/quantifier/dotstar battery.
     const pats = [_][]const u8{
-        "v?[0-9]+\\.[0-9]+\\.[0-9]+",      "[0-9]{4}-[0-9]{2}-[0-9]{2}",
-        "[0-9]{4}[ -][0-9]{4}[ -][0-9]{4}[ -][0-9]{4}",
-        "\\(?[0-9]{3}\\)?[ .-][0-9]{3}[ .-][0-9]{4}",
-        "(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}",
-        "a.*c",       "ab*c",   "[a-z]+@[a-z]+", "cat|dog|bird",
-        "a|ab",       "ab|a",   "a.*?b",         "(ab)+",
-        "\\d+",       "a+b+",   "(foo|foobar)x", "[^x]+",
+        "v?[0-9]+\\.[0-9]+\\.[0-9]+",                   "[0-9]{4}-[0-9]{2}-[0-9]{2}",
+        "[0-9]{4}[ -][0-9]{4}[ -][0-9]{4}[ -][0-9]{4}", "\\(?[0-9]{3}\\)?[ .-][0-9]{3}[ .-][0-9]{4}",
+        "(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}",         "a.*c",
+        "ab*c",                                         "[a-z]+@[a-z]+",
+        "cat|dog|bird",                                 "a|ab",
+        "ab|a",                                         "a.*?b",
+        "(ab)+",                                        "\\d+",
+        "a+b+",                                         "(foo|foobar)x",
+        "[^x]+",
     };
     const ins = [_][]const u8{
-        "",                       "v1.2.3 x 10.20.30 9.9 4.5.6",
-        "no 2026-05-18 then 99-9-9 1999-12-31 end",
-        "4111 1111 1111 1111 nope 1 2 3",
-        "(555) 123-4567 and 800-555-0199 x",
-        "de:ad:be:ef:00:11 zz:zz",
-        "xxabbcyy",  "ac",  "a@b dog cat",  "1234 56",
-        "the cat dog bird", "aaabbb", "aXXb", "ababab",
-        "fin: ab",   "....abXcd",  "foobarx foox", "qqqqq",
+        "",                                         "v1.2.3 x 10.20.30 9.9 4.5.6",
+        "no 2026-05-18 then 99-9-9 1999-12-31 end", "4111 1111 1111 1111 nope 1 2 3",
+        "(555) 123-4567 and 800-555-0199 x",        "de:ad:be:ef:00:11 zz:zz",
+        "xxabbcyy",                                 "ac",
+        "a@b dog cat",                              "1234 56",
+        "the cat dog bird",                         "aaabbb",
+        "aXXb",                                     "ababab",
+        "fin: ab",                                  "....abXcd",
+        "foobarx foox",                             "qqqqq",
     };
 
     for (pats) |p| {

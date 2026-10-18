@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Zig Regex Tester · Zeetah, a fast regex library for Zig</title>
+  <meta name="description" content="Free online regex tester powered by Zeetah, a fast regex library for Zig. Live matches, capture groups, replace, split and Zig code, all in your browser.">
+  <link rel="canonical" href="%SITE_URL%">
+  <meta name="robots" content="index, follow, max-image-preview:large">
+  <meta name="theme-color" content="#f4f5f7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0d1015" media="(prefers-color-scheme: dark)">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Zeetah">
+  <meta property="og:title" content="Zig Regex Tester · Zeetah">
+  <meta property="og:description" content="Test regular expressions with Zeetah, a fast, dependency-free regex library for Zig, running in your browser via WebAssembly.">
+  <meta property="og:url" content="%SITE_URL%">
+  <meta property="og:image" content="%SITE_URL%og-image.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="Zeetah, fast regex for Zig: a cheetah running through regex symbols">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Zig Regex Tester · Zeetah">
+  <meta name="twitter:description" content="Test regular expressions with Zeetah, a fast regex library for Zig, running in your browser via WebAssembly.">
+  <meta name="twitter:image" content="%SITE_URL%og-image.jpg">
+  <link rel="icon" type="image/png" href="favicon.png">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <link rel="alternate" type="text/plain" title="Zeetah summary for language models" href="llms.txt">
+  <link rel="stylesheet" href="style.css">
+  <script>
+    // Apply the saved theme before first paint.
+    try {
+      const t = localStorage.getItem('zeetah:theme');
+      if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+    } catch (_) {}
+  </script>
+  <script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "WebSite",
+      "@id": "%SITE_URL%#website",
+      "url": "%SITE_URL%",
+      "name": "Zeetah",
+      "description": "Zeetah, a fast regular expression library for Zig: online regex tester, usage guide and engine internals.",
+      "inLanguage": "en"
+    },
+    {
+      "@type": "WebApplication",
+      "@id": "%SITE_URL%#tester",
+      "name": "Zeetah Regex Tester",
+      "url": "%SITE_URL%",
+      "description": "Online regex tester running the Zeetah regex engine for Zig, compiled to WebAssembly.",
+      "applicationCategory": "DeveloperApplication",
+      "operatingSystem": "Any (runs in a web browser)",
+      "browserRequirements": "WebAssembly with SIMD: Chrome 91+, Firefox 89+, Safari 16.4+",
+      "isAccessibleForFree": true,
+      "offers": {
+        "@type": "Offer",
+        "price": "0",
+        "priceCurrency": "USD"
+      },
+      "image": "%SITE_URL%og-image.jpg",
+      "featureList": [
+        "Live regex matching and highlighting",
+        "Capture groups and named groups",
+        "Replace with $1 and ${name} templates",
+        "Split",
+        "Plain-English pattern explanation",
+        "Zig code for runtime Regex and comptime Pattern",
+        "In-browser throughput benchmark",
+        "Shareable links"
+      ],
+      "about": {
+        "@id": "%SITE_URL%#library"
+      },
+      "isPartOf": {
+        "@id": "%SITE_URL%#website"
+      }
+    },
+    {
+      "@type": "SoftwareSourceCode",
+      "@id": "%SITE_URL%#library",
+      "name": "Zeetah",
+      "alternateName": "Zeetah regex library for Zig",
+      "description": "Fast, dependency-free regular expression (regex) meta engine for Zig: SIMD literal scans, linear-time DFAs, a step-budgeted backtracker for lookaround and backreferences, and compile-time regex via zeetah.Pattern.",
+      "codeRepository": "https://github.com/DaliVana/Zeetah",
+      "programmingLanguage": {
+        "@type": "ComputerLanguage",
+        "name": "Zig",
+        "url": "https://ziglang.org"
+      },
+      "runtimePlatform": "Zig 0.17.0",
+      "version": "0.17.0",
+      "license": "https://opensource.org/licenses/MIT",
+      "keywords": "zig, regex, regular expressions, zig regex library, regex engine, dfa, simd, comptime regex, redos",
+      "author": {
+        "@type": "Person",
+        "name": "DaliVana",
+        "url": "https://github.com/DaliVana"
+      }
+    },
+    {
+      "@type": "FAQPage",
+      "@id": "%SITE_URL%#faq",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "What is Zeetah?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Zeetah is a fast, open-source (MIT) regular expression library for the Zig programming language, with no dependencies beyond the Zig standard library. It is a meta engine: when you compile a pattern it picks the cheapest correct matcher for it, such as a SIMD literal scan, a DFA, or a bounded backtracker for lookaround and backreferences."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How do I use regular expressions in Zig?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Zig's standard library has no regex module, so you add a library such as Zeetah. Run zig fetch --save with the Zeetah Git URL, import the zeetah module in build.zig, then call zeetah.Regex.compile(allocator, pattern) and use find, findAll, captures or replaceAll. The guide walks through each step."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Which regex syntax does Zeetah support?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Perl and PCRE style syntax: character classes and POSIX classes, \\d \\w \\s and \\b, anchors, greedy, lazy and possessive quantifiers, alternation, capturing, non-capturing and named groups, lookahead, fixed-width lookbehind, backreferences, atomic groups and the inline flags (?i) (?m) (?s) (?x). Matching is byte-oriented: \\w and \\d are ASCII and . matches one byte."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Is Zeetah safe from ReDoS (catastrophic backtracking)?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Regular patterns compile to a DFA and run in linear time, so classic catastrophic shapes like (a+)+$ stay fast. Only features that need backtracking (backreferences, lookaround, atomic groups) use a backtracker, and it runs under a step budget that returns error.MatchBudgetExceeded instead of hanging."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Can Zig compile a regex at compile time?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Yes. zeetah.Pattern(\"...\", .{}) runs the whole regex compiler at comptime and bakes the matcher into the binary's read-only data. Matching then needs no allocator and no runtime compilation, and an invalid pattern is a compile error."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How fast is Zeetah?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "In the 13-engine benchmark published in the Zeetah README (1 MiB corpus, count model), Zeetah's geometric-mean throughput was 1.51x Rust's regex crate, 3.32x RE2 and 0.82x PCRE2-JIT, and pure-literal search reached 31.5 GB/s. The Benchmark button in this tester measures your own pattern in the browser."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does this tester behave like JavaScript's RegExp?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. It runs the real Zeetah engine compiled to WebAssembly, so results match what your Zig program will see. Like JavaScript it uses leftmost-first matching, but Zeetah works on UTF-8 bytes: \\w is ASCII, . matches a single byte, and match positions are byte offsets."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Is my text sent to a server?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. The pattern and test string never leave your browser; compiling and matching happen locally in WebAssembly. Share links keep the state in the URL fragment, which browsers do not send to servers."
+          }
+        }
+      ]
+    }
+  ]
+}
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="./" aria-label="Zeetah regex tester home">
+      <img class="logo" src="zeetah-logo.webp" width="40" height="40" alt="">
+      <span class="brand-text">
+        <span class="brand-name">Zeetah</span>
+        <span class="brand-sub">Regex library for Zig</span>
+      </span>
+    </a>
+    <nav class="nav" aria-label="Site">
+      <a href="./" aria-current="page">Tester</a>
+      <a href="guide.html">Guide</a>
+      <a href="how-it-works.html">How it works</a>
+    </nav>
+    <div class="topbar-right">
+      <span class="chip" id="version" title="Engine version">loading…</span>
+      <a class="link" href="https://github.com/DaliVana/Zeetah" target="_blank" rel="noopener">GitHub</a>
+      <button class="icon-btn" id="themeBtn" type="button" aria-label="Toggle dark mode" title="Toggle dark mode">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main class="page">
+    <section class="hero">
+      <h1>Zig regex tester</h1>
+      <p>Test and debug regular expressions with <strong>Zeetah</strong>, a fast, dependency-free regex library for Zig.
+        The real engine runs in your browser as WebAssembly, so what matches here matches in your Zig program.</p>
+    </section>
+
+    <div class="layout">
+    <div class="col-main">
+      <!-- Pattern -->
+      <section class="card" aria-labelledby="patternTitle">
+        <div class="card-head">
+          <h2 id="patternTitle">Regular expression</h2>
+          <div class="actions">
+            <div class="menu-wrap">
+              <button class="btn" id="libBtn" type="button" aria-haspopup="true" aria-expanded="false">
+                Examples
+                <svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+              </button>
+              <div class="menu" id="libMenu" role="menu" hidden></div>
+            </div>
+            <button class="btn" id="shareBtn" type="button" title="Copy a link to this pattern, flags and test string">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 14a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1M14 10a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg>
+              Share
+            </button>
+          </div>
+        </div>
+
+        <div class="pattern-row">
+          <span class="delim" aria-hidden="true">/</span>
+          <div class="editor pattern-editor">
+            <div class="hl" id="patternHl" aria-hidden="true"></div>
+            <textarea id="pattern" rows="1" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" aria-label="Regular expression" placeholder="type a pattern, e.g. \d{4}-\d{2}"></textarea>
+          </div>
+          <span class="delim" aria-hidden="true">/</span>
+          <span class="flag-text" id="flagText" aria-hidden="true"></span>
+        </div>
+
+        <div class="flags" role="group" aria-label="Flags">
+          <button class="flag" type="button" data-flag="g" title="All matches instead of only the first"><b>g</b>global</button>
+          <button class="flag" type="button" data-flag="i" title="ASCII case-insensitive, same as (?i)"><b>i</b>ignore case</button>
+          <button class="flag" type="button" data-flag="m" title="^ and $ match at line boundaries, same as (?m)"><b>m</b>multiline</button>
+          <button class="flag" type="button" data-flag="s" title=". also matches a newline, same as (?s)"><b>s</b>dot all</button>
+          <button class="flag" type="button" data-flag="x" title="Ignore whitespace and allow # comments, same as (?x)"><b>x</b>extended</button>
+        </div>
+
+        <div class="status" id="status" aria-live="polite"></div>
+      </section>
+
+      <!-- Test string -->
+      <section class="card" aria-labelledby="subjectTitle">
+        <div class="card-head">
+          <h2 id="subjectTitle">Test string <span class="meta" id="textMeta"></span></h2>
+          <div class="actions">
+            <span class="count" id="count"></span>
+            <button class="icon-btn" id="prevBtn" type="button" aria-label="Previous match" title="Previous match">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+            </button>
+            <button class="icon-btn" id="nextBtn" type="button" aria-label="Next match" title="Next match">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+            </button>
+            <button class="icon-btn" id="clearBtn" type="button" aria-label="Clear test string" title="Clear test string">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="editor subject-editor" id="subjectWrap">
+          <div class="hl" id="subjectHl" aria-hidden="true"></div>
+          <textarea id="subject" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" aria-label="Test string" placeholder="paste or type text to search"></textarea>
+        </div>
+
+        <div class="card-foot">
+          <span class="exec-info" id="execInfo"></span>
+          <div class="bench-ctl">
+            <label class="check" title="Repeat the test string until it is at least 1 MiB, so the timing is meaningful">
+              <input type="checkbox" id="benchScale" checked> 1 MiB input
+            </label>
+            <button class="btn" id="benchBtn" type="button" title="Time count() over the test string">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>
+              Benchmark
+            </button>
+          </div>
+        </div>
+        <div class="bench-out" id="benchOut" hidden></div>
+      </section>
+
+      <!-- Results -->
+      <section class="card results" aria-label="Results">
+        <div class="tabs" role="tablist">
+          <button role="tab" type="button" data-tab="matches" id="tab-matches" aria-controls="panel-matches">Matches</button>
+          <button role="tab" type="button" data-tab="replace" id="tab-replace" aria-controls="panel-replace">Replace</button>
+          <button role="tab" type="button" data-tab="split" id="tab-split" aria-controls="panel-split">Split</button>
+          <button role="tab" type="button" data-tab="code" id="tab-code" aria-controls="panel-code">Zig code</button>
+        </div>
+
+        <div class="tab-panel" role="tabpanel" id="panel-matches" aria-labelledby="tab-matches">
+          <div id="matches" class="matches"></div>
+        </div>
+
+        <div class="tab-panel" role="tabpanel" id="panel-replace" aria-labelledby="tab-replace" hidden>
+          <label class="field-label" for="template">Replacement</label>
+          <input class="field mono" id="template" spellcheck="false" autocomplete="off" placeholder="e.g. $2/$1 or ${name}">
+          <div class="row">
+            <label class="check"><input type="checkbox" id="literal"> literal (no $ expansion)</label>
+            <span class="hint"><code>$&amp;</code> whole match · <code>$1</code> group · <code>${name}</code> named · <code>$$</code> dollar · <b>g</b> flag replaces every match</span>
+          </div>
+          <div class="out-head">
+            <span id="replaceMeta">Result</span>
+            <button class="btn small" id="copyReplace" type="button">Copy</button>
+          </div>
+          <pre class="out" id="replaceOut"></pre>
+        </div>
+
+        <div class="tab-panel" role="tabpanel" id="panel-split" aria-labelledby="tab-split" hidden>
+          <div id="splitOut" class="segments"></div>
+        </div>
+
+        <div class="tab-panel" role="tabpanel" id="panel-code" aria-labelledby="tab-code" hidden>
+          <div class="out-head">
+            <span>Use this pattern from Zig</span>
+            <button class="btn small" id="copyCode" type="button">Copy</button>
+          </div>
+          <pre class="out code" id="codeOut"></pre>
+        </div>
+      </section>
+    </div>
+
+    <aside class="col-side">
+      <section class="card" aria-labelledby="explainTitle">
+        <div class="card-head"><h2 id="explainTitle">Explanation</h2></div>
+        <div class="engine-note" id="engineNote"></div>
+        <ol class="explain" id="explain"></ol>
+      </section>
+
+      <section class="card" aria-labelledby="refTitle">
+        <div class="card-head">
+          <h2 id="refTitle">Quick reference</h2>
+          <span class="meta">click to insert</span>
+        </div>
+        <div class="ref" id="ref"></div>
+      </section>
+    </aside>
+    </div>
+
+    <section class="about" aria-labelledby="aboutTitle">
+      <div class="about-intro">
+        <h2 id="aboutTitle">About Zeetah, the regex library behind this tester</h2>
+        <p><strong>Zeetah</strong> is an open-source (MIT) regular expression engine for <a href="https://ziglang.org" rel="noopener">Zig</a>.
+          It is a <em>meta engine</em>: when a pattern is compiled, Zeetah analyzes it and routes it to the cheapest matcher that is still correct.
+          The status line above the test string shows which one your pattern got.</p>
+        <ul class="facts">
+          <li><b>Linear-time core.</b> Regular patterns compile to a DFA and match in O(n); even <code>(a+)+$</code> stays linear.</li>
+          <li><b>Bounded backtracking.</b> Backreferences and lookaround run under a step budget and return <code>error.MatchBudgetExceeded</code> instead of hanging.</li>
+          <li><b>SIMD where it pays.</b> Teddy multi-literal search and 64-byte bitmask scans for character-class runs.</li>
+          <li><b>Compile-time regex.</b> <code>zeetah.Pattern</code> builds the matcher at comptime: no allocator, no runtime compile.</li>
+          <li><b>No dependencies.</b> Zig standard library only; every allocation goes through the allocator you pass.</li>
+        </ul>
+        <div class="about-links">
+          <a class="btn" href="guide.html">Read the guide</a>
+          <a class="btn" href="how-it-works.html">How it works</a>
+          <a class="btn" href="https://github.com/DaliVana/Zeetah" rel="noopener">Zeetah on GitHub</a>
+        </div>
+      </div>
+      <div class="faq" id="faq">
+        <h2>Frequently asked questions</h2>
+        <div class="faq-item">
+          <h3>What is Zeetah?</h3>
+          <p>Zeetah is a fast, open-source (MIT) regular expression library for the Zig programming language, with no dependencies beyond the Zig standard library. It is a meta engine: when you compile a pattern it picks the cheapest correct matcher for it, such as a SIMD literal scan, a DFA, or a bounded backtracker for lookaround and backreferences.</p>
+        </div>
+        <div class="faq-item">
+          <h3>How do I use regular expressions in Zig?</h3>
+          <p>Zig&#x27;s standard library has no regex module, so you add a library such as Zeetah. Run zig fetch --save with the Zeetah Git URL, import the zeetah module in build.zig, then call zeetah.Regex.compile(allocator, pattern) and use find, findAll, captures or replaceAll. The guide walks through each step.</p>
+        </div>
+        <div class="faq-item">
+          <h3>Which regex syntax does Zeetah support?</h3>
+          <p>Perl and PCRE style syntax: character classes and POSIX classes, \d \w \s and \b, anchors, greedy, lazy and possessive quantifiers, alternation, capturing, non-capturing and named groups, lookahead, fixed-width lookbehind, backreferences, atomic groups and the inline flags (?i) (?m) (?s) (?x). Matching is byte-oriented: \w and \d are ASCII and . matches one byte.</p>
+        </div>
+        <div class="faq-item">
+          <h3>Is Zeetah safe from ReDoS (catastrophic backtracking)?</h3>
+          <p>Regular patterns compile to a DFA and run in linear time, so classic catastrophic shapes like (a+)+$ stay fast. Only features that need backtracking (backreferences, lookaround, atomic groups) use a backtracker, and it runs under a step budget that returns error.MatchBudgetExceeded instead of hanging.</p>
+        </div>
+        <div class="faq-item">
+          <h3>Can Zig compile a regex at compile time?</h3>
+          <p>Yes. zeetah.Pattern(&quot;...&quot;, .{}) runs the whole regex compiler at comptime and bakes the matcher into the binary&#x27;s read-only data. Matching then needs no allocator and no runtime compilation, and an invalid pattern is a compile error.</p>
+        </div>
+        <div class="faq-item">
+          <h3>How fast is Zeetah?</h3>
+          <p>In the 13-engine benchmark published in the Zeetah README (1 MiB corpus, count model), Zeetah&#x27;s geometric-mean throughput was 1.51x Rust&#x27;s regex crate, 3.32x RE2 and 0.82x PCRE2-JIT, and pure-literal search reached 31.5 GB/s. The Benchmark button in this tester measures your own pattern in the browser.</p>
+        </div>
+        <div class="faq-item">
+          <h3>Does this tester behave like JavaScript&#x27;s RegExp?</h3>
+          <p>No. It runs the real Zeetah engine compiled to WebAssembly, so results match what your Zig program will see. Like JavaScript it uses leftmost-first matching, but Zeetah works on UTF-8 bytes: \w is ASCII, . matches a single byte, and match positions are byte offsets.</p>
+        </div>
+        <div class="faq-item">
+          <h3>Is my text sent to a server?</h3>
+          <p>No. The pattern and test string never leave your browser; compiling and matching happen locally in WebAssembly. Share links keep the state in the URL fragment, which browsers do not send to servers.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <p>Runs entirely in your browser: Zeetah compiled to WebAssembly (wasm32 + SIMD128), no server round-trips.
+      Zeetah is byte-oriented, so <code>.</code> matches one byte, <code>\w</code> is ASCII and offsets are UTF-8 byte offsets.</p>
+    <p class="foot-links"><a href="./">Regex tester</a> · <a href="guide.html">Guide</a> · <a href="how-it-works.html">How it works</a> ·
+      <a href="https://github.com/DaliVana/Zeetah" rel="noopener">GitHub</a> · <a href="llms.txt">llms.txt</a> · MIT license</p>
+  </footer>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="site.js"></script>
+  <script src="zeetah.js"></script>
+  <script src="explain.js"></script>
+  <script src="library.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

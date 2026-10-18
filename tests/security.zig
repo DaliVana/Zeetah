@@ -86,8 +86,8 @@ test "redos: classic nested-quantifier patterns collapse to a linear DFA" {
     // therefore certifies only the matching-input case; the worst-case
     // quadratic is tracked by the known-failing marker.
     const patterns = [_][]const u8{
-        "(a+)+$",  "(a*)*$",        "((a+)+)+$",
-        "(a|a)*$", "([a-zA-Z]+)*$", "(.*)*$",
+        "(a+)+$",      "(a*)*$",        "((a+)+)+$",
+        "(a|a)*$",     "([a-zA-Z]+)*$", "(.*)*$",
         "(x|x|x|x)*y",
     };
     for (patterns) |p| {
@@ -223,12 +223,15 @@ test "quantifier: overflowing / oversized counts rejected cleanly, no leak" {
         // linear engines — so moderate counts (`a{1001}`, `{20,1024}`) compile
         // while these blow a ceiling (or the count limit) at compile time.
         "a{20000}",
-        "a{100000}",             "(a{1000}){1000}",
+        "a{100000}",
+        "(a{1000}){1000}",
         "(ab){50000}",
         // Integer overflow on the count, and inverted min > max: genuine
         // syntax errors that must always reject.
-        "a{2147483648}",         "a{4294967296}",
-        "a{99999999999999999999}", "a{3,2}",
+        "a{2147483648}",
+        "a{4294967296}",
+        "a{99999999999999999999}",
+        "a{3,2}",
     };
     for (bad) |p| {
         if (Regex.compile(a, p)) |r| {
@@ -307,8 +310,8 @@ test "utf8: malformed input bytes do not crash or over-read" {
     const a = std.testing.allocator;
     const patterns = [_][]const u8{ "a.b", ".*", "^.+$", "\\w+", "a.*c" };
     const inputs = [_][]const u8{
-        "\xFF\xFE",         "\xC0\x80",        "\xED\xA0\x80",
-        "\xF4\x90\x80\x80", "\x80\x80\x80",    "a\xFFb\x00c",
+        "\xFF\xFE",         "\xC0\x80",     "\xED\xA0\x80",
+        "\xF4\x90\x80\x80", "\x80\x80\x80", "a\xFFb\x00c",
         "",
     };
     for (patterns) |p| {
@@ -368,10 +371,10 @@ test "casefold: boundary code points under -i stay memory-safe" {
 test "redos(polynomial): unanchored $-patterns are linear (single-pass reverse fix)" {
     const a = std.testing.allocator;
     const patterns = [_][]const u8{
-        "a*a*$",     "a*a*a*$",   "a*a*a*a*$", // degree 2/3/4 (Cloudflare-class)
-        "a+a+$",     "a+a+a+$", // PTLS adjacent loops
-        ".*a$",      "a+$", // SLQ / POLS single large quantifier
-        "(a+)+$",    "(a*)*$", // the "linear" shapes the docs over-claimed
+        "a*a*$", "a*a*a*$", "a*a*a*a*$", // degree 2/3/4 (Cloudflare-class)
+        "a+a+$", "a+a+a+$", // PTLS adjacent loops
+        ".*a$", "a+$", // SLQ / POLS single large quantifier
+        "(a+)+$", "(a*)*$", // the "linear" shapes the docs over-claimed
     };
     // Small sizes on purpose: at n=20k a quadratic pattern is already ~1s, so
     // the 16x signal is unmistakable while the whole marker runs in ~1-2s. (At
@@ -638,9 +641,9 @@ test "injection: adversarial *patterns* are bounded at compile time, never unbou
 test "teardown: error and success paths free memory exactly once" {
     const a = std.testing.allocator;
     const sweep = [_][]const u8{
-        "",          "abc[",      "abc(",        "a)b",
-        "*x",        "a{,}",      "a{2,1}",      "\\",
-        "(?<d>a)(?<d>b)", "a{99999}", "((((a))))",  "[a-z]+",
+        "",                    "abc[",         "abc(",         "a)b",
+        "*x",                  "a{,}",         "a{2,1}",       "\\",
+        "(?<d>a)(?<d>b)",      "a{99999}",     "((((a))))",    "[a-z]+",
         "\\d{1,3}\\.\\d{1,3}", "cat|dog|bird", "hello.*world",
     };
     for (sweep) |p| {

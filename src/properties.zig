@@ -31,6 +31,11 @@ pub const Properties = struct {
     prefix: Seq = .{},
     /// Trailing literal sequence.
     suffix: Seq = .{},
+    /// Case-folded literal(s) (`seq_extract.foldLiterals`): the whole pattern
+    /// (`exact`) or its leading run, with letters kept as case pairs — the
+    /// `(?i)` peer of `prefix`, which cannot represent them. Empty when the
+    /// pattern has no case pair.
+    fold: Seq = .{},
     /// The whole pattern is exactly one fixed literal string.
     is_exact_literal: bool = false,
     /// A lazy quantifier was used (carried from the parser).
@@ -105,7 +110,7 @@ fn leadingLineAnchor(comptime cap: ?usize, h: *const hir.Hir(cap)) bool {
     if (h.root == hir.none) return false;
     const f = firstFactor(cap, h, h.root) orelse return false;
     const nd = h.node(f);
-    return nd.tag == .look and nd.set_idx == @intFromEnum(hir.LookKind.start_line);
+    return nd.tag == .look and nd.set_idx == @backingInt(hir.LookKind.start_line);
 }
 
 /// Shape result for a line-anchored regular pattern (`(?m)^body$` or
@@ -137,11 +142,11 @@ fn walkLineBody(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, w: *
     return switch (nd.tag) {
         .backref, .look_around, .atomic => false,
         .look => blk: {
-            if (nd.set_idx == @intFromEnum(hir.LookKind.start_line)) {
+            if (nd.set_idx == @backingInt(hir.LookKind.start_line)) {
                 w.n_start += 1;
                 break :blk true;
             }
-            if (nd.set_idx == @intFromEnum(hir.LookKind.end_line)) {
+            if (nd.set_idx == @backingInt(hir.LookKind.end_line)) {
                 w.n_end += 1;
                 break :blk true;
             }
@@ -180,7 +185,7 @@ pub fn lineAnchoredRegular(comptime cap: ?usize, h: *const hir.Hir(cap)) ?LineSh
         const root = h.node(h.root);
         if (root.tag != .concat) return null;
         const last = h.node(root.b);
-        if (!(last.tag == .look and last.set_idx == @intFromEnum(hir.LookKind.end_line))) return null;
+        if (!(last.tag == .look and last.set_idx == @backingInt(hir.LookKind.end_line))) return null;
         has_dollar = true;
     }
     // The forward body DFA is the leftmost-first (priority-cut) DFA, so its
@@ -244,7 +249,7 @@ fn trailingLook(comptime cap: ?usize, h: *const hir.Hir(cap)) ?hir.LookKind {
     const f = lastFactor(cap, h, h.root) orelse return null;
     const nd = h.node(f);
     if (nd.tag != .look) return null;
-    return @as(hir.LookKind, @enumFromInt(nd.set_idx));
+    return @as(hir.LookKind, @fromBackingInt(@intCast(nd.set_idx)));
 }
 
 /// The descriptive `(start, end)` boundary view of a pattern (item-1 abstraction).
@@ -301,7 +306,7 @@ fn walkRevBody(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, w: *R
     const nd = h.node(ref);
     switch (nd.tag) {
         .backref, .look_around, .atomic => w.irregular = true,
-        .look => switch (@as(hir.LookKind, @enumFromInt(nd.set_idx))) {
+        .look => switch (@as(hir.LookKind, @fromBackingInt(@intCast(nd.set_idx)))) {
             .end_line => w.n_line += 1,
             .end_text_before_nl => w.n_znl += 1,
             else => w.other_look = true, // \b \B \A \z mid ^/$ … need real eval
@@ -541,6 +546,7 @@ pub fn analyze(comptime cap: ?usize, h: *const hir.Hir(cap)) Properties {
 
     p.prefix = seq_extract.prefix(cap, h);
     p.suffix = seq_extract.suffix(cap, h);
+    p.fold = seq_extract.foldLiterals(cap, h);
     p.is_exact_literal = p.prefix.n == 1 and p.prefix.exact and
         !p.anchored_start and !p.anchored_end;
 

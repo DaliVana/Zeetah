@@ -102,26 +102,27 @@ the regular-tier sub-decision shared with the compile-time path.
 ### Layer 1 — the runtime dispatcher (`regex.zig`)
 
 `Regex.compileWithFlags` classifies the analyzed pattern and selects one of
-fourteen executors, tracked by the private enum `MetaKind`:
+fifteen executors, tracked by the private enum `MetaKind`:
 
 ```zig
 const MetaKind = enum {
     literal, dfa, lit_prefix, reverse_suffix, bt_look, backtrack,
-    split_alt, lazy_dfa, dense_search, class_span, boundary_lits, dup_word,
-    dfa_edge_look, literal_alt,
+    split_alt, lazy_dfa, dense_search, class_span, class_seq, boundary_lits,
+    dup_word, dfa_edge_look, literal_alt,
 };
 ```
 
 | `MetaKind` | Chosen when | How it runs | Backing code |
 |------------|-------------|-------------|--------------|
-| `literal` | a single literal, or an exact literal alternation (`cat\|dog\|bird`) | SIMD substring / Teddy multi-literal scan — **no automaton** | `exec/core.zig`, `prefilter.zig` |
+| `literal` | a single literal, or an exact literal alternation (`cat\|dog\|bird`) — also case-insensitive ones (`(?i)sherlock\|watson`, kept as case-folded needles) | SIMD substring / Teddy multi-literal scan (fold-masked for `(?i)`) — **no automaton** | `exec/core.zig`, `prefilter.zig` |
 | `lit_prefix` | a literal prefix ≥ 3 bytes, unanchored (`hello.*world`) | Teddy-locate the prefix, then verify with an anchored DFA; with an unbounded tail the bytes failing candidates scan are metered (`PackedDfa.runFromStop` reports where a failed walk died — no second pass), and past a budget ∝ progress the search continues on an attached single-pass engine | `exec/core.zig` → `exec/search.zig`, `prefilter.zig` |
 | `reverse_suffix` | a selective trailing literal but a weak prefix | use the suffix as a sound fast-negative (no occurrence ⇒ no match), then a forward DFA | `exec/core.zig`, `prefilter.zig`, `exec/full_dfa.zig` |
 | `dfa` | the general regular case | eager DFA table walk (`Dfa256`) | `exec/core.zig`, `exec/full_dfa.zig`, `exec/dfa_build.zig` |
 | `dense_search` | a bare unanchored DFA of narrow shape (`min_len ≥ 4`, ≤ 16 start bytes, no required literal, not lazy), or an unanchored `$`-anchored bare DFA | a *frozen* dense single-pass unanchored DFA + reverse start pass (one sweep, no per-position restart) | `exec/dense_search.zig` |
 | `lazy_dfa` | the eager DFA would exceed its state ceiling (or the dense freeze would); **plain look-assertions** (`\b`, `\B`, mid-pattern `^`/`$`, `(?m)` anchors, `\A`, `\z`) | the same subset construction, evaluated on demand and memoized; in *look mode* each state also carries the class of the previous byte and assertions are evaluated inside the transition (matches reported one byte late) | `exec/lazy_dfa.zig`, `exec/lazy_memo.zig` |
-| `class_span` | one greedy single contiguous-range `class+` / `class*` | SIMD member-run scan, no automaton | `exec/class_span.zig` |
-| `boundary_lits` | `\b(?:kw1\|kw2\|…)\b` keyword alternations | Aho-Corasick locate + O(1) `\b` verify | `exec/seq_extract.zig`, `prefilter.zig` |
+| `class_span` | the whole pattern is one repeated byte class `S`: `S+`, `S*`, `S{m,}`, `S{m,n}` (cut greedily into `n`-byte pieces), or `\bS{m,n}\b` with `S ⊆ \w` (whole `\w` runs of `S` bytes) — no groups | 64-byte block-bitmask run scan (`ctz` / `popCount`), no automaton; recogniser + executor `class_span.RunSpec`, shared with the comptime `Pattern` | `exec/class_span.zig` |
+| `class_seq` | a fixed-length sequence of byte classes (`[0-9]{2}:[0-9]{2}:[0-9]{2}`, `(?:[0-9A-F]{2}:){5}[0-9A-F]{2}`; length 2–64, ≤ 4 distinct classes, not a pure literal; capture groups allowed) | per-class 64-byte masks, shifted and ANDed into every match end of the block at once; a rare *gate* class filters blocks first (`memchr` when it is one byte) — no automaton; captures rebuilt one-pass over the span | `exec/class_seq.zig` |
+| `boundary_lits` | `\b(?:kw1\|kw2\|…)\b` keyword alternations | ≤ 8 keywords: Teddy locate + O(1) `\b` verify; word-only keywords (≤ 16 bytes): walk the `\w` runs off a 64-byte mask, reject by length and (first, last) byte with two bit tests, hash-check the rest (`.words`); otherwise Aho-Corasick locate + O(1) `\b` verify | `exec/seq_extract.zig`, `exec/word_set.zig`, `prefilter.zig` |
 | `bt_look` | the look-assertions the lazy DFA does not take: `\Z` (two bytes of lookahead) and a leading `(?m)^` (whose line-start scan skips whole lines) — plus the line-DFA / reverse-end-DFA fast paths | line-DFA (forward, or the reverse body DFA as a whole-line membership test for an alternation/lazy body with `$`) or reverse-end DFA when built, else the bounded backtracker over line starts / every start; the PikeVM when the visited bitset would exceed its budget (anchored at each line start for a `(?m)^` scan) | `exec/bounded_bt.zig`, `exec/line_dfa.zig`, `exec/pikevm.zig` |
 | `backtrack` | lookaround / backreferences / atomic groups (incl. possessive quantifiers, which lower to atomic groups) | HIR-tree backtracker, with a `seek` over-approximation prefilter and concat-internal regular "island" delegation | `exec/backtrack.zig`, `exec/seek.zig`, `exec/delegate.zig` |
 | `split_alt` | a top-level alternation mixing regular and non-regular branches | regular branches → anchored DFAs, the rest → tree backtracker | `exec/split_alt.zig` |
@@ -130,8 +131,8 @@ const MetaKind = enum {
 | `literal_alt` | a pure-literal alternation too large for the NFA (a dictionary) | leftmost-first trie walk; tables bounded by a byte budget | `prefilter.zig` (`LiteralAltScanner`) |
 
 The regular tier (`literal`, `lit_prefix`, `reverse_suffix`, `dfa`,
-`dense_search`, `lazy_dfa`, `class_span`, `boundary_lits`, `dfa_edge_look`,
-`literal_alt`) consists of finite automata or literal scans. `bt_look`,
+`dense_search`, `lazy_dfa`, `class_span`, `class_seq`, `boundary_lits`,
+`dfa_edge_look`, `literal_alt`) consists of finite automata or literal scans. `bt_look`,
 `backtrack`, `split_alt` and `dup_word` are the non-regular and hybrid tiers;
 `dup_word` is linear by construction, `bt_look` is O(n·m) (visited bitset or
 PikeVM), and `backtrack` / `split_alt` are governed by the step budget described
@@ -176,7 +177,7 @@ sentinel: non-regular patterns are intercepted by `regex.zig` *before* `plan` is
 ever consulted, so `plan` returning `.backtrack` never reaches the dispatch hot
 path. The `.literal`, `.prefix_prefilter`, `.reverse_suffix`, and `.core`
 variants map onto the corresponding `MetaKind` executors; the dispatcher refines
-`.core` further (into `dfa`, `dense_search`, `lazy_dfa`, `class_span`, etc.)
+`.core` further (into `dfa`, `dense_search`, `lazy_dfa`, `class_span`, `class_seq`, etc.)
 using runtime-only information such as the eager DFA's actual state count.
 
 ## Prefilters
@@ -197,7 +198,8 @@ prefilters live in `prefilter.zig` (plus the seek/locate helpers in `src/exec`):
 - **Teddy.** A SIMD multi-substring locator (≤ 8 needles, adaptive nibble
   masks). It backs the `literal`, `lit_prefix`, and `reverse_suffix` executors.
 - **Aho-Corasick.** A multi-keyword locator that backs the `boundary_lits`
-  executor (`\b`-fenced keyword alternations).
+  executor (`\b`-fenced keyword alternations) when the keywords are not all
+  word-only — those take the `\w`-run hash path (`exec/word_set.zig`).
 - **Seek.** A *regular over-approximation* of a non-regular pattern that skips
   proven-dead prefixes; it is the prefilter for the backtracking tier.
 
@@ -518,7 +520,10 @@ but it is **compiled to code** rather than interpreted:
   Soundness mirrors the runtime `seek.build` guards exactly. (The runtime also
   delegates regular concat islands to DFAs, `exec/delegate.zig`; the compiled
   matcher doesn't need that — it runs class loops as scans.)
-- **Routing** is comptime-only: `pattern.zig buildAll` dispatches on
+- **Routing** is comptime-only: `pattern.zig buildAll` first tries the DFA-free
+  `.class_span` and `.class_seq` arms — the *same* `class_span.RunSpec.recognize`
+  and `class_seq.ClassSeq.fromHir` the runtime cascade calls, so the two routers
+  pick the same engine for those shapes — then dispatches on
   `requires_backtracking or has_look` *before* `thompson.build`. The shared
   `properties.requires_backtracking` deliberately omits `has_look` so the *runtime*
   keeps its separate look engines (the look-aware lazy DFA, `.bt_look`); the
@@ -642,6 +647,7 @@ intentional, not an accident of layering.
 | `regex.zig` | runtime façade + Layer-1 dispatcher (`MetaKind`) |
 | `pattern.zig` | comptime façade (`Pattern`, `PatternOptions`) |
 | `prefilter.zig` | required-byte / required-literal / first-byte-SIMD / Teddy / Aho-Corasick / `LiteralAltScanner` |
+| `simd.zig` | shared arch byte-shuffle (`pshufb`/`vpshufb`/`tbl`) + comptime `has_shuffle`; used by Teddy, `class_span` and `class_seq` |
 | `exec/core.zig` | runtime DFA table-walk executor + literal/prefix fast paths (drives `Dfa256`) |
 | `exec/search.zig` | table-type-agnostic prefilter search shared by the runtime `Dfa256` and the comptime `Dfa(ns,nk)` |
 | `exec/full_dfa.zig`, `exec/dfa_build.zig` | eager DFA construction (subset + minimize) → `Dfa256` |
@@ -652,8 +658,10 @@ intentional, not an accident of layering.
 | `exec/nfa_index.zig` | `EdgeIndex`: per-state out-edge index of the retained NFA in priority order, built once per `Regex` and borrowed by the bounded backtracker and the PikeVM |
 | `exec/onepass.zig` | one-pass capture walker (slots over a found span); walks a prebuilt out-edge index — the `Regex`'s shared `EdgeIndex` at runtime, a comptime-baked `SizedIndex` in a `Pattern` |
 | `exec/edge_look.zig`, `exec/line_dfa.zig` | trailing width-1 look peel (`dfa_edge_look`); line-anchored body-DFA scan (forward, or reverse whole-line membership) |
-| `exec/class_span.zig` | SIMD single-range `class+`/`class*` scan |
+| `exec/class_span.zig` | block-bitmask class-run scanner (`Class`) and the whole `.class_span` shape — recogniser + executor shared by both front-ends (`RunSpec`); 16-byte range scan for `seek` (`Ranges`) |
+| `exec/class_seq.zig` | fixed-length class-sequence matcher (`ClassSeq`): shifted per-class block masks, gate filter |
 | `exec/seq_extract.zig` | literal-sequence / keyword extraction (`Seq`; `boundary_lits`) |
+| `exec/word_set.zig` | `boundary_lits` `.words` strategy: `\w`-run walk + bit filters + keyword hash table (`WordSet`) |
 | `exec/backtrack.zig`, `exec/bounded_bt.zig` | HIR-tree backtracker (backref/lookaround/atomic) + bounded `O(n·m)` NFA backtracker (span captures, `bt_look`) |
 | `exec/compiled_bt.zig` | comptime-only: the baked HIR compiled to a specialized backtracker (the comptime `Pattern`'s non-regular tier and capture fills) |
 | `exec/nfa_fuzz.zig` | random-pattern differential test across the NFA engines and the public API |

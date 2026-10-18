@@ -5,7 +5,8 @@
 //! tier is `planner.plan`-driven (`literal`/`lit_prefix`/`reverse_suffix`/
 //! `dfa`, with `lazy_dfa` for DFA-explosion, `dense_search` for the
 //! frozen-dense unanchored single pass, `class_span` for trivial `class+`,
-//! and `boundary_lits` for `\b(?:lit|lit|…)\b` keyword alternations);
+//! `class_seq` for fixed-length class sequences (`[0-9]{2}:[0-9]{2}`), and
+//! `boundary_lits` for `\b(?:lit|lit|…)\b` keyword alternations);
 //! plain look-assertions (`\b \B ^ $ (?m) \A \z`) run on the look-aware
 //! `lazy_dfa` (or a line / reverse-end DFA fast path; `\Z` on the `bt_look`
 //! bounded backtracker); NFA searches whose backtracker window would exceed
@@ -46,6 +47,7 @@ const delegate = @import("exec/delegate.zig");
 const dupword = @import("exec/dupword.zig");
 const lazy_dfa = @import("exec/lazy_dfa.zig");
 const class_span = @import("exec/class_span.zig");
+const class_seq = @import("exec/class_seq.zig");
 const onepass = @import("exec/onepass.zig");
 const cache_mod = @import("cache.zig");
 
@@ -54,7 +56,7 @@ pub const Group = @import("match.zig").Group;
 const wholeMatch = @import("match.zig").wholeMatch;
 const advanceEmpty = @import("match.zig").advanceEmpty;
 
-const MetaKind = enum { literal, dfa, lit_prefix, reverse_suffix, bt_look, backtrack, split_alt, lazy_dfa, dense_search, class_span, boundary_lits, dup_word, dfa_edge_look, literal_alt };
+const MetaKind = enum { literal, dfa, lit_prefix, reverse_suffix, bt_look, backtrack, split_alt, lazy_dfa, dense_search, class_span, class_seq, boundary_lits, dup_word, dfa_edge_look, literal_alt };
 
 /// `.boundary_lits` engine: `\b(?:lit|lit|…)\b` (a word-boundary-bracketed
 /// pure literal alternation). The naive NFA of a big keyword list blows
@@ -206,7 +208,7 @@ pub const Regex = struct {
     /// the capture engine's automaton. `gnames[g]` is group g's `(?<name>)`
     /// name (aliases `pattern`), or null.
     n_groups: usize = 0,
-    gnames: GNames = [_]?[]const u8{null} ** (hir.MAX_GROUPS_RUNTIME + 1),
+    gnames: GNames = @splat(null),
     /// Owned HIR for the `.backtrack` path (backref / lookaround run on the
     /// tree backtracker, which walks the HIR, not the NFA).
     bt_hir: ?*hir.Hir(null) = null,
@@ -221,10 +223,13 @@ pub const Regex = struct {
     /// `.backtrack`/`.bt_look` (see `exec/delegate.zig`). `null` ⇒ pure
     /// tree-walk.
     del: ?*delegate.Plan = null,
-    /// `.class_span`: the whole unanchored pattern is one greedy `class+`
-    /// / `class*` — matched by a SIMD member-run scan, no automaton.
-    cs_ranges: class_span.Ranges = .{},
-    cs_star: bool = false,
+    /// `.class_span`: the whole unanchored pattern is one repeated byte class
+    /// (`S+`, `S*`, `S{m,}`, `S{m,n}`, `\bS+\b`, …) — matched off 64-byte block
+    /// bitmasks, no automaton (`class_span.RunSpec`).
+    cs: class_span.RunSpec = .{},
+    /// Owned `.class_seq` matcher: the whole unanchored pattern is a fixed
+    /// sequence of byte classes, matched by shifted 64-byte block masks.
+    cseq: ?*class_seq.ClassSeq = null,
     /// Owned lazy DFA for `.lazy_dfa`: patterns whose eager `full_dfa` table
     /// blows `MAX_DFA` run here on demand instead of being rejected. Same
     /// construction, evaluated incrementally (bit-identical to `full_dfa`).
@@ -270,7 +275,7 @@ pub const Regex = struct {
     /// `.dfa_edge_look`: the peeled trailing width-1 look. `self.dfa` is the
     /// core's DFA with the look folded in; this is the walk config `nextFrom`
     /// needs on top of it (see `exec/edge_look.zig`).
-    el_spec: edge_look.Spec = .{ .set = [_]u8{0} ** 32, .behind = false, .neg = false },
+    el_spec: edge_look.Spec = .{ .set = @splat(0), .behind = false, .neg = false },
     /// Captures fast path: when the pattern is one-pass (decided at compile by
     /// the pure `onepass.dfaMatchIsOnePass` over the DFA), `captures()` resolves slots
     /// via a single allocation-free deterministic forward pass instead of the
@@ -825,30 +830,50 @@ pub const Regex = struct {
         };
     }
 
-    /// `.class_span`: a trivial whole-unanchored greedy `class+` / `class*` with
-    /// no groups — the match is just a maximal class run (a SIMD member scan, no
-    /// automaton). Single contiguous range only: a sparse class with long gaps
-    /// (`[0-9]+`) wins big; a dense/short-run class (`\w+`) loses to the DFA's
-    /// tight per-byte loop, so everything else keeps the DFA.
-    fn tryClassSpan(allocator: std.mem.Allocator, h: *hir.Hir(null), owned: []const u8, flags: common.CompileFlags, ng: usize, gnames: GNames) ?Regex {
-        if (h.anchored_start or h.anchored_end or ng != 0 or h.saw_lazy) return null;
-        const rootn = h.node(h.root);
-        if (!((rootn.tag == .plus or rootn.tag == .star) and rootn.greedy)) return null;
-        const child = h.node(rootn.a);
-        if (child.tag != .set) return null;
-        if (class_span.Ranges.fromBitmap(h.setBitmap(child.set_idx))) |rg| {
-            if (rg.n == 1) return Regex{
-                .allocator = allocator,
-                .pattern = owned,
-                .flags = flags,
-                .kind = .class_span,
-                .cs_ranges = rg,
-                .cs_star = rootn.tag == .star,
-                .n_groups = 0,
-                .gnames = gnames,
-            };
-        }
-        return null;
+    /// `.class_span`: the whole unanchored pattern is one repeated byte class
+    /// with no groups — `S+`, `S*`, `S{m,}`, `S{m,n}`, or `\bS{m,n}\b` with
+    /// `S ⊆ \w` — so its matches follow from the maximal `S` (or `\w`) runs
+    /// alone, read off 64-byte block masks; no automaton. The recogniser and
+    /// executor are `class_span.RunSpec`, shared with the comptime `Pattern` so
+    /// the two routers agree. (Without a SIMD byte shuffle only ≤ 2-range
+    /// classes qualify — `Class.fromBitmap` returns null — and the rest keep
+    /// their engine.) Needs no NFA, so it runs before the NFA build — also
+    /// ahead of the look-assertion routing that `\b…\b` would otherwise take.
+    fn tryClassSpan(allocator: std.mem.Allocator, h: *hir.Hir(null), owned: []const u8, flags: common.CompileFlags, gnames: GNames) ?Regex {
+        const spec = class_span.RunSpec.recognize(h) orelse return null;
+        return Regex{
+            .allocator = allocator,
+            .pattern = owned,
+            .flags = flags,
+            .kind = .class_span,
+            .cs = spec,
+            .n_groups = 0,
+            .gnames = gnames,
+        };
+    }
+
+    /// `.class_seq`: the whole unanchored pattern is a fixed sequence of byte
+    /// classes (`[0-9]{2}:[0-9]{2}`, `(?:[0-9A-F]{2}:){5}[0-9A-F]{2}`, groups
+    /// allowed) — every match has the same length, so all match ends of a
+    /// 64-byte block come from ANDing shifted per-class masks (`exec/class_seq.zig`).
+    /// Capture groups keep the two-phase path: this finds the span, the
+    /// retained NFA (`nheap`) rebuilds the slots — one-pass, as a fixed
+    /// sequence always is.
+    fn tryClassSeq(allocator: std.mem.Allocator, h: *hir.Hir(null), owned: []const u8, flags: common.CompileFlags, ng: usize, gnames: GNames, nheap: ?*thompson.Nfa(null)) !?Regex {
+        const seq = class_seq.ClassSeq.fromHir(h) orelse return null;
+        const p = try allocator.create(class_seq.ClassSeq);
+        p.* = seq;
+        return Regex{
+            .allocator = allocator,
+            .pattern = owned,
+            .flags = flags,
+            .kind = .class_seq,
+            .cseq = p,
+            .nfa = nheap,
+            .n_groups = ng,
+            .gnames = gnames,
+            .op_onepass = ng > 0 and nheap != null and onepass.isCaptureOnePass(null, nheap.?),
+        };
     }
 
     /// Lever A: should this eager-dense-table pattern route through
@@ -1032,7 +1057,7 @@ pub const Regex = struct {
         var h = hir.Hir(null).initRuntime();
         var h_owned = true; // false once ownership is transferred to a heap copy
         defer if (h_owned) h.deinit(allocator);
-        var gnames0 = [_]?[]const u8{null} ** (hir.MAX_GROUPS_RUNTIME + 1);
+        var gnames0: [hir.MAX_GROUPS_RUNTIME + 1]?[]const u8 = @splat(null);
         var ng0: usize = 0;
         // `parseCaptures` is the single source of truth for capture numbering +
         // names (replaces the old standalone `scanGroups` second grammar).
@@ -1077,6 +1102,7 @@ pub const Regex = struct {
         }
 
         if (ng0 == 0) if (try tryBoundaryLits(allocator, &h, owned, flags, gnames0)) |r| return r;
+        if (ng0 == 0) if (tryClassSpan(allocator, &h, owned, flags, gnames0)) |r| return r;
 
         var nfa = thompson.buildAlloc(allocator, &h) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -1121,7 +1147,7 @@ pub const Regex = struct {
 
         if (props.has_look) return withPools(try buildBtLook(allocator, &h, nheap, props, owned, flags, ng, gnames), pools);
 
-        if (tryClassSpan(allocator, &h, owned, flags, ng, gnames)) |r| return withPools(r, pools);
+        if (try tryClassSeq(allocator, &h, owned, flags, ng, gnames, nheap)) |r| return withPools(r, pools);
 
         var d = full_dfa.compute(null, &nfa, h.anchored_start, h.anchored_end);
         if (d.outcome != .ok) {
@@ -1204,6 +1230,7 @@ pub const Regex = struct {
             p.deinit(self.allocator);
             self.allocator.destroy(p);
         }
+        if (self.cseq) |p| self.allocator.destroy(p);
         if (self.lazy) |p| {
             p.deinit();
             self.allocator.destroy(p);
@@ -1405,17 +1432,19 @@ pub const Regex = struct {
         return core.Span{ .start = s.start, .end = s.end };
     }
 
-    /// `.class_span` leftmost span (greedy `class+`/`class*`). `class*` is
-    /// nullable: the leftmost match is the (possibly empty) run at offset 0.
-    fn csFind(self: *const Regex, input: []const u8) ?core.Span {
-        if (self.cs_star)
-            return core.Span{ .start = 0, .end = self.cs_ranges.runEnd(input, 0) };
-        const i = self.cs_ranges.firstMember(input, 0) orelse return null;
-        return core.Span{ .start = i, .end = self.cs_ranges.runEnd(input, i) };
+    /// Leftmost `class_span` match at/after absolute `pos` (absolute coords).
+    /// `S*` is nullable: the leftmost match is the (possibly empty) run at `pos`.
+    fn csFindFrom(self: *const Regex, input: []const u8, pos: usize) ?core.Span {
+        const r = self.cs.nextMatch(input, pos) orelse return null;
+        return core.Span{ .start = r.start, .end = r.end };
     }
 
     fn csIsMatch(self: *const Regex, input: []const u8) bool {
-        return self.cs_star or self.cs_ranges.firstMember(input, 0) != null;
+        return self.cs.isMatch(input);
+    }
+
+    fn csMatch(input: []const u8, start: usize, end: usize) Match {
+        return wholeMatch(input, start, end);
     }
 
     pub fn isMatch(self: *const Regex, input: []const u8) !bool {
@@ -1439,6 +1468,7 @@ pub const Regex = struct {
             .lazy_dfa => try self.lazyIsMatch(input),
             .dense_search => self.dsearch.?.isMatch(input),
             .class_span => self.csIsMatch(input),
+            .class_seq => self.cseq.?.isMatch(input),
             .boundary_lits => self.blits.?.find(input, 0) != null,
             .dup_word => self.dw.?.find(input, 0) != null,
             .dfa_edge_look => edge_look.nextFrom(self.dfa.?, &self.el_spec, input, 0) != null,
@@ -1706,9 +1736,10 @@ pub const Regex = struct {
                 const r = self.dsearch.?.findFrom(input, pos) orelse break :blk null;
                 break :blk core.Span{ .start = r.start, .end = r.end }; // absolute
             },
-            .class_span => blk: {
-                const r = self.csFind(input[pos..]) orelse break :blk null;
-                break :blk core.Span{ .start = pos + r.start, .end = pos + r.end };
+            .class_span => self.csFindFrom(input, pos), // absolute
+            .class_seq => blk: {
+                const r = self.cseq.?.nextFrom(input, pos) orelse break :blk null;
+                break :blk core.Span{ .start = r.start, .end = r.end }; // absolute
             },
             .boundary_lits => self.blits.?.find(input, pos), // already absolute
             .dup_word => blk: {
@@ -1726,6 +1757,17 @@ pub const Regex = struct {
     pub fn findAll(self: *const Regex, allocator: std.mem.Allocator, input: []const u8) ![]Match {
         var list: std.ArrayList(Match) = .empty;
         errdefer list.deinit(allocator);
+        // `class+`: the matches are exactly the maximal member runs, walked
+        // straight off each 64-byte block mask (same set `nextSpanFrom` yields).
+        if (self.kind == .class_span) {
+            try self.cs.appendAll(Match, allocator, &list, input, csMatch);
+            return list.toOwnedSlice(allocator);
+        }
+        // Fixed-length class sequence: one sweep over the block end masks.
+        if (self.kind == .class_seq) {
+            try self.cseq.?.appendAll(Match, allocator, &list, input, csMatch);
+            return list.toOwnedSlice(allocator);
+        }
         var pos: usize = 0;
         while (pos <= input.len) {
             const s = (try self.nextSpanFrom(input, pos)) orelse break;
@@ -1773,19 +1815,13 @@ pub const Regex = struct {
     /// RE2/Rust `find_iter().count()`).
     ///
     /// For the `class+` family (`[0-9]+`, `\w+`, … — the *whole* unanchored
-    /// pattern is one non-nullable single-class repetition) it is a single
-    /// forward sweep over the member-run boundaries: no `Match`, no per-run
-    /// engine re-entry, no sub-slicing. (`class*` is nullable, so it keeps
-    /// the shared per-match path to preserve the empty-match semantics.)
+    /// pattern is one non-nullable single-class repetition) the count is the
+    /// number of maximal member runs: a branch-free `popCount` of each 64-byte
+    /// block's run starts. (`class*` is nullable, so it keeps the shared
+    /// per-match path to preserve the empty-match semantics.)
     pub fn count(self: *const Regex, input: []const u8) !usize {
-        if (self.kind == .class_span and !self.cs_star) {
-            var n: usize = 0;
-            var i: usize = 0;
-            while (self.cs_ranges.firstMember(input, i)) |s| : (n += 1) {
-                i = self.cs_ranges.runEnd(input, s);
-            }
-            return n;
-        }
+        if (self.kind == .class_span) return self.cs.count(input);
+        if (self.kind == .class_seq) return self.cseq.?.count(input);
         var n: usize = 0;
         var pos: usize = 0;
         while (pos <= input.len) {
@@ -1937,6 +1973,376 @@ pub const Regex = struct {
         }
     };
 };
+
+test "regex(meta): class_span == DFA on language-equivalent patterns" {
+    // Each `class_span` pattern is paired with a DFA-routed pattern of the same
+    // language and leftmost-first spans (the same pattern wrapped in a capture
+    // group, which keeps it off `class_span`);
+    // every API must agree on random haystacks that cross 64-byte blocks.
+    const a = std.testing.allocator;
+    const Pair = struct { cs: []const u8, ref: []const u8 };
+    const pairs = [_]Pair{
+        .{ .cs = "[0-9]+", .ref = "([0-9]+)" }, // .range
+        .{ .cs = "[^\\n]+", .ref = "([^\\n]+)" }, // .range2
+        .{ .cs = "\\w+", .ref = "(\\w+)" }, // .nibble
+        .{ .cs = "[^\\s\"]+", .ref = "([^\\s\"]+)" }, // .nibble2 (incl. high bytes)
+        .{ .cs = "[\\x80-\\xffa-c_]+", .ref = "([\\x80-\\xffa-c_]+)" }, // .nibble2
+        .{ .cs = "[a-fA-F_]+", .ref = "([a-fA-F_]+)" }, // .nibble
+        .{ .cs = "[0-9]*", .ref = "([0-9]*)" }, // class* (nullable)
+        .{ .cs = "\\w*", .ref = "(\\w*)" },
+        // `.runs` with a minimum / a maximum (greedy cut into `max` pieces)
+        .{ .cs = "[0-9]{3,}", .ref = "([0-9]{3,})" },
+        .{ .cs = "[a-f]{2,3}", .ref = "([a-f]{2,3})" },
+        .{ .cs = "\\w{4}", .ref = "(\\w{4})" },
+        .{ .cs = "[^\\n]{1,5}", .ref = "([^\\n]{1,5})" },
+        .{ .cs = "\\w\\w?\\w*", .ref = "(\\w\\w?\\w*)" }, // = \w+ by count interval
+        // `.word`: whole `\w` runs, optionally of S ⊊ \w only, with a length window
+        .{ .cs = "\\b\\w+\\b", .ref = "(\\b\\w+\\b)" },
+        .{ .cs = "\\b[a-zA-Z]+\\b", .ref = "(\\b[a-zA-Z]+\\b)" },
+        .{ .cs = "\\b\\w{2,4}\\b", .ref = "(\\b\\w{2,4}\\b)" },
+        .{ .cs = "\\b[0-9a-f]{3,}\\b", .ref = "(\\b[0-9a-f]{3,}\\b)" },
+    };
+    const alphabet = "aAbcFz_09 \t\n-\"\x80\xe9\xff";
+    var prng = std.Random.DefaultPrng.init(0xC5);
+    const r = prng.random();
+    var buf: [300]u8 = undefined;
+    for (pairs) |p| {
+        var cs = try Regex.compile(a, p.cs);
+        defer cs.deinit();
+        var ref = try Regex.compile(a, p.ref);
+        defer ref.deinit();
+        // Without a byte shuffle (portable SIMD, e.g. wasm32) only the 1-2
+        // range shapes build; nibble/word shapes route elsewhere (dfa,
+        // lazy_dfa). The API-equivalence checks below still apply.
+        if (class_span.has_shuffle) try std.testing.expectEqual(MetaKind.class_span, cs.kind);
+        try std.testing.expect(ref.kind != .class_span);
+        for (0..120) |iter| {
+            const len = if (iter < 8) iter else r.uintLessThan(usize, buf.len + 1);
+            for (buf[0..len]) |*c| c.* = alphabet[r.uintLessThan(usize, alphabet.len)];
+            const hay = buf[0..len];
+            try std.testing.expectEqual(try ref.isMatch(hay), try cs.isMatch(hay));
+            try std.testing.expectEqual(try ref.count(hay), try cs.count(hay));
+            const fr = try ref.find(hay);
+            const fc = try cs.find(hay);
+            try std.testing.expectEqual(fr == null, fc == null);
+            if (fr) |m| try std.testing.expectEqual(m.start, fc.?.start);
+            if (fr) |m| try std.testing.expectEqual(m.end, fc.?.end);
+            const mr = try ref.findAll(a, hay);
+            defer a.free(mr);
+            const mc = try cs.findAll(a, hay);
+            defer a.free(mc);
+            try std.testing.expectEqual(mr.len, mc.len);
+            for (mr, mc) |x, y| {
+                try std.testing.expectEqual(x.start, y.start);
+                try std.testing.expectEqual(x.end, y.end);
+                try std.testing.expectEqualSlices(u8, x.slice, y.slice);
+            }
+            var it = cs.iterator(hay);
+            var k: usize = 0;
+            while (try it.next(a)) |m| : (k += 1) {
+                try std.testing.expectEqual(mr[k].start, m.start);
+                try std.testing.expectEqual(mr[k].end, m.end);
+            }
+            try std.testing.expectEqual(mr.len, k);
+            // Resuming mid-run (`findFrom` inside a word must skip it under
+            // `\b…\b`, but match the suffix of an `S{m,n}` run).
+            if (iter < 24) for (0..len + 1) |pos| {
+                const xr = try ref.findFrom(hay, pos);
+                const xc = try cs.findFrom(hay, pos);
+                try std.testing.expectEqual(xr == null, xc == null);
+                if (xr) |m| {
+                    try std.testing.expectEqual(m.start, xc.?.start);
+                    try std.testing.expectEqual(m.end, xc.?.end);
+                }
+            };
+        }
+    }
+}
+
+test "regex(meta): class_seq == naive matcher on random fixed-length patterns" {
+    const a = std.testing.allocator;
+    const Item = struct { pat: []const u8, set: []const u8 };
+    const items = [_]Item{
+        .{ .pat = "[0-9]", .set = "0123456789" },
+        .{ .pat = "\\d", .set = "0123456789" },
+        .{ .pat = "[a-f]", .set = "abcdef" },
+        .{ .pat = ":", .set = ":" },
+        .{ .pat = "-", .set = "-" },
+        .{ .pat = "[ -]", .set = " -" },
+        .{ .pat = "\\w", .set = "0123456789abcdefABCDEF_z" }, // (alphabet ∩ \w)
+        .{ .pat = ".", .set = "0123456789abcdefABCDEF_z:- \t\"\xe9" }, // (alphabet ∩ [^\n])
+        .{ .pat = "[^\"]", .set = "0123456789abcdefABCDEF_z:- \t\n\xe9" },
+    };
+    const alphabet = "0123456789abcdefABCDEF_z:- \t\n\"\xe9";
+    var prng = std.Random.DefaultPrng.init(0x5E9);
+    const r = prng.random();
+    var routed: usize = 0;
+    var pat_buf: [512]u8 = undefined;
+    var hay_buf: [400]u8 = undefined;
+    for (0..300) |_| {
+        // Build a pattern and its per-position member sets.
+        var pat: std.ArrayList(u8) = .initBuffer(&pat_buf);
+        var pos_sets: [80][]const u8 = undefined;
+        var n: usize = 0;
+        const n_items = 1 + r.uintLessThan(usize, 6);
+        for (0..n_items) |_| {
+            const it = items[r.uintLessThan(usize, items.len)];
+            const rep = 1 + r.uintLessThan(usize, 5);
+            const grp = r.uintLessThan(u8, 4);
+            if (grp == 0) pat.appendSliceAssumeCapacity("(") else if (grp == 1) pat.appendSliceAssumeCapacity("(?:");
+            pat.appendSliceAssumeCapacity(it.pat);
+            if (rep > 1) pat.printAssumeCapacity("{{{d}}}", .{rep});
+            if (grp <= 1) pat.appendSliceAssumeCapacity(")");
+            for (0..rep) |_| {
+                pos_sets[n] = it.set;
+                n += 1;
+            }
+        }
+        var re = try Regex.compile(a, pat.items);
+        defer re.deinit();
+        if (re.kind != .class_seq) continue; // > 4 classes / too short / …
+        routed += 1;
+        const L = n;
+        const atSet = struct {
+            fn f(sets: []const []const u8, s: []const u8, i: usize) bool {
+                if (i + sets.len > s.len) return false;
+                for (sets, 0..) |set, k| if (std.mem.indexOfScalar(u8, set, s[i + k]) == null) return false;
+                return true;
+            }
+        }.f;
+        for (0..6) |_| {
+            const len = r.uintLessThan(usize, hay_buf.len + 1);
+            const hay = hay_buf[0..len];
+            for (hay) |*c| c.* = alphabet[r.uintLessThan(usize, alphabet.len)];
+            var plant: usize = 0; // make real matches likely
+            while (plant < 5 and len >= L) : (plant += 1) {
+                const at = r.uintLessThan(usize, len - L + 1);
+                for (0..L) |k| hay[at + k] = pos_sets[k][r.uintLessThan(usize, pos_sets[k].len)];
+            }
+            // naive leftmost non-overlapping
+            var want: std.ArrayList(core.Span) = .empty;
+            defer want.deinit(a);
+            var i: usize = 0;
+            while (i + L <= len) {
+                if (atSet(pos_sets[0..L], hay, i)) {
+                    try want.append(a, .{ .start = i, .end = i + L });
+                    i += L;
+                } else i += 1;
+            }
+            try std.testing.expectEqual(want.items.len > 0, try re.isMatch(hay));
+            try std.testing.expectEqual(want.items.len, try re.count(hay));
+            const f = try re.find(hay);
+            try std.testing.expectEqual(want.items.len == 0, f == null);
+            if (f) |m| try std.testing.expectEqual(want.items[0].start, m.start);
+            const ms = try re.findAll(a, hay);
+            defer a.free(ms);
+            try std.testing.expectEqual(want.items.len, ms.len);
+            var it = re.iterator(hay);
+            for (want.items, ms) |w, m| {
+                try std.testing.expectEqual(w.start, m.start);
+                try std.testing.expectEqual(w.end, m.end);
+                const im = (try it.next(a)).?;
+                try std.testing.expectEqual(w.start, im.start);
+            }
+            try std.testing.expect((try it.next(a)) == null);
+        }
+    }
+    try std.testing.expect(routed > 100);
+}
+
+test "regex(meta): class_seq captures (fixed group offsets)" {
+    const a = std.testing.allocator;
+    var re = try Regex.compile(a, "([0-9]{4})-([0-9]{2})-([0-9]{2})");
+    defer re.deinit();
+    try std.testing.expectEqual(MetaKind.class_seq, re.kind);
+    const hay = "x 2024-01-1 2025-10-17 and 1999-12-31!";
+    var m = (try re.captures(a, hay)).?;
+    defer m.deinit(a);
+    try std.testing.expectEqualStrings("2025-10-17", m.groups[0].?.slice);
+    try std.testing.expectEqualStrings("2025", m.groups[1].?.slice);
+    try std.testing.expectEqualStrings("10", m.groups[2].?.slice);
+    try std.testing.expectEqualStrings("17", m.groups[3].?.slice);
+    const all = try re.capturesAll(a, hay);
+    defer {
+        for (all) |*x| x.deinit(a);
+        a.free(all);
+    }
+    try std.testing.expectEqual(@as(usize, 2), all.len);
+    try std.testing.expectEqualStrings("31", all[1].groups[3].?.slice);
+    // Scope: anchored, alternation, a pure literal and a variable count stay off it.
+    for ([_][]const u8{ "^[0-9]{4}", "[0-9]{2}|ab", "abc", "[0-9]{2,3}", "[0-9]+:" }) |p| {
+        var x = try Regex.compile(a, p);
+        defer x.deinit();
+        try std.testing.expect(x.kind != .class_seq);
+    }
+}
+
+test "regex(meta): boundary_lits (words / Teddy / Aho-Corasick) == naive \\b(?:…)\\b" {
+    const a = std.testing.allocator;
+    const isW = @import("exec/charclass.zig").isWord;
+    const wbAt = struct {
+        fn f(s: []const u8, pos: usize) bool {
+            return (pos > 0 and isW(s[pos - 1])) != (pos < s.len and isW(s[pos]));
+        }
+    }.f;
+    var prng = std.Random.DefaultPrng.init(0xB0D);
+    const r = prng.random();
+    const word_chars = "abcAB_09";
+    const hay_chars = "abcAB_09 .-\n\xe9";
+    var kw_store: [80][12]u8 = undefined;
+    var kws: [80][]const u8 = undefined;
+    var pat_buf: [2048]u8 = undefined;
+    var hay_buf: [300]u8 = undefined;
+    var n_words: usize = 0;
+    var n_teddy: usize = 0;
+    var n_ac: usize = 0;
+    for (0..120) |iter| {
+        const n = 1 + r.uintLessThan(usize, if (iter % 2 == 0) 80 else 10);
+        const with_punct = iter % 5 == 0; // some keyword has '-' or '.' ⇒ not `.words`
+        for (0..n) |i| {
+            const len = 1 + r.uintLessThan(usize, 12);
+            for (kw_store[i][0..len]) |*c| c.* = word_chars[r.uintLessThan(usize, word_chars.len)];
+            if (with_punct and i == n / 2 and len >= 3) kw_store[i][1] = if (r.boolean()) '-' else '.';
+            kws[i] = kw_store[i][0..len];
+        }
+        var pat: std.ArrayList(u8) = .initBuffer(&pat_buf);
+        pat.appendSliceAssumeCapacity("\\b(?:");
+        for (kws[0..n], 0..) |k, i| {
+            if (i > 0) pat.appendAssumeCapacity('|');
+            for (k) |c| {
+                if (c == '.') pat.appendAssumeCapacity('\\');
+                pat.appendAssumeCapacity(c);
+            }
+        }
+        pat.appendSliceAssumeCapacity(")\\b");
+        var re = try Regex.compile(a, pat.items);
+        defer re.deinit();
+        // (The parser folds single-byte alternatives into a class, which the
+        // recogniser declines — those run elsewhere; correctness is still checked.)
+        if (re.kind == .boundary_lits) switch (re.blits.?.pre) {
+            .words => n_words += 1,
+            .teddy => n_teddy += 1,
+            .none => n_ac += 1,
+        };
+        for (0..5) |_| {
+            const len = r.uintLessThan(usize, hay_buf.len + 1);
+            const hay = hay_buf[0..len];
+            var i: usize = 0;
+            while (i < len) { // keywords, near-misses and separators
+                if (r.uintLessThan(u8, 3) == 0) {
+                    hay[i] = hay_chars[r.uintLessThan(usize, hay_chars.len)];
+                    i += 1;
+                    continue;
+                }
+                for (kws[r.uintLessThan(usize, n)]) |c| {
+                    if (i == len) break;
+                    hay[i] = c;
+                    i += 1;
+                }
+            }
+            // naive leftmost-first, non-overlapping
+            var want: std.ArrayList(core.Span) = .empty;
+            defer want.deinit(a);
+            var p: usize = 0;
+            outer: while (p <= len) {
+                if (wbAt(hay, p)) for (kws[0..n]) |k| {
+                    if (p + k.len <= len and std.mem.eql(u8, hay[p .. p + k.len], k) and wbAt(hay, p + k.len)) {
+                        try want.append(a, .{ .start = p, .end = p + k.len });
+                        p = if (k.len == 0) p + 1 else p + k.len;
+                        continue :outer;
+                    }
+                };
+                p += 1;
+            }
+            try std.testing.expectEqual(want.items.len > 0, try re.isMatch(hay));
+            try std.testing.expectEqual(want.items.len, try re.count(hay));
+            const ms = try re.findAll(a, hay);
+            defer a.free(ms);
+            try std.testing.expectEqual(want.items.len, ms.len);
+            var it = re.iterator(hay);
+            for (want.items, ms) |w, m| {
+                try std.testing.expectEqual(w.start, m.start);
+                try std.testing.expectEqual(w.end, m.end);
+                const im = (try it.next(a)).?;
+                try std.testing.expectEqual(w.end, im.end);
+            }
+        }
+    }
+    // Every strategy was exercised (`.words` needs a byte shuffle for `\w`).
+    try std.testing.expect(n_teddy > 5 and n_ac > 5);
+    try std.testing.expectEqual(class_span.has_shuffle, n_words > 20);
+}
+
+test "regex(meta): case-insensitive literals (folded Teddy) == the same pattern on the DFA" {
+    // Each pattern vs itself wrapped in a capture group (a group keeps it off
+    // the folded-literal routes, so it runs the DFA / old prefilter path) —
+    // same spans by construction. Haystacks mix the cases.
+    const a = std.testing.allocator;
+    const Case = struct { pat: []const u8, ci: bool, kind: ?MetaKind };
+    const cases = [_]Case{
+        .{ .pat = "sherlock holmes", .ci = true, .kind = .literal },
+        .{ .pat = "Sherlock Holmes|John Watson|Irene Adler|Inspector Lestrade|Professor Moriarty", .ci = true, .kind = .literal },
+        .{ .pat = "ab|b|abc", .ci = true, .kind = .literal }, // declared-order tie-break
+        .{ .pat = "a", .ci = true, .kind = .class_span }, // one case pair = a 1-byte class run
+        .{ .pat = "x-1|y_2|z\\.3", .ci = true, .kind = .literal }, // letters + exact bytes
+        .{ .pat = "(?i)hello world", .ci = false, .kind = .literal }, // inline flag
+        .{ .pat = "error: [0-9]+", .ci = true, .kind = .lit_prefix }, // folded prefix + DFA
+        .{ .pat = "abc[0-9]*x", .ci = true, .kind = .lit_prefix },
+        .{ .pat = "a|b|c|d|e|f|g|h|i", .ci = true, .kind = null }, // > MAX_ALTS: other engine
+    };
+    const alphabet = "abcxyzhelorwdsHOLMESWATSONabc ABC-_.123:\n";
+    var prng = std.Random.DefaultPrng.init(0xCA5E);
+    const r = prng.random();
+    var buf: [400]u8 = undefined;
+    var pbuf: [200]u8 = undefined;
+    for (cases) |c| {
+        var re = try Regex.compileWithFlags(a, c.pat, .{ .case_insensitive = c.ci });
+        defer re.deinit();
+        const wrapped = if (std.mem.startsWith(u8, c.pat, "(?i)"))
+            try std.fmt.bufPrint(&pbuf, "(?i)({s})", .{c.pat[4..]})
+        else
+            try std.fmt.bufPrint(&pbuf, "({s})", .{c.pat});
+        var ref = try Regex.compileWithFlags(a, wrapped, .{ .case_insensitive = c.ci });
+        defer ref.deinit();
+        if (c.kind) |k| try std.testing.expectEqual(k, re.kind);
+        try std.testing.expect(re.teddy == null or ref.teddy == null or !ref.teddy.?.folded);
+        for (0..80) |iter| {
+            const len = if (iter < 4) iter else r.uintLessThan(usize, buf.len + 1);
+            const hay = buf[0..len];
+            var i: usize = 0;
+            while (i < len) { // fragments of the literals in random case, plus noise
+                if (r.uintLessThan(u8, 3) == 0) {
+                    const lits = [_][]const u8{ "sherlock holmes", "john watson", "error: 42", "abc12x", "hello world", "x-1", "Z.3", "ab" };
+                    for (lits[r.uintLessThan(usize, lits.len)]) |ch| {
+                        if (i == len) break;
+                        hay[i] = if (std.ascii.isAlphabetic(ch) and r.boolean()) ch ^ 0x20 else ch;
+                        i += 1;
+                    }
+                } else {
+                    hay[i] = alphabet[r.uintLessThan(usize, alphabet.len)];
+                    i += 1;
+                }
+            }
+            try std.testing.expectEqual(try ref.isMatch(hay), try re.isMatch(hay));
+            try std.testing.expectEqual(try ref.count(hay), try re.count(hay));
+            const mr = try ref.findAll(a, hay);
+            defer a.free(mr);
+            const mc = try re.findAll(a, hay);
+            defer a.free(mc);
+            try std.testing.expectEqual(mr.len, mc.len);
+            for (mr, mc) |x, y| {
+                try std.testing.expectEqual(x.start, y.start);
+                try std.testing.expectEqual(x.end, y.end);
+            }
+            if (iter < 10) for (0..len + 1) |pos| {
+                const xr = try ref.findFrom(hay, pos);
+                const xc = try re.findFrom(hay, pos);
+                try std.testing.expectEqual(xr == null, xc == null);
+                if (xr) |m| try std.testing.expectEqual(m.end, xc.?.end);
+            };
+        }
+    }
+}
 
 test "regex(meta): count == findAll().len across engine kinds" {
     const a = std.testing.allocator;
