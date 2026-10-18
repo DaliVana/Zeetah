@@ -2011,7 +2011,10 @@ test "regex(meta): class_span == DFA on language-equivalent patterns" {
         defer cs.deinit();
         var ref = try Regex.compile(a, p.ref);
         defer ref.deinit();
-        try std.testing.expectEqual(MetaKind.class_span, cs.kind);
+        // Without a byte shuffle (portable SIMD, e.g. wasm32) only the 1-2
+        // range shapes build; nibble/word shapes route elsewhere (dfa,
+        // lazy_dfa). The API-equivalence checks below still apply.
+        if (class_span.has_shuffle) try std.testing.expectEqual(MetaKind.class_span, cs.kind);
         try std.testing.expect(ref.kind != .class_span);
         for (0..120) |iter| {
             const len = if (iter < 8) iter else r.uintLessThan(usize, buf.len + 1);

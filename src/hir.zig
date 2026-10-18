@@ -266,10 +266,13 @@ pub fn Hir(comptime cap: ?usize) type {
 /// `relax_irregular` (comptime):
 ///   * `false` — faithful clone of every tag (the old `split_alt.cloneExact`
 ///     / `delegate.copyReg`).
-///   * `true`  — `look`/`look_around`/`backref` collapse to `empty` and
-///     `atomic` drops its cut (keeping the inner subtree), a sound
-///     *language-enlarging* relaxation (the old `seek.lowerApprox`): used to
-///     derive a regular over-approximation.
+///   * `true`  — the zero-width `look`/`look_around` collapse to `empty`, a
+///     `backref` to `[\x00-\xFF]*`, and `atomic` drops its cut (keeping the
+///     inner subtree): a sound *language-enlarging* relaxation (the old
+///     `seek.lowerApprox`) used to derive a regular over-approximation. A
+///     backref CONSUMES the referenced group's text, so `empty` would shrink
+///     the language (`(b)\1d` would approximate to `bd` and the seek would
+///     skip the real start of `bbd`); any-byte-string is the sound stand-in.
 /// One definition replaces three near-identical recursive copies.
 pub fn cloneSubtree(
     comptime dcap: ?usize,
@@ -283,7 +286,12 @@ pub fn cloneSubtree(
     const nd = src.node(ref);
     switch (nd.tag) {
         .look, .look_around, .backref => {
-            if (relax_irregular) return dst.addNode(a, .{ .tag = .empty });
+            if (relax_irregular) {
+                if (nd.tag != .backref) return dst.addNode(a, .{ .tag = .empty });
+                const any = try dst.addSet(a, @splat(0xFF));
+                const byte = try dst.addNode(a, .{ .tag = .set, .set_idx = any });
+                return dst.addNode(a, .{ .tag = .star, .a = byte, .greedy = true });
+            }
             return switch (nd.tag) {
                 // look / backref are leaves (set_idx = LookKind / group).
                 .look, .backref => dst.addNode(a, .{ .tag = nd.tag, .set_idx = nd.set_idx, .fold = nd.fold }),

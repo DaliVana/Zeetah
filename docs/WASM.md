@@ -159,8 +159,8 @@ You are the one who designs and owns this ABI — Zeetah does not provide it.
 
 ### Writing an export shim
 
-This is a minimal, realistic sketch. It exports a fixed-buffer allocator for the
-JS side to write input bytes into, plus a stateless `isMatch` that compiles the
+This is a minimal, realistic sketch. It exports a fixed I/O buffer for the JS
+side to write input bytes into, plus a stateless `isMatch` that compiles the
 pattern, runs the match, and frees it in one call. Adapt it to your needs.
 
 ```zig
@@ -169,9 +169,15 @@ const std = @import("std");
 const zeetah = @import("zeetah");
 const Regex = zeetah.Regex;
 
-// A single linear-memory arena the JS host writes into and reads from.
-var buffer: [1 << 20]u8 = undefined; // 1 MiB scratch
-var fba = std.heap.FixedBufferAllocator.init(&buffer);
+// Host I/O region: the JS side writes pattern/input bytes here (and reads any
+// results back). 64 KiB is plenty for a stateless isMatch.
+var buffer: [64 * 1024]u8 = undefined;
+
+// Separate arena for Regex.compile's own allocations, reset per call. It must
+// NOT alias `buffer`: the compiler would allocate straight over the bytes the
+// host just wrote.
+var heap: [1 << 20]u8 = undefined; // 1 MiB
+var fba = std.heap.FixedBufferAllocator.init(&heap);
 
 /// JS calls this to learn where to write bytes; it then copies UTF-8 into
 /// `memory` at the returned offset (up to `buffer.len`).
@@ -327,7 +333,10 @@ above.
   shim you choose the allocator — the example uses a fixed-size
   `FixedBufferAllocator` (reset per call, so nothing leaks across calls). You can
   instead use a `DebugAllocator` or wrap the host's memory growth, but a
-  reset-per-call arena is the simplest correct choice for a stateless ABI.
+  reset-per-call arena is the simplest correct choice for a stateless ABI. Keep
+  the arena separate from the region the host writes into: `Regex.compile`
+  allocates immediately, and an arena that aliases the host buffer would
+  overwrite the pattern/input bytes mid-call.
 - **No hidden allocation.** Every Zeetah heap allocation goes through the
   allocator you pass. On the comptime `Pattern` (ideal for Wasm), **every
   one-match verb is allocation-free** — `isMatch` / `find` / `count` / `startsWith`

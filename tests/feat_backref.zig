@@ -116,3 +116,40 @@ test "backref: (?i) backreferences match the group text in any case" {
     try ciBackref("(\\b[A-Za-z]+\\b) \\1", "The the", null);
     try ciBackref("(?i:(a))\\1", "aA", null); // (?i) scoped to the group only
 }
+
+// A required literal AFTER a backreference: the seek prefilter's regular
+// over-approximation used to relax `\1` to `ε`, which SHRINKS the language
+// (`(b)\1d` became `bd`), so the seek skipped the real match start and these
+// patterns silently found nothing. `\1` now relaxes to `[\x00-\xFF]*`. Both
+// front-ends (runtime `Regex`, comptime `Pattern`) share the relaxation.
+fn spanBoth(comptime p: []const u8, in: []const u8, want: ?[]const u8) !void {
+    const a = std.testing.allocator;
+    var rx = try Regex.compile(a, p);
+    defer rx.deinit();
+    var m = try rx.find(in);
+    defer if (m) |*x| x.deinit(a);
+    try std.testing.expectEqual(want == null, m == null);
+    if (want) |w| try std.testing.expectEqualStrings(w, m.?.slice);
+    const P = regex.Pattern(p, .{});
+    const pm = P.find(in);
+    try std.testing.expectEqual(want == null, pm == null);
+    if (want) |w| try std.testing.expectEqualStrings(w, in[pm.?.start..pm.?.end]);
+}
+
+test "backref: a required literal after the backreference still matches" {
+    try spanBoth("(b)\\1d", "xbbd", "bbd");
+    try spanBoth("(b)\\1[d]", "bbd", "bbd");
+    try spanBoth("(?:(b)\\1)d", "bbd", "bbd");
+    try spanBoth("a(b)c\\1d", "zabcbd", "abcbd");
+    try spanBoth("<(\\w+)>[a-z]*</\\1>", "<b>bold</b>", "<b>bold</b>");
+    try spanBoth("<(\\w+)[^>]*>(.*?)</\\1>", "<p class=\"x\">hi <b>b</b></p>", "<p class=\"x\">hi <b>b</b></p>");
+    try spanBoth("(['\"])\\w+\\1:", "say 'key': 1", "'key':");
+    // Controls: the backreference constraint itself is still enforced.
+    try spanBoth("(b)\\1d", "bcd bd", null);
+    try spanBoth("<(\\w+)>[a-z]*</\\1>", "<b>bold</i>", null);
+
+    const a = std.testing.allocator;
+    var rx = try Regex.compile(a, "(b)\\1d");
+    defer rx.deinit();
+    try std.testing.expectEqual(@as(usize, 2), try rx.count("bbdbbd"));
+}
