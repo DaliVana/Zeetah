@@ -37,8 +37,9 @@ functions.
 
 So a "WASM build" of Zeetah is really *your* Wasm program with Zeetah linked in
 as a dependency. The library itself is allocator-driven and OS-agnostic, so it
-compiles cleanly to `wasm32-freestanding` and `wasm32-wasi` with no special
-configuration.
+compiles cleanly to `wasm32-freestanding` and `wasm32-wasi`. The one setting to
+be aware of is the **linear-memory stack size** on `wasm32-freestanding` — see
+[Stack size](#stack-size) below.
 
 ---
 
@@ -84,6 +85,10 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // `Regex.compile` builds its DFA tables on the stack and needs ~1.5 MiB.
+    // Zig's wasm32-freestanding default is 1 MiB (wasm32-wasi defaults to
+    // 16 MiB, so this line is only needed for the export-shim path).
+    exe.stack_size = 4 * 1024 * 1024;
     b.installArtifact(exe);
 }
 ```
@@ -214,6 +219,7 @@ zig build-exe src/shim.zig \
     -target wasm32-freestanding \
     -O ReleaseSmall \
     -fno-entry \
+    --stack 4194304 \
     --export=bufferPtr \
     --export=bufferLen \
     --export=isMatch \
@@ -223,8 +229,10 @@ zig build-exe src/shim.zig \
 ```
 
 (`-fno-entry` because there is no `main`; `--export=` makes each `export fn`
-visible to the host. You can wire the same flags into a `build.zig` executable
-via `exe.entry = .disabled;` and `exe.rdynamic = true;`.)
+visible to the host; `--stack` raises the 1 MiB freestanding default, which
+`Regex.compile` overflows — see [Stack size](#stack-size). You can wire the same
+flags into a `build.zig` executable via `exe.entry = .disabled;`,
+`exe.rdynamic = true;` and `exe.stack_size = 4 * 1024 * 1024;`.)
 
 ### Calling it from JavaScript
 
@@ -262,6 +270,26 @@ console.log('matched:', result === 1);
 > submatch slices, `replace`/`replaceAll` expand `$`-references in the template
 > (`$0`/`$&`, `$1`..`$N`, `${name}`), and `replaceLiteral`/`replaceAllLiteral`
 > insert the replacement verbatim (no `$`-substitution).
+
+---
+
+## Stack size
+
+The runtime compiler (`Regex.compile`) builds its DFA tables in fixed-size
+stack arrays — the same code runs at comptime for `Pattern`, so it cannot take an
+allocator. Peak stack use during a compile is roughly **1–1.5 MiB**.
+
+- **`wasm32-wasi`**: Zig's default stack is 16 MiB. Nothing to do.
+- **`wasm32-freestanding`**: Zig's default stack is **1 MiB**, which is not
+  enough. Zig places the stack at the bottom of linear memory, so overflowing it
+  does not corrupt data — the module **traps** with `RuntimeError: memory access
+  out of bounds` on the first `Regex.compile`. Set `exe.stack_size =
+  4 * 1024 * 1024;` in `build.zig` (or pass `--stack 4194304` to
+  `zig build-exe`); 4 MiB costs 48 extra 64 KiB pages of initial memory and
+  leaves headroom for your own frames.
+
+Matching itself (`isMatch` / `find` / `count` on a compiled `Regex`, and every
+verb on a comptime `Pattern`) uses a few KiB of stack and is unaffected.
 
 ---
 

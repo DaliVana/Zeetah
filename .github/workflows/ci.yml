@@ -46,6 +46,9 @@ jobs:
           - x86_64-macos
           - aarch64-macos
           - x86_64-windows
+          # 32-bit usize: catches shift-width / @intCast assumptions that only
+          # hold on 64-bit hosts (see docs/WASM.md).
+          - wasm32-wasi
     steps:
       - uses: actions/checkout@v6
 

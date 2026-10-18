@@ -116,6 +116,8 @@ test "cache: pool reuse round-trips a Cache" {
 }
 
 test "cache: pool is safe under thread contention" {
+    // Single-threaded targets (wasm32) cannot spawn threads at all.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
     const a = std.testing.allocator;
     var pool = Pool(Cache).init(a);
     defer pool.deinit();
