@@ -11,6 +11,10 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      # Optional: add a PANTRY_TOKEN repository secret to also publish to the
+      # Pantry registry (registry.pantry.dev). Without it that step is skipped.
+      PANTRY_TOKEN: ${{ secrets.PANTRY_TOKEN }}
     steps:
       - uses: actions/checkout@v6
 
@@ -20,9 +24,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish to Pantry
+        if: env.PANTRY_TOKEN != ''
         uses: home-lang/pantry/packages/action@main
         with:
           publish: zig
           install: 'false'
-        env:
-          PANTRY_TOKEN: ${{ secrets.PANTRY_TOKEN }}
