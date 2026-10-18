@@ -139,8 +139,15 @@ pub fn findAll(d: anytype, allocator: std.mem.Allocator, input: []const u8) ![]S
 /// not per search). `null` if the seq cannot be represented.
 pub fn buildLiteral(seq: *const Seq) ?pf.Teddy {
     var bufs: [seq_extract.MAX_ALTS][]const u8 = undefined;
+    var folds: [seq_extract.MAX_ALTS][]const u8 = undefined;
     var n: usize = 0;
-    while (n < seq.n) : (n += 1) bufs[n] = seq.lits[n][0..seq.lens[n]];
+    while (n < seq.n) : (n += 1) {
+        bufs[n] = seq.lits[n][0..seq.lens[n]];
+        folds[n] = seq.fold[n][0..seq.lens[n]];
+    }
+    // A case-folded Seq (`seq_extract.foldLiterals`) bakes its fold masks into
+    // the Teddy nibble tables and verify; a plain one stays exact-byte.
+    if (seq.folded) return pf.Teddy.buildFolded(bufs[0..seq.n], folds[0..seq.n]);
     return pf.Teddy.build(bufs[0..seq.n]);
 }
 

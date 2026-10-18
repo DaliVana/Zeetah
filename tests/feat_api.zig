@@ -65,12 +65,14 @@ test "findFrom: positional resume in absolute coordinates; find == findFrom(.,0)
 }
 
 test "Pattern on_oversize = .allow_oversized bakes a DFA over the soft budget" {
-    // `\d\dx` needs several DFA states, so a `max_dfa_states` of 1 puts it over
+    // `\d\d+x` needs several DFA states, so a `max_dfa_states` of 1 puts it over
     // the soft budget. `.compile_error` would reject it at compile time (and so
     // cannot be exercised from a normal test); `.allow_oversized` bakes the
     // larger table anyway — this file compiling at all is the proof, and the
     // match below confirms the baked table is correct.
-    const P = regex.Pattern("\\d\\dx", .{ .max_dfa_states = 1, .on_oversize = .allow_oversized });
+    // (`\d\dx` would now route to the DFA-free `.class_seq` arm — a fixed
+    // class sequence — so the `+` keeps this on the DFA the option governs.)
+    const P = regex.Pattern("\\d\\d+x", .{ .max_dfa_states = 1, .on_oversize = .allow_oversized });
     comptime std.debug.assert(P.has_dfa);
     try std.testing.expect(P.isMatch("..42x.."));
     const m = P.find("ab12x").?;
@@ -235,7 +237,8 @@ const cr_inputs = [_][]const u8{
 fn crAgree(comptime p: []const u8) !void {
     const a = std.testing.allocator;
     const P = regex.Pattern(p, .{});
-    comptime std.debug.assert(P.has_dfa);
+    // Baked (not rejected): a DFA, or one of the DFA-free class-run arms.
+    comptime std.debug.assert(P.has_dfa or @hasDecl(P, "class_span_mode") or @hasDecl(P, "class_seq_len"));
     var rx = try Regex.compile(a, p);
     defer rx.deinit();
     for (cr_inputs) |in| {
@@ -644,6 +647,95 @@ test "comptime Pattern <-> runtime Regex agree: boundary-literals (Aho-Corasick)
     // leftmost-first source-order tie-break and shared-prefix overlap.
     try blAgree("\\b(?:do|double|doc)\\b", "a do double doc done do dom");
     try blAgree("\\b(?:get|getter|set)\\b", "set getter get getty");
+}
+
+// The comptime `.class_span` / `.class_seq` arms: the same shared recognisers
+// (`class_span.RunSpec`, `class_seq.ClassSeq`) as the runtime engines, so the
+// two routers pick the same engine. `class_span_mode` / `class_seq_len` are the
+// engagement proofs; values are checked against the runtime `Regex` across every
+// whole-match verb on haystacks with runs crossing the 64-byte blocks.
+fn runArmAgree(comptime p: []const u8, comptime proof: []const u8, in: []const u8) !void {
+    const a = std.testing.allocator;
+    const P = regex.Pattern(p, .{});
+    // Without a byte shuffle, multi-range classes (`\w`) cannot be classified
+    // and keep the DFA — the values must still agree.
+    if (regex.simd.has_shuffle) comptime std.debug.assert(!P.has_dfa and @hasDecl(P, proof));
+    var rx = try Regex.compile(a, p);
+    defer rx.deinit();
+    try std.testing.expectEqual(try rx.isMatch(in), P.isMatch(in));
+    try std.testing.expectEqual(try rx.count(in), P.count(in));
+    const rm = try rx.findAll(a, in);
+    defer a.free(rm);
+    const pm = try P.findAll(a, in);
+    defer a.free(pm);
+    try std.testing.expectEqual(rm.len, pm.len);
+    var it = P.iterator(in);
+    for (rm, pm) |x, y| {
+        try std.testing.expectEqual(x.start, y.start);
+        try std.testing.expectEqual(x.end, y.end);
+        const im = it.next().?;
+        try std.testing.expectEqual(x.start, im.start);
+    }
+    try std.testing.expect(it.next() == null);
+    for (0..in.len + 1) |pos| { // mid-run resumes
+        const x = try rx.findFrom(in, pos);
+        const y = P.nextSpanFrom(in, pos);
+        try std.testing.expectEqual(x == null, y == null);
+        if (x) |m| try std.testing.expectEqual(m.end, y.?.end);
+    }
+}
+
+test "comptime Pattern <-> runtime Regex agree: class_span / class_seq tiers" {
+    const words = "the quick_brown fox 2024 x " ++ rep("abcdefghijklmnopqrstuvwxyz0123456789", 3) ++ " a1 bb ccc dddd é ok";
+    inline for (.{ "[0-9]+", "\\w+", "[a-z]*", "[0-9]{2,}", "[a-z]{2,3}", "\\w{4}", "\\b\\w+\\b", "\\b[a-z]+\\b", "\\b\\w{3,5}\\b", "\\b[0-9A-Za-z_]{12,}\\b" }) |p| {
+        try runArmAgree(p, "class_span_mode", words);
+        try runArmAgree(p, "class_span_mode", "");
+    }
+    const logs = "at 12:34:56 on 2025-10-17, id 550e8400-e29b-41d4-a716-446655440000, mac 00:1A:2b:3C:4d:5E, 12:34:56:78";
+    inline for (.{ "[0-9]{2}:[0-9]{2}:[0-9]{2}", "[0-9]{4}-[0-9]{2}-[0-9]{2}", "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", "([0-9]{4})-([0-9]{2})" }) |p| {
+        try runArmAgree(p, "class_seq_len", logs);
+    }
+    // Captures on the comptime `.class_seq` arm (fixed group offsets).
+    const D = regex.Pattern("([0-9]{4})-([0-9]{2})-([0-9]{2})", .{});
+    const c = D.captures("x 2025-10-17 y").?;
+    try std.testing.expectEqualStrings("2025", c.get(1).?.slice);
+    try std.testing.expectEqualStrings("17", c.get(3).?.slice);
+}
+
+// Case-insensitive literals: the planner's folded `.literal` / `.lit_prefix`
+// routes are shared, so the comptime `Pattern` bakes the same case-folded Teddy
+// the runtime builds (`literal_folded` / `prefilter_folded` prove it).
+fn ciAgree(comptime p: []const u8, comptime proof: []const u8, in: []const u8) !void {
+    const a = std.testing.allocator;
+    const P = regex.Pattern(p, .{ .case_insensitive = true });
+    comptime std.debug.assert(@field(P, proof));
+    var rx = try Regex.compileWithFlags(a, p, .{ .case_insensitive = true });
+    defer rx.deinit();
+    try std.testing.expectEqual(try rx.isMatch(in), P.isMatch(in));
+    try std.testing.expectEqual(try rx.count(in), P.count(in));
+    const rm = try rx.findAll(a, in);
+    defer a.free(rm);
+    const pm = try P.findAll(a, in);
+    defer a.free(pm);
+    try std.testing.expectEqual(rm.len, pm.len);
+    for (rm, pm) |x, y| {
+        try std.testing.expectEqual(x.start, y.start);
+        try std.testing.expectEqual(x.end, y.end);
+    }
+    for (0..in.len + 1) |pos| {
+        const x = try rx.findFrom(in, pos);
+        const y = P.nextSpanFrom(in, pos);
+        try std.testing.expectEqual(x == null, y == null);
+        if (x) |m| try std.testing.expectEqual(m.end, y.?.end);
+    }
+}
+
+test "comptime Pattern <-> runtime Regex agree: case-insensitive literal routes" {
+    const in = "SHERLOCK holmes met sherlock Holmes; John WATSON, irene adler. ERROR: 42 Error: 7 error:x";
+    try ciAgree("sherlock holmes", "literal_folded", in);
+    try ciAgree("Sherlock Holmes|John Watson|Irene Adler|Inspector Lestrade|Professor Moriarty", "literal_folded", in);
+    try ciAgree("error: [0-9]+", "prefilter_folded", in);
+    try ciAgree("sherlock holmes", "literal_folded", "");
 }
 
 test "comptime backtracker inherits the ReDoS step budget over a longer input" {

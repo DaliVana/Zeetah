@@ -66,6 +66,23 @@ pub fn plan(p: Properties, flags: Flags) Strategy {
         return .{ .literal = p.prefix };
     }
 
+    // §5.2 — Case-folded literal(s): `(?i)sherlock holmes`, `(?i)sherlock|watson`,
+    // or a folded leading run (`(?i)error: \d+`). The exact extractors above
+    // cannot represent letters under `(?i)` (each is a 2-byte set, and the
+    // cross-product of k letters is 2^k alternatives); `fold` keeps each as one
+    // alternative plus a fold mask that Teddy matches exactly
+    // (`Teddy.buildFolded`). Taken under the case-insensitive flag, or when it
+    // beats the plain prefix (an inline `(?i)` or a `[Ss]` pair the
+    // cross-product truncated). An exact set is the whole match (Teddy verify
+    // tries alternatives in declared order — leftmost-first, as `.literal`);
+    // a leading run prefilters the anchored DFA like any literal prefix.
+    if (!p.fold.isEmpty() and !p.anchored_start and !p.anchored_end and
+        (flags.case_insensitive or p.prefix.minLen() < p.fold.minLen()))
+    {
+        if (p.fold.exact) return .{ .literal = p.fold };
+        return .{ .prefix_prefilter = .{ .seq = p.fold, .first_byte_set = p.first_byte_set } };
+    }
+
     // §5.4 — A selective trailing literal but no literal prefix: the suffix
     // is a sound fast-negative and drives the reverse DFA. Prefer it over a
     // broad first-byte prefilter.
@@ -191,10 +208,21 @@ test "planner(ci): letter-free selective suffix -> .reverse_suffix" {
     try std.testing.expectEqualStrings("9999", s.reverse_suffix.alt(0));
 }
 
-test "planner(ci): letter-bearing literal stays off the fast paths" {
-    // `hello` folds to 2-bit sets ⇒ no Seq ⇒ folded first-byte-set prefilter.
-    try std.testing.expect(comptime planForCi("hello") == .prefix_prefilter);
-    try std.testing.expect(comptime resolve(planForCi("hello"), false) == .dfa);
+test "planner(ci): letter-bearing literals take the case-folded literal routes" {
+    // `hello` folds to 2-bit sets: the exact extractors drop it, `fold` keeps
+    // it as ONE folded alternative ⇒ the Teddy `.literal` route.
+    const s = comptime planForCi("hello");
+    try std.testing.expect(s == .literal);
+    try std.testing.expect(s.literal.folded and s.literal.exact);
+    try std.testing.expectEqualStrings("hello", s.literal.alt(0));
+    // A folded alternation stays exact (declared order); ≤ MAX_ALTS branches.
+    const a = comptime planForCi("sherlock|watson");
+    try std.testing.expect(a == .literal and a.literal.n == 2 and a.literal.folded);
+    // A folded leading run ⇒ prefix_prefilter → `.lit_prefix` (≥ 3 bytes).
+    const p = comptime planForCi("error: [0-9]+");
+    try std.testing.expect(p == .prefix_prefilter and p.prefix_prefilter.seq.folded);
+    try std.testing.expectEqualStrings("error: ", p.prefix_prefilter.seq.alt(0));
+    try std.testing.expect(comptime resolve(p, false) == .lit_prefix);
     // selective letter suffix must NOT become a (case-sensitive) reverse_suffix
     try std.testing.expect(comptime planForCi("[A-Z].*foobar") == .prefix_prefilter);
 }

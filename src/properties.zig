@@ -31,6 +31,11 @@ pub const Properties = struct {
     prefix: Seq = .{},
     /// Trailing literal sequence.
     suffix: Seq = .{},
+    /// Case-folded literal(s) (`seq_extract.foldLiterals`): the whole pattern
+    /// (`exact`) or its leading run, with letters kept as case pairs — the
+    /// `(?i)` peer of `prefix`, which cannot represent them. Empty when the
+    /// pattern has no case pair.
+    fold: Seq = .{},
     /// The whole pattern is exactly one fixed literal string.
     is_exact_literal: bool = false,
     /// A lazy quantifier was used (carried from the parser).
@@ -541,6 +546,7 @@ pub fn analyze(comptime cap: ?usize, h: *const hir.Hir(cap)) Properties {
 
     p.prefix = seq_extract.prefix(cap, h);
     p.suffix = seq_extract.suffix(cap, h);
+    p.fold = seq_extract.foldLiterals(cap, h);
     p.is_exact_literal = p.prefix.n == 1 and p.prefix.exact and
         !p.anchored_start and !p.anchored_end;
 

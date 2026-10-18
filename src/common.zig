@@ -41,6 +41,12 @@ pub inline fn hasBit(set: *const [32]u8, c: u8) bool {
     return (set[c >> 3] & (@as(u8, 1) << @as(u3, @intCast(c & 7)))) != 0;
 }
 
+/// Canonical 256-bit-set insertion — the write-side counterpart of `hasBit`,
+/// so producers and consumers of a `[32]u8` set share one bit layout.
+pub inline fn setBit(set: *[32]u8, c: u8) void {
+    set[c >> 3] |= (@as(u8, 1) << @as(u3, @intCast(c & 7)));
+}
+
 /// Character class - represents a set of characters
 pub const CharClass = struct {
     ranges: []const CharRange,

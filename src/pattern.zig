@@ -25,6 +25,7 @@ const line_dfa = @import("exec/line_dfa.zig");
 const compiled_bt = @import("exec/compiled_bt.zig");
 const seek_mod = @import("exec/seek.zig");
 const class_span = @import("exec/class_span.zig");
+const class_seq = @import("exec/class_seq.zig");
 const dupword = @import("exec/dupword.zig");
 
 const Match = @import("match.zig").Match;
@@ -32,6 +33,11 @@ const Group = @import("match.zig").Group;
 const Captures = @import("match.zig").Captures;
 const wholeMatch = @import("match.zig").wholeMatch;
 const advanceEmpty = @import("match.zig").advanceEmpty;
+
+/// `wholeMatch` as a plain function value, for the executors' `appendAll`.
+fn spanMatch(input: []const u8, start: usize, end: usize) Match {
+    return wholeMatch(input, start, end);
+}
 
 /// A comptime-known placeholder `Allocator` for the seek `Plan` fields on the
 /// **comptime** path. Those plans bake their DFAs into `.rodata` and
@@ -286,7 +292,7 @@ const Outcome = enum { ok, unsupported, exploded, invalid };
 /// §6/(c) monomorphization: which planner strategy the baked matcher emits.
 /// `.literal` skips the DFA table entirely (Teddy only); the other three bake
 /// the DFA and differ only in the per-position prefilter wrapped around it.
-const Strat = enum { literal, reverse_suffix, lit_prefix, dfa, backtrack, edge_look, boundary_lits, line_dfa, rev_end, dup_word };
+const Strat = enum { literal, reverse_suffix, lit_prefix, dfa, backtrack, edge_look, boundary_lits, line_dfa, rev_end, dup_word, class_span, class_seq };
 
 /// Search mode for the baked-DFA matcher (everything except `.literal`). A
 /// comptime constant, so the `switch (mode)` in each method folds to the one
@@ -325,6 +331,12 @@ const Built = struct {
     /// bitmaps + group id). Default is the never-matching zero descriptor for
     /// every other strat (it is read only on the `.dup_word` arm).
     dw: dupword.DupWord = .{ .class = @splat(0), .sep = @splat(0), .group = 0 },
+    /// `.class_span` arm: the run shape (`S+`, `S{m,n}`, `\bS+\b`, …) — the
+    /// same `class_span.RunSpec` the runtime `.class_span` executor runs.
+    cs: class_span.RunSpec = .{},
+    /// `.class_seq` arm: the fixed-length class-sequence matcher (runtime peer
+    /// `.class_seq`). Read only on that arm.
+    cseq: class_seq.ClassSeq = undefined,
     /// `.backtrack` arm: a regular over-approximation DFA used as the seek
     /// prefilter (skip proven-dead prefixes). Built at comptime by the SAME
     /// zero-allocator `full_dfa.compute` the regular arm uses, over a relaxed
@@ -560,6 +572,24 @@ fn tryDupWordBuilt(h: *hir.Hir(HIR_CAP), ng: usize, gnames: GroupNames) ?Built {
     return null;
 }
 
+/// `.class_span`: the whole pattern is one repeated byte class (`S+`, `S*`,
+/// `S{m,}`, `S{m,n}`, `\bS{m,n}\b`, no groups) — the shared
+/// `class_span.RunSpec` recogniser, so this and the runtime `.class_span` arm
+/// route identically. Needs no NFA/DFA; checked first (it is also the right
+/// engine for the `\b…\b` forms, which would otherwise take the backtracker).
+fn tryClassSpanBuilt(h: *hir.Hir(HIR_CAP), gnames: GroupNames) ?Built {
+    const spec = class_span.RunSpec.recognize(h) orelse return null;
+    return .{ .dfa = full_dfa.emptyDfa256(.ok), .outcome = .ok, .strat = .class_span, .hir = h.*, .n_groups = 0, .gnames = gnames, .cs = spec };
+}
+
+/// `.class_seq`: the whole pattern is a fixed-length sequence of byte classes
+/// (`[0-9]{2}:[0-9]{2}`, groups allowed) — the shared `ClassSeq.fromHir`, as the
+/// runtime `.class_seq` arm. Captures go through `CaptureSupport` (one-pass).
+fn tryClassSeqBuilt(h: *hir.Hir(HIR_CAP), ng: usize, gnames: GroupNames) ?Built {
+    const seq = class_seq.ClassSeq.fromHir(h) orelse return null;
+    return .{ .dfa = full_dfa.emptyDfa256(.ok), .outcome = .ok, .strat = .class_seq, .hir = h.*, .n_groups = ng, .gnames = gnames, .cseq = seq };
+}
+
 /// `.backtrack` fallback for `requires_backtracking or has_look` patterns the
 /// DFA path can't represent. Bakes a regular over-approximation seek DFA
 /// (`overApproxDfa`) when available so the backtracker `memchr`s/DFA-skips
@@ -686,6 +716,10 @@ fn buildAll(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) 
     // comptime path folds line-DFA / rev-end / has-look into these ordered arms
     // where the runtime keeps a separate `.bt_look` engine — see the `has_look`
     // note on `buildBacktrackBuilt`.)
+    if (ng == 0) if (tryClassSpanBuilt(&h, gnames)) |b| return b;
+
+    if (tryClassSeqBuilt(&h, ng, gnames)) |b| return b;
+
     if (ng == 0) if (tryEdgeLookBuilt(&h, ng, gnames)) |b| return b;
 
     if (ng == 0) if (tryBoundaryLitsBuilt(&h, ng, gnames)) |b| return b;
@@ -1377,6 +1411,98 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
         };
     }
 
+    // Class-run tier (comptime peer of runtime `.class_span`): the baked
+    // `RunSpec` reads every match off 64-byte block masks — `count` is a
+    // popcount of run starts for the plain `S+` shape. No DFA table.
+    if (built.strat == .class_span) {
+        const spec = built.cs;
+        return struct {
+            pub const has_dfa = false;
+            /// Engagement proof: the run shape this arm bakes.
+            pub const class_span_mode = spec.mode;
+            const sp = spec;
+
+            pub fn nextSpanFrom(input: []const u8, from: usize) ?search.Span {
+                const r = sp.nextMatch(input, from) orelse return null;
+                return .{ .start = r.start, .end = r.end };
+            }
+
+            const V = WholeMatchVerbs(nextSpanFrom);
+            pub const Iterator = V.Iterator;
+            pub const iterator = V.iterator;
+            pub const startsWith = V.startsWith;
+            pub const SplitIterator = V.SplitIterator;
+            pub const splitIterator = V.splitIterator;
+            pub const find = V.find;
+            pub fn isMatch(input: []const u8) bool {
+                return sp.isMatch(input);
+            }
+            pub fn count(input: []const u8) usize {
+                return sp.count(input);
+            }
+            pub fn findAll(allocator: std.mem.Allocator, input: []const u8) ![]Match {
+                var list: std.ArrayList(Match) = .empty;
+                errdefer list.deinit(allocator);
+                try sp.appendAll(Match, allocator, &list, input, spanMatch);
+                return list.toOwnedSlice(allocator);
+            }
+
+            const C = CaptureSupport(built);
+            pub const Captures = C.Caps;
+            pub const captures = C.captures;
+            pub const capturesFrom = C.capturesFrom;
+            pub const capturesAll = C.capturesAll;
+            pub const CapturesIterator = C.CapturesIterator;
+            pub const capturesIterator = C.capturesIterator;
+        };
+    }
+
+    // Fixed-length class-sequence tier (comptime peer of runtime `.class_seq`):
+    // shifted per-class block masks give every match end of a block at once.
+    if (built.strat == .class_seq) {
+        const cq = built.cseq;
+        return struct {
+            pub const has_dfa = false;
+            /// Engagement proof: the fixed match length.
+            pub const class_seq_len: usize = cq.len;
+            const q = cq;
+
+            pub fn nextSpanFrom(input: []const u8, from: usize) ?search.Span {
+                const r = q.nextFrom(input, from) orelse return null;
+                return .{ .start = r.start, .end = r.end };
+            }
+
+            const V = WholeMatchVerbs(nextSpanFrom);
+            pub const Iterator = V.Iterator;
+            pub const iterator = V.iterator;
+            pub const startsWith = V.startsWith;
+            pub const SplitIterator = V.SplitIterator;
+            pub const splitIterator = V.splitIterator;
+            pub const find = V.find;
+            pub fn isMatch(input: []const u8) bool {
+                return q.isMatch(input);
+            }
+            pub fn count(input: []const u8) usize {
+                return q.count(input);
+            }
+            pub fn findAll(allocator: std.mem.Allocator, input: []const u8) ![]Match {
+                var list: std.ArrayList(Match) = .empty;
+                errdefer list.deinit(allocator);
+                try q.appendAll(Match, allocator, &list, input, spanMatch);
+                return list.toOwnedSlice(allocator);
+            }
+
+            // Groups (`([0-9]{4})-…`) reuse the shared capture support.
+            const C = CaptureSupport(built);
+            pub const Captures = C.Caps;
+            pub const captures = C.captures;
+            pub const capturesFrom = C.capturesFrom;
+            pub const capturesAll = C.capturesAll;
+            pub const CapturesIterator = C.CapturesIterator;
+            pub const capturesIterator = C.capturesIterator;
+        };
+    }
+
     // Adjacent-duplicate-word fast path (comptime peer of runtime `.dup_word`):
     // the baked `DupWord` recogniser scans `(\b CLASS+ \b) SEP \1` in ONE O(n)
     // forward pass (the `\b` brackets force a unique token length ⇒ no quantifier
@@ -1567,6 +1693,9 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
         const teddy = comptime core.buildLiteral(&seq).?;
         return struct {
             pub const has_dfa = true;
+            /// Case-folded literal set (`(?i)sherlock`): the Teddy matches letters
+            /// in either case through its fold masks (`Teddy.buildFolded`).
+            pub const literal_folded = teddy.folded;
             const t = teddy;
 
             /// Leftmost literal span at/after `from` (Teddy scan). The single
@@ -1635,6 +1764,9 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
         const rev_table = if (built.rev_ok) compress(built.rev_dfa) else {};
         return struct {
             pub const has_dfa = true;
+            /// The literal prefilter (`.lit_prefix` / `.reverse_suffix`) is a
+            /// case-folded Teddy (`(?i)error: \d+`).
+            pub const prefilter_folded = if (maybe_teddy) |td| td.folded else false;
             const table = baked;
             // Only referenced in the `.reverse_suffix` / `.lit_prefix` switch
             // prongs; for `.dfa` `mode` is comptime-known so those prongs are

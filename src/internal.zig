@@ -28,6 +28,7 @@ pub const RegexCache = @import("thread_safety.zig").RegexCache(Regex);
 // Internal shared modules
 pub const common = @import("common.zig");
 pub const prefilter = @import("prefilter.zig");
+pub const simd = @import("simd.zig");
 pub const comptime_dfa = @import("exec/comptime_dfa.zig");
 
 // Unified meta-engine pipeline
@@ -59,6 +60,9 @@ pub const nfa_index = @import("exec/nfa_index.zig");
 pub const nfa_fuzz = @import("exec/nfa_fuzz.zig");
 pub const compiled_bt = @import("exec/compiled_bt.zig");
 pub const onepass = @import("exec/onepass.zig");
+pub const class_span = @import("exec/class_span.zig");
+pub const class_seq = @import("exec/class_seq.zig");
+pub const word_set = @import("exec/word_set.zig");
 
 // Single source of truth: the public `version` in root.zig (kept in lockstep
 // with build.zig.zon by tests/version_sync.zig).

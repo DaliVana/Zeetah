@@ -18,6 +18,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const common = @import("common.zig");
+const simd = @import("simd.zig");
 
 /// Vector lane count, chosen per target at comptime. `orelse 16` guards
 /// targets where the query returns null (128-bit baseline).
@@ -65,18 +66,13 @@ pub inline fn robustlyRareProbe(b: u8) bool {
 /// Is a real SIMD byte-shuffle (the Teddy kernel primitive) available for the
 /// build target? Decided entirely at comptime — no runtime per-target branch.
 /// When false, the portable two-byte `@Vector` filter is the fast path.
-const teddy_simd: bool = switch (builtin.cpu.arch) {
-    .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .ssse3),
-    .aarch64 => std.Target.aarch64.featureSetHas(builtin.cpu.features, .neon),
-    else => false,
-};
+const teddy_simd: bool = simd.has_shuffle;
 
 /// AVX2 256-bit "Fat Teddy": process 32 bytes per iteration via `vpshufb
 /// ymm`. x86_64-only (NEON has no 256-bit shuffle); the 16-entry nibble
 /// table is duplicated into *both* 128-bit lanes because `vpshufb` looks up
 /// independently per 128-bit lane — correct here since indices are nibbles.
-const teddy_avx2: bool = builtin.cpu.arch == .x86_64 and
-    std.Target.x86.featureSetHas(builtin.cpu.features, .avx2);
+const teddy_avx2: bool = simd.x86_avx2;
 
 /// Teddy kernel width and its vector type: 32 on AVX2, else the 128-bit
 /// baseline shared by SSSE3 PSHUFB and NEON TBL.
@@ -113,10 +109,8 @@ pub const FREQ: [256]u16 = blk: {
 pub const inSet = common.hasBit;
 
 /// Canonical 256-bit-set insertion — the write-side counterpart of `inSet`,
-/// so producers and consumers of a `[32]u8` set share one bit layout.
-pub inline fn setBit(set: *[32]u8, c: u8) void {
-    set[c >> 3] |= (@as(u8, 1) << @as(u3, @intCast(c & 7)));
-}
+/// re-exported from `common.setBit`.
+pub const setBit = common.setBit;
 
 /// Compact classification of the first-byte set, derived from the bitmap.
 /// The kernels iterate exactly `n` real members/ranges (no padding work), so
@@ -564,47 +558,11 @@ pub fn findLiteralOcc(input: []const u8, from: usize, lit: []const u8, probe: u8
 // scalar-verified baseline.
 
 /// One-instruction byte shuffle `out[k] = table[idx[k] & 0x0F]` (our indices are
-/// nibbles, 0..15) — PSHUFB on x86_64 (SSSE3, or `vpshufb` under AVX2), TBL on
-/// aarch64 NEON. Both zero a lane whose index has bit7 set / is ≥16, and since
-/// our indices are nibbles the two are bit-identical. Width = `TW` (16 baseline,
-/// 32 on AVX2). Arch/feature is selected by a *comptime* switch, so only the
-/// target's prong is analysed/emitted (no per-target runtime branch; non-shuffle
-/// targets never reference this).
-const shuf = switch (builtin.cpu.arch) {
-    .aarch64 => struct {
-        inline fn f(table: VT, idx: VT) VT {
-            return asm ("tbl %[o].16b, {%[t].16b}, %[i].16b"
-                : [o] "=w" (-> VT),
-                : [t] "w" (table),
-                  [i] "w" (idx),
-            );
-        }
-    }.f,
-    .x86_64 => if (teddy_avx2) struct {
-        // 3-operand AVX2: ymm = vpshufb(table, idx), per-128-lane lookup.
-        inline fn f(table: VT, idx: VT) VT {
-            return asm ("vpshufb %[i], %[t], %[o]"
-                : [o] "=x" (-> VT),
-                : [t] "x" (table),
-                  [i] "x" (idx),
-            );
-        }
-    }.f else struct {
-        inline fn f(table: VT, idx: VT) VT {
-            var t = table;
-            asm ("pshufb %[i], %[t]"
-                : [t] "+x" (t),
-                : [i] "x" (idx),
-            );
-            return t;
-        }
-    }.f,
-    else => struct {
-        inline fn f(_: VT, _: VT) VT {
-            unreachable;
-        }
-    }.f,
-};
+/// nibbles, 0..15) at the kernel width `TW` — the shared `simd.shuffle`
+/// primitive (`tbl` / `pshufb` / `vpshufb`; see `src/simd.zig`).
+inline fn shuf(table: VT, idx: VT) VT {
+    return simd.shuffle(TW, table, idx);
+}
 
 /// Tile a 16-entry nibble table across the kernel width. For `TW==16` this is
 /// the identity; for `TW==32` the table is duplicated into both 128-bit lanes
@@ -671,21 +629,63 @@ pub const Teddy = struct {
     tlv: [TEDDY_MAXMASK]VT = @splat(@splat(0)),
     thv: [TEDDY_MAXMASK]VT = @splat(@splat(0)),
 
+    // --- Case-folded needles (`buildFolded`) ---
+    /// `fold[w][j]` is `0x20` where needle w's byte j is a case pair (both
+    /// `c` and `c ^ 0x20` match), else 0; `pat` then holds the canonical
+    /// `c | fold`, so byte `x` matches iff `x | fold[w][j] == pat[w][j]`. Both
+    /// pair bytes share the low nibble and differ in bit 1 of the high one, so
+    /// setting both high-nibble bits in `mask_hi` keeps a bucket exact.
+    fold: [MAX_NEEDLES][MAX_LEN]u8 = @splat(@splat(0)),
+    /// Any fold set ⇒ exact-byte fast paths (memchr / two-byte filter) are
+    /// skipped and verification compares through the fold masks.
+    folded: bool = false,
+    /// One-shot verify vectors for needles of ≤ 16 bytes: canonical bytes and
+    /// fold masks, both `0xFF` past the needle (so those lanes always agree).
+    fv_pat: [MAX_NEEDLES]V16 = @splat(@splat(0xFF)),
+    fv_fold: [MAX_NEEDLES]V16 = @splat(@splat(0xFF)),
+
+    const V16 = @Vector(16, u8);
+
     pub const Hit = struct { start: usize, which: u8 };
 
     /// Build from a slice of needles. Returns null if it cannot represent the
     /// set (too many / too long / an empty needle, which would defeat the
     /// prefilter). Pure scalar — comptime-evaluable (pattern.zig bakes it).
     pub fn build(needles: []const []const u8) ?Teddy {
-        if (needles.len == 0 or needles.len > MAX_NEEDLES) return null;
+        return buildImpl(needles, null);
+    }
+
+    /// `build` for case-folded needles: `folds[i][j]` is `0x20` where needle
+    /// i's byte j matches either case (`needles[i][j] | 0x20` and that `^ 0x20`),
+    /// else 0 — the `seq_extract.foldLiterals` representation. Comptime-evaluable.
+    pub fn buildFolded(needles: []const []const u8, folds: []const []const u8) ?Teddy {
+        return buildImpl(needles, folds);
+    }
+
+    fn buildImpl(needles0: []const []const u8, folds: ?[]const []const u8) ?Teddy {
+        if (needles0.len == 0 or needles0.len > MAX_NEEDLES) return null;
         var t = Teddy{};
+        // Canonicalise folded bytes (`c | fold`) up front; everything below
+        // reads `t.pat` through `needles`.
+        var canon: [MAX_NEEDLES][]const u8 = undefined;
+        for (needles0, 0..) |nd0, i| {
+            if (nd0.len == 0 or nd0.len > MAX_LEN) return null;
+            for (nd0, 0..) |b, j| {
+                const f: u8 = if (folds) |fs| fs[i][j] else 0;
+                if (f != 0 and f != 0x20) return null;
+                t.pat[i][j] = b | f;
+                t.fold[i][j] = f;
+                if (f != 0) t.folded = true;
+            }
+            canon[i] = t.pat[i][0..nd0.len];
+        }
+        const needles: []const []const u8 = canon[0..needles0.len];
         var min_len: usize = MAX_LEN;
         var ge2 = true;
         for (needles, 0..) |nd, i| {
-            if (nd.len == 0 or nd.len > MAX_LEN) return null;
-            for (nd, 0..) |b, j| t.pat[i][j] = b;
             t.len[i] = @intCast(nd.len);
             setBit(&t.first, nd[0]);
+            if (t.fold[i][0] != 0) setBit(&t.first, nd[0] ^ 0x20);
             t.b1[i] = nd[0];
             if (nd.len >= 2) {
                 // Rarest byte → most selective second probe. Tie: prefer the
@@ -709,7 +709,7 @@ pub const Teddy = struct {
         }
         t.n = @intCast(needles.len);
         t.all_ge2 = ge2;
-        t.one_memchr = t.n == 1 and t.len[0] >= 2 and robustlyRareProbe(t.b2[0]);
+        t.one_memchr = !t.folded and t.n == 1 and t.len[0] >= 2 and robustlyRareProbe(t.b2[0]);
 
         // Adaptive prefix depth: start at the Slim-Teddy base, then deepen
         // while some needle pair shares the whole nm-byte prefix (the filter
@@ -724,7 +724,9 @@ pub const Teddy = struct {
             while (a < needles.len and !collide) : (a += 1) {
                 var b: usize = a + 1;
                 while (b < needles.len) : (b += 1) {
-                    if (std.mem.eql(u8, needles[a][0..nm], needles[b][0..nm])) {
+                    if (std.mem.eql(u8, needles[a][0..nm], needles[b][0..nm]) and
+                        std.mem.eql(u8, t.fold[a][0..nm], t.fold[b][0..nm]))
+                    {
                         collide = true;
                         break;
                     }
@@ -740,7 +742,20 @@ pub const Teddy = struct {
                 const c = nd[j];
                 t.mask_lo[j][c & 0x0F] |= bit;
                 t.mask_hi[j][c >> 4] |= bit;
+                // The other case: same low nibble, high nibble ^ 2.
+                if (t.fold[i][j] != 0) t.mask_hi[j][(c ^ 0x20) >> 4] |= bit;
             }
+        }
+        for (0..t.n) |w| {
+            if (t.len[w] > 16) continue;
+            var pa: [16]u8 = @splat(0xFF);
+            var fa: [16]u8 = @splat(0xFF);
+            for (0..t.len[w]) |j| {
+                pa[j] = t.pat[w][j];
+                fa[j] = t.fold[w][j];
+            }
+            t.fv_pat[w] = pa;
+            t.fv_fold[w] = fa;
         }
         // Build-time bake: per-needle scan vectors materialized once (build is comptime).
         for (0..t.n) |k| {
@@ -756,16 +771,29 @@ pub const Teddy = struct {
         return t;
     }
 
+    /// Does needle `w` match at `cand`? Exact bytes, or through the fold masks
+    /// for a folded set — one 16-byte compare when the needle fits.
+    inline fn needleAt(self: *const Teddy, input: []const u8, cand: usize, w: usize) bool {
+        const L = self.len[w];
+        if (cand + L > input.len) return false;
+        if (!self.folded) return std.mem.eql(u8, input[cand .. cand + L], self.pat[w][0..L]);
+        if (L <= 16 and cand + 16 <= input.len) {
+            const x: V16 = input[cand..][0..16].*;
+            return @reduce(.And, (x | self.fv_fold[w]) == self.fv_pat[w]);
+        }
+        for (0..L) |j| {
+            if ((input[cand + j] | self.fold[w][j]) != self.pat[w][j]) return false;
+        }
+        return true;
+    }
+
     /// Earliest-declared needle that matches at absolute position `cand`, or
     /// null. THE authoritative predicate — every fast path funnels here, so
     /// semantics are byte-identical to the original scalar matcher.
     inline fn verifyAt(self: *const Teddy, input: []const u8, cand: usize) ?Hit {
         var w: usize = 0;
         while (w < self.n) : (w += 1) {
-            const L = self.len[w];
-            if (cand + L <= input.len and
-                std.mem.eql(u8, input[cand .. cand + L], self.pat[w][0..L]))
-            {
+            if (self.needleAt(input, cand, w)) {
                 return .{ .start = cand, .which = @intCast(w) };
             }
         }
@@ -783,10 +811,7 @@ pub const Teddy = struct {
         var b = bucket;
         while (b != 0) {
             const w: usize = @ctz(b);
-            const L = self.len[w];
-            if (cand + L <= input.len and
-                std.mem.eql(u8, input[cand .. cand + L], self.pat[w][0..L]))
-            {
+            if (self.needleAt(input, cand, w)) {
                 return .{ .start = cand, .which = @intCast(w) };
             }
             b &= b - 1; // clear lowest set bit → next candidate, ascending
@@ -939,6 +964,12 @@ pub const Teddy = struct {
     /// across positions; at a tie returns the earliest-declared needle.
     pub fn find(self: *const Teddy, input: []const u8, pos: usize) ?Hit {
         if (pos >= input.len) return null;
+        // Folded sets: only the nibble kernel (whose masks hold both cases) and
+        // the first-byte-set reference scan are fold-aware.
+        if (self.folded) {
+            if (teddy_simd and self.all_ge2) return self.findTeddy(input, pos);
+            return self.findScalarRef(input, pos);
+        }
         if (self.n == 1) {
             if (self.len[0] == 1) {
                 return if (std.mem.indexOfScalarPos(u8, input, pos, self.b1[0])) |s|
@@ -976,6 +1007,62 @@ test "teddy: build rejects degenerate inputs" {
     try std.testing.expect(Teddy.build(&[_][]const u8{ "ok", "" }) == null);
     const big = common.repeat("x", Teddy.MAX_LEN + 1);
     try std.testing.expect(Teddy.build(&[_][]const u8{big}) == null);
+}
+
+test "teddy: folded needles == naive case-pair matcher (leftmost, declared order)" {
+    var prng = std.Random.DefaultPrng.init(0xF01D);
+    const r = prng.random();
+    // Letters fold; digits/punctuation stay exact. Both cases appear in the
+    // haystack so folded positions must accept either.
+    const chars = "abcsSHhE7:- ";
+    var pat_store: [Teddy.MAX_NEEDLES][24]u8 = undefined;
+    var fold_store: [Teddy.MAX_NEEDLES][24]u8 = undefined;
+    var needles: [Teddy.MAX_NEEDLES][]const u8 = undefined;
+    var folds: [Teddy.MAX_NEEDLES][]const u8 = undefined;
+    var hay_store: [8 + 300]u8 = undefined;
+    for (0..300) |iter| {
+        const n = 1 + r.uintLessThan(usize, Teddy.MAX_NEEDLES);
+        for (0..n) |i| {
+            const len = 1 + r.uintLessThan(usize, if (iter % 4 == 0) 24 else 6);
+            for (0..len) |j| {
+                const c = chars[r.uintLessThan(usize, chars.len)];
+                const letter = std.ascii.isAlphabetic(c);
+                pat_store[i][j] = if (letter and r.boolean()) c ^ 0x20 else c; // either case given
+                fold_store[i][j] = if (letter and r.uintLessThan(u8, 4) != 0) 0x20 else 0;
+            }
+            needles[i] = pat_store[i][0..len];
+            folds[i] = fold_store[i][0..len];
+        }
+        const t = Teddy.buildFolded(needles[0..n], folds[0..n]).?;
+        const matchAt = struct {
+            fn f(nd: []const u8, fd: []const u8, s: []const u8, p: usize) bool {
+                if (p + nd.len > s.len) return false;
+                for (nd, fd, 0..) |c, fm, j| if ((s[p + j] | fm) != (c | fm)) return false;
+                return true;
+            }
+        }.f;
+        const len = r.uintLessThan(usize, 300);
+        const off = r.uintLessThan(usize, 8);
+        const hay = hay_store[off .. off + len];
+        for (hay) |*c| c.* = chars[r.uintLessThan(usize, chars.len)];
+        for (0..4) |_| { // plant needles in random case
+            const w = r.uintLessThan(usize, n);
+            if (needles[w].len > len) continue;
+            const at = r.uintLessThan(usize, len - needles[w].len + 1);
+            for (needles[w], folds[w], 0..) |c, fm, j| hay[at + j] = if (fm != 0 and r.boolean()) c ^ 0x20 else c;
+        }
+        for (0..len + 1) |from| {
+            var want: ?Teddy.Hit = null;
+            var p = from;
+            outer: while (p < len) : (p += 1) {
+                for (0..n) |w| if (matchAt(needles[w], folds[w], hay, p)) {
+                    want = .{ .start = p, .which = @intCast(w) };
+                    break :outer;
+                };
+            }
+            try std.testing.expectEqual(want, t.find(hay, from));
+        }
+    }
 }
 
 test "teddy: SIMD find == scalar reference (differential, leftmost+order)" {

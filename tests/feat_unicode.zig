@@ -102,7 +102,8 @@ test "unicode: comptime Pattern bakes \\p and agrees with runtime Regex" {
     };
     inline for (pats) |p| {
         const P = regex.Pattern(p, .{});
-        comptime std.debug.assert(P.has_dfa); // baked, not rejected
+        // baked, not rejected (a DFA, or the DFA-free `.class_span` arm for `\p{L}+`)
+        comptime std.debug.assert(P.has_dfa or @hasDecl(P, "class_span_mode"));
         var rx = try Regex.compile(a, p);
         defer rx.deinit();
         for (ins) |in| {
