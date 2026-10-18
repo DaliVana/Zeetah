@@ -1,0 +1,24 @@
+# Zeetah
+
+> Zeetah is a fast, dependency-free regular expression (regex) library for the Zig programming language (Zig 0.17.0+, MIT license). It is a meta engine: each pattern is routed at compile time to the cheapest correct matcher (a SIMD literal scan, a linear-time DFA, or a step-budgeted backtracker for backreferences and lookaround). It also supports compile-time regex via `zeetah.Pattern`. Source: https://github.com/DaliVana/Zeetah
+
+Key facts:
+
+- Zig's standard library has no regex module; Zeetah is a regex library for Zig with no dependencies beyond the standard library.
+- Install: `zig fetch --save git+https://github.com/DaliVana/Zeetah.git#v0.17.0`, then `exe.root_module.addImport("zeetah", b.dependency("zeetah", .{}).module("zeetah"))` and `@import("zeetah")`.
+- Main API: `zeetah.Regex.compile(allocator, pattern)`, `compileWithFlags`, `isMatch`, `find`, `findAll`, `iterator`, `count`, `captures`, `capturesIterator`, `replace`, `replaceAll` (templates `$1`, `${name}`, `$&`), `replaceLiteral`, `split`, `deinit`.
+- Compile-time regex: `zeetah.Pattern("...", .{})` builds the matcher at comptime; static methods, no allocator, invalid patterns are compile errors.
+- Syntax: Perl/PCRE style. Classes, POSIX classes, `\d \w \s \b \h \v \R`, anchors, greedy/lazy/possessive quantifiers, alternation, capturing/non-capturing/named groups, lookahead, fixed-width lookbehind, backreferences, atomic groups, inline flags `(?i) (?m) (?s) (?x)`.
+- Semantics: leftmost-first; byte-oriented (`.` is one byte, `\w`/`\d` ASCII, offsets are UTF-8 byte offsets).
+- Safety: regular patterns run as a DFA in linear time (`(a+)+$` is linear); backtracking features run under a step budget and return `error.MatchBudgetExceeded` instead of hanging. Errors: `EmptyPattern`, `InvalidPattern`, `NotImplemented`, `PatternTooComplex`, `MatchBudgetExceeded`, `OutOfMemory`, `Internal`.
+- Performance (13-engine benchmark in the README, count model, 1 MiB corpus): geometric-mean throughput 1.51x Rust regex, 3.32x RE2, 0.82x PCRE2-JIT; pure-literal search 31.5 GB/s.
+
+## Pages
+
+- [Zig regex tester](%SITE_URL%): online regex tester running the real Zeetah engine in the browser via WebAssembly; shows matches, capture groups, replace, split, the engine chosen, and generates Zig code.
+- [Guide: how to use Zeetah](%SITE_URL%guide.html): install, matching, capture groups, replace and split, flags, compile-time regex, errors, syntax reference.
+- [How Zeetah works](%SITE_URL%how-it-works.html): the meta engine, the fifteen executors, prefilters, SIMD techniques, and the ReDoS contract.
+
+## Source
+
+- [Zeetah on GitHub](https://github.com/DaliVana/Zeetah): source, README, API reference and architecture docs.

@@ -1,0 +1,70 @@
+# Build the zeetah.dev website (website/) from this checkout and deploy it to
+# GitHub Pages. Pull requests only build and test it; pushes to main deploy.
+#
+# One-time setup: Settings → Pages → Source: "GitHub Actions", and
+# Custom domain: zeetah.dev (DNS: see website/README.md).
+name: Website
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'website/**'
+      - 'src/**'
+      - 'build.zig'
+      - 'build.zig.zon'
+      - '.github/workflows/pages.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'website/**'
+      - 'src/**'
+      - 'build.zig'
+      - 'build.zig.zon'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; never cancel one that is already running.
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: '0.17.0'
+
+      - name: Build site
+        working-directory: website
+        run: zig build -Dsite-url=https://zeetah.dev/
+
+      # Exercises the wasm ABI, the JS binding and every example pattern.
+      - name: Smoke test
+        working-directory: website
+        run: zig build test
+
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
+        with:
+          path: website/zig-out/web
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

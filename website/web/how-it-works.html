@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>How Zeetah Works: A Fast Regex Meta Engine for Zig</title>
+  <meta name="description" content="Inside Zeetah, the Zig regex library: how each pattern is routed to a SIMD scan, a linear-time DFA or a bounded backtracker, and why it stays safe.">
+  <link rel="canonical" href="%SITE_URL%how-it-works.html">
+  <meta name="robots" content="index, follow, max-image-preview:large">
+  <meta name="theme-color" content="#f4f5f7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0d1015" media="(prefers-color-scheme: dark)">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="Zeetah">
+  <meta property="og:title" content="How Zeetah Works: A Fast Regex Meta Engine for Zig">
+  <meta property="og:description" content="How Zeetah routes each regex to a SIMD scan, a linear-time DFA or a bounded backtracker.">
+  <meta property="og:url" content="%SITE_URL%how-it-works.html">
+  <meta property="og:image" content="%SITE_URL%og-image.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="Zeetah, fast regex for Zig: a cheetah running through regex symbols">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="How Zeetah Works: A Fast Regex Meta Engine for Zig">
+  <meta name="twitter:description" content="How Zeetah routes each regex to a SIMD scan, a linear-time DFA or a bounded backtracker.">
+  <meta name="twitter:image" content="%SITE_URL%og-image.jpg">
+  <link rel="icon" type="image/png" href="favicon.png">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <link rel="alternate" type="text/plain" title="Zeetah summary for language models" href="llms.txt">
+  <link rel="stylesheet" href="style.css">
+  <script>
+    try {
+      const t = localStorage.getItem('zeetah:theme');
+      if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+    } catch (_) {}
+  </script>
+  <script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "TechArticle",
+      "@id": "%SITE_URL%how-it-works.html#article",
+      "headline": "How Zeetah works: a fast regex meta engine for Zig",
+      "description": "How Zeetah routes each regular expression to a SIMD literal scan, a linear-time DFA or a bounded backtracker, and its safety guarantees.",
+      "url": "%SITE_URL%how-it-works.html",
+      "image": "%SITE_URL%og-image.jpg",
+      "inLanguage": "en",
+      "dateModified": "2026-10-18",
+      "proficiencyLevel": "Expert",
+      "author": { "@type": "Person", "name": "DaliVana", "url": "https://github.com/DaliVana" },
+      "about": { "@type": "SoftwareSourceCode", "name": "Zeetah", "codeRepository": "https://github.com/DaliVana/Zeetah", "programmingLanguage": "Zig" },
+      "isPartOf": { "@id": "%SITE_URL%#website" }
+    },
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        { "@type": "ListItem", "position": 1, "name": "Zeetah", "item": "%SITE_URL%" },
+        { "@type": "ListItem", "position": 2, "name": "How it works", "item": "%SITE_URL%how-it-works.html" }
+      ]
+    }
+  ]
+}
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="./" aria-label="Zeetah regex tester home">
+      <img class="logo" src="zeetah-logo.webp" width="40" height="40" alt="">
+      <span class="brand-text">
+        <span class="brand-name">Zeetah</span>
+        <span class="brand-sub">Regex library for Zig</span>
+      </span>
+    </a>
+    <nav class="nav" aria-label="Site">
+      <a href="./">Tester</a>
+      <a href="guide.html">Guide</a>
+      <a href="how-it-works.html" aria-current="page">How it works</a>
+    </nav>
+    <div class="topbar-right">
+      <a class="link" href="https://github.com/DaliVana/Zeetah" target="_blank" rel="noopener">GitHub</a>
+      <button class="icon-btn" id="themeBtn" type="button" aria-label="Toggle dark mode" title="Toggle dark mode">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main class="doc-page">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="./">Zeetah</a><span aria-hidden="true">/</span><span>How it works</span></nav>
+    <div class="doc-grid">
+      <article class="doc">
+        <h1>How Zeetah works: a fast regex meta engine for Zig</h1>
+        <p class="lede">Most regex libraries run every pattern on one matcher. Zeetah is a <strong>meta engine</strong>: when you
+          compile a pattern it analyzes it and picks the cheapest matcher that is still correct. A plain word becomes a SIMD substring
+          search, a typical pattern becomes a linear-time DFA, and only patterns that truly need it (backreferences, lookaround) use a
+          backtracker, which runs under a step budget. You call one API, and the engine picks the machine.</p>
+        <p class="doc-meta">Describes Zeetah 0.17.0 · Updated 18 October 2026</p>
+
+        <h2 id="pipeline">From pattern to matcher</h2>
+        <p>Compiling a pattern runs a short pipeline. Every stage is plain Zig with no dependencies, and the same code runs at run time
+          (<code>Regex.compile</code>) and at compile time (<code>zeetah.Pattern</code>).</p>
+        <ol class="pipeline">
+          <li><b>Parse</b><span>A recursive-descent parser turns the pattern straight into HIR, a flat high-level IR. There is no separate lexer or AST.</span></li>
+          <li><b>Analyze</b><span>A pure pass over the HIR finds literal prefixes and suffixes, anchors, a required byte, and whether the pattern is regular at all.</span></li>
+          <li><b>Plan</b><span>The planner picks a strategy from that analysis alone. It never looks at the text being searched, which is why it can also run at compile time.</span></li>
+          <li><b>Build</b><span>A Thompson NFA is built and turned into a DFA (subset construction plus minimization), or into one of the specialized executors.</span></li>
+          <li><b>Match</b><span>Prefilters skip text that cannot match; the chosen executor finds the match; capture groups are filled in afterwards, only over the matched span.</span></li>
+        </ol>
+
+        <h2 id="engines">Choosing an engine</h2>
+        <p>Zeetah has fifteen executors. The tester's status line shows which one your pattern got; these are the main ones.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Engine</th><th>Chosen for</th><th>How it runs</th></tr></thead>
+            <tbody>
+              <tr><td><code>literal</code></td><td>plain text or a small set of words, including case-insensitive ones (<code>cat|dog</code>)</td><td>SIMD substring or Teddy multi-literal search, no automaton</td></tr>
+              <tr><td><code>lit_prefix</code></td><td>a pattern that starts with a literal (<code>hello.*world</code>)</td><td>find the prefix with SIMD, confirm with a DFA</td></tr>
+              <tr><td><code>reverse_suffix</code></td><td>a rare literal at the end and a weak start</td><td>no suffix in the text proves there is no match; otherwise a DFA</td></tr>
+              <tr><td><code>dfa</code></td><td>the general regular case</td><td>one table lookup per byte, linear time</td></tr>
+              <tr><td><code>lazy_dfa</code></td><td>DFAs too big to build up front, and assertions such as <code>\b</code>, <code>\B</code> and mid-pattern <code>^</code>/<code>$</code></td><td>the same DFA, built state by state while matching</td></tr>
+              <tr><td><code>dense_search</code></td><td>narrow unanchored shapes</td><td>a single pass over the input with no restarts</td></tr>
+              <tr><td><code>class_span</code></td><td>one repeated class: <code>[a-z]+</code>, <code>\d{2,}</code>, <code>\b\w+\b</code></td><td>64-byte bitmask scan (see <a href="#simd">SIMD</a>)</td></tr>
+              <tr><td><code>class_seq</code></td><td>fixed-length class sequences: <code>\d{2}:\d{2}:\d{2}</code></td><td>Shift-And over bitmasks</td></tr>
+              <tr><td><code>boundary_lits</code></td><td>keyword lists: <code>\b(?:if|else|while)\b</code></td><td>multi-literal or word-hash search plus an O(1) <code>\b</code> check</td></tr>
+              <tr><td><code>literal_alt</code></td><td>a dictionary too large for an automaton</td><td>a byte-budgeted trie walk</td></tr>
+              <tr><td><code>dup_word</code></td><td>repeated words: <code>\b(\w+)\s+\1\b</code></td><td>a dedicated linear scan</td></tr>
+              <tr><td><code>dfa_edge_look</code></td><td>a regular body with a one-byte lookaround at the end (<code>\w+(?=!)</code>)</td><td>DFA with the lookaround folded in</td></tr>
+              <tr><td><code>backtrack</code></td><td>backreferences, lookaround, atomic groups</td><td>step-budgeted backtracker behind a regular prefilter</td></tr>
+              <tr><td><code>split_alt</code></td><td>alternations mixing both kinds</td><td>regular branches on a DFA, the rest on the backtracker</td></tr>
+              <tr><td><code>bt_look</code></td><td><code>\Z</code> and line-anchored <code>(?m)^</code> patterns</td><td>line-by-line DFA, or a bounded backtracker</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Try it: in the <a href="./">tester</a>, <code>[0-9]+</code> runs on <code>class_span</code>, <code>[0-9]{2}:[0-9]{2}</code> on
+          <code>class_seq</code>, <code>zeetah</code> with the <code>i</code> flag on <code>literal</code>, and <code>\b(\w+)\s+\1\b</code> on
+          <code>backtrack</code>.</p>
+
+        <h2 id="prefilters">Skipping work with prefilters</h2>
+        <p>Before any automaton runs, Zeetah tries to rule text out cheaply:</p>
+        <ul>
+          <li><b>Required byte.</b> If every match must contain a certain byte and one <code>memchr</code> finds none, the answer is
+            "no match" without running the pattern at all.</li>
+          <li><b>Required literal.</b> A rare mandatory substring is located first, and the match start is recovered from it.</li>
+          <li><b>First-byte set.</b> The set of bytes a match can start with, scanned with vector instructions.</li>
+          <li><b>Teddy and Aho-Corasick.</b> SIMD and automaton based search for several literals at once.</li>
+          <li><b>Seek.</b> For backtracking patterns, a regular over-approximation of the pattern runs as a fast DFA to skip
+            positions where no match can start.</li>
+        </ul>
+        <p>Prefilters may let through false candidates, which the real matcher then rejects, but they never skip a real match.</p>
+
+        <h2 id="simd">SIMD inside</h2>
+        <p>Several executors treat the input as 64-byte blocks and work on all 64 bytes at once:</p>
+        <ul>
+          <li><b>Character-class runs</b> (<code>class_span</code>). Each block is classified into a 64-bit mask, one bit per byte
+            ("is this byte in the class?"). Run starts are <code>mask &amp; ~(mask &lt;&lt; 1)</code>; count-trailing-zeros jumps to the
+            next one and popcount counts them, so <code>[a-z]+</code> never walks byte by byte. This technique is inspired by
+            Validark's accelerated Zig tokenizer.</li>
+          <li><b>Fixed-length sequences</b> (<code>class_seq</code>). Each class gets its own mask; shifting and ANDing the masks marks
+            every position where the whole sequence ends, for all 64 positions in a few instructions.</li>
+          <li><b>Keyword sets</b> (<code>boundary_lits</code>). Word runs are walked off the same bitmask, rejected by length and
+            first and last byte with two bit tests, and only then hash-checked.</li>
+          <li><b>Teddy</b>. Nibble lookup tables find candidate positions for up to eight literals at once; case-insensitive
+            literals are folded into the tables rather than lowercased.</li>
+        </ul>
+        <p>On ARM these use NEON (<code>ld4</code>, <code>tbl</code>) and on x86 SSSE3/AVX2 (<code>pshufb</code>). The WebAssembly
+          build in the tester uses portable SIMD128 vectors.</p>
+
+        <h2 id="safety">Linear time and the ReDoS contract</h2>
+        <p>Catastrophic backtracking (ReDoS) is when a pattern like <code>(a+)+$</code> takes exponential time on input such as
+          <code>aaaa…X</code>. Zeetah avoids it by construction:</p>
+        <ul>
+          <li><b>Regular patterns are linear.</b> They compile to a DFA, one table lookup per byte. <code>(a+)+$</code>,
+            <code>(a*)*$</code> and <code>(.*)*$</code> compile and run in linear time; they are not rejected. If a DFA would be too big,
+            Zeetah builds it lazily instead of falling back to backtracking.</li>
+          <li><b>Backtracking is bounded.</b> Only backreferences, lookaround and atomic groups need a backtracker. It runs under a
+            step budget proportional to the input and a recursion limit, and returns <code>error.MatchBudgetExceeded</code> instead of
+            hanging.</li>
+          <li><b>Compilation is bounded.</b> Patterns too large to build fail with <code>error.PatternTooComplex</code> at compile time.</li>
+        </ul>
+
+        <h2 id="comptime">Compile time and run time</h2>
+        <p>Because planning never reads the input, the whole pipeline can run inside the Zig compiler.
+          <code>zeetah.Pattern("…", .{})</code> parses, plans and builds the matcher at <code>comptime</code> and stores the finished
+          DFA (or literal scanner, or backtracker) in the binary's read-only data. The result is a type with static methods: no
+          allocator, no <code>deinit</code>, no compile step at run time. It supports the same syntax as the runtime
+          <code>Regex</code>; anything it cannot build is a compile error.</p>
+
+        <h2 id="semantics">Match semantics</h2>
+        <ul>
+          <li><b>Leftmost-first</b>, like Perl, PCRE, RE2 and Rust: the first alternative that matches wins, and every engine agrees
+            on the same match. Randomized differential tests pin the engines to each other.</li>
+          <li><b>Byte-oriented.</b> The engine works on bytes: <code>.</code> matches one byte, <code>\w</code> <code>\d</code>
+            <code>\b</code> are ASCII and <code>\p{…}</code> covers the Latin-1 range. A codepoint-aware Unicode mode is reserved as a
+            future opt-in flag.</li>
+          <li><b>Captures on demand.</b> <code>find</code> returns only the match span. <code>captures</code> then re-runs a small
+            engine over just that span to fill in the groups, so captures never cost a second pass over the whole text.</li>
+        </ul>
+
+        <div class="next">
+          <a class="next-card" href="guide.html"><span>Learn</span><b>Use Zeetah in Zig</b>
+            <small>Install, match, capture, replace and compile-time regex.</small></a>
+          <a class="next-card" href="./"><span>Try it</span><b>Open the regex tester</b>
+            <small>See which engine your pattern gets.</small></a>
+        </div>
+      </article>
+
+      <aside class="toc" aria-label="On this page">
+        <h2>On this page</h2>
+        <ol>
+          <li><a href="#pipeline">From pattern to matcher</a></li>
+          <li><a href="#engines">Choosing an engine</a></li>
+          <li><a href="#prefilters">Prefilters</a></li>
+          <li><a href="#simd">SIMD inside</a></li>
+          <li><a href="#safety">Linear time and ReDoS</a></li>
+          <li><a href="#comptime">Compile time and run time</a></li>
+          <li><a href="#semantics">Match semantics</a></li>
+        </ol>
+      </aside>
+    </div>
+  </main>
+
+  <footer class="foot">
+    <p class="foot-links"><a href="./">Regex tester</a> · <a href="guide.html">Guide</a> · <a href="how-it-works.html">How it works</a> ·
+      <a href="https://github.com/DaliVana/Zeetah" rel="noopener">GitHub</a> · <a href="llms.txt">llms.txt</a> · MIT license</p>
+  </footer>
+
+  <script src="site.js"></script>
+</body>
+</html>

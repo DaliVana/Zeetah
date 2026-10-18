@@ -1,0 +1,26 @@
+# Zeetah: regex tester and docs for the Zig regex library.
+# Everything here is public documentation; search engines and AI assistants
+# are welcome to crawl and quote it.
+
+User-agent: *
+Allow: /
+
+User-agent: GPTBot
+Allow: /
+
+User-agent: OAI-SearchBot
+Allow: /
+
+User-agent: ClaudeBot
+Allow: /
+
+User-agent: Claude-SearchBot
+Allow: /
+
+User-agent: PerplexityBot
+Allow: /
+
+User-agent: Google-Extended
+Allow: /
+
+Sitemap: %SITE_URL%sitemap.xml
