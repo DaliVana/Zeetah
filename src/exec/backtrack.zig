@@ -234,10 +234,11 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
                     return false;
                 },
                 .uclass => {
-                    // One decoded scalar, tested against the sorted range set
-                    // (an invalid sequence is not a scalar ⇒ no match).
+                    // One decoded scalar, tested against the set (ASCII: one
+                    // bit; else a binary search over the sorted ranges). An
+                    // invalid sequence is not a scalar ⇒ no match.
                     const d = utf8.decodeAt(self.input, pos) orelse return false;
-                    if (!uset.contains(self.h.uclassRanges(nd.set_idx), d.cp)) return false;
+                    if (!self.h.uclassContains(nd.set_idx, d.cp)) return false;
                     return self.cont(pos + d.len, k);
                 },
                 .look => {
@@ -280,12 +281,16 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
                     // SIMD fast path: greedy repetition of a single byte class.
                     if (nd.greedy and self.h.node(nd.a).tag == .set)
                         return self.greedySetRun(nd.a, pos, k, 0);
+                    if (nd.greedy and self.h.node(nd.a).tag == .uclass)
+                        return self.greedyUClassRun(nd.a, pos, k, 0);
                     const lp: Cont = .{ .loop = .{ .ref = nd.a, .next = k, .greedy = nd.greedy } };
                     return self.loopSplit(pos, &lp, entryKey(nd.a));
                 },
                 .plus => {
                     if (nd.greedy and self.h.node(nd.a).tag == .set)
                         return self.greedySetRun(nd.a, pos, k, 1);
+                    if (nd.greedy and self.h.node(nd.a).tag == .uclass)
+                        return self.greedyUClassRun(nd.a, pos, k, 1);
                     // `x+` ≡ `x x*`: the first iteration enters the body directly.
                     const lp: Cont = .{ .loop = .{ .ref = nd.a, .next = k, .greedy = nd.greedy } };
                     return self.enterBody(nd.a, pos, &lp);
@@ -408,6 +413,49 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
                 self.seen = &here;
                 if (try self.cont(p, k)) return true;
                 if (p == pos + min) break;
+            }
+            return false;
+        }
+
+        /// `greedySetRun` for a `.uclass` body (`\p{L}+`, `(?u).*`, …): consume
+        /// the maximal run of member scalars (decode + binary search each), then
+        /// hand the continuation each end from longest to shortest, stepping back
+        /// one whole scalar at a time (`utf8.decodeBefore`; the run is valid
+        /// UTF-8 by construction) — the recursive loop's iteration ends in its
+        /// exact order, with O(1) stack depth and no per-scalar frame.
+        fn greedyUClassRun(self: *Self, body: NodeRef, pos: usize, k: *const Cont, min: usize) Error!bool {
+            const idx = self.h.node(body).set_idx;
+            const ranges = self.h.uclassRanges(idx);
+            const ascii = &self.h.uclassDesc(idx).ascii;
+            if (self.seenAt(if (min == 0) entryKey(body) else bodyKey(body), pos)) return false;
+            var e = pos;
+            var n: usize = 0;
+            const in = self.input;
+            while (e < in.len) {
+                const b = in[e];
+                if (b < 0x80) { // ASCII: one bit test, no decode
+                    if ((ascii[b >> 3] & (@as(u8, 1) << @as(u3, @intCast(b & 7)))) == 0) break;
+                    e += 1;
+                } else {
+                    const d = utf8.decodeAt(in, e) orelse break;
+                    if (!uset.contains(ranges, d.cp)) break;
+                    e += d.len;
+                }
+                n += 1;
+            }
+            if (n < min) return false;
+            const saved = self.seen;
+            defer self.seen = saved;
+            var p = e;
+            while (true) {
+                try self.tick();
+                const here: Seen = .{ .key = if (p == pos) entryKey(body) else loopKey(body), .pos = p, .prev = saved };
+                self.seen = &here;
+                if (try self.cont(p, k)) return true;
+                if (n == min) break;
+                const d = utf8.decodeBefore(self.input, p) orelse unreachable;
+                p -= d.len;
+                n -= 1;
             }
             return false;
         }

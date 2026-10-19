@@ -268,14 +268,21 @@ pub const PikeVm = struct {
                 }
                 if (at >= limit) continue;
                 // The list also holds the closure's pure ε-states (inserted for
-                // first-visit dedupe); only byte-consuming threads advance.
+                // first-visit dedupe); only byte-consuming threads advance. A
+                // thread state's out-edges are ALL byte edges — one for a plain
+                // `.set`, several (disjoint ranges, priority order) for a state
+                // of a UTF-8 class automaton — so every firing edge advances.
                 const lo = self.idx.off[s];
-                if (lo == self.idx.off[s + 1]) continue;
-                const ei = self.idx.order[lo];
-                if (nfa.e_kind[ei] != .consume) continue;
-                if (cc.hasBit(&nfa.sets[nfa.e_set[ei]], input[at])) {
-                    @memcpy(sc.cur[0..nsl], clist.row(s, nsl));
-                    try self.addThread(nlist, nfa.e_to[ei], at + 1, input);
+                const hi = self.idx.off[s + 1];
+                if (lo == hi) continue;
+                if (nfa.e_kind[self.idx.order[lo]] != .consume) continue;
+                var k = lo;
+                while (k < hi) : (k += 1) {
+                    const ei = self.idx.order[k];
+                    if (cc.hasBit(&nfa.sets[nfa.e_set[ei]], input[at])) {
+                        @memcpy(sc.cur[0..nsl], clist.row(s, nsl));
+                        try self.addThread(nlist, nfa.e_to[ei], at + 1, input);
+                    }
                 }
             }
             if (at >= limit) break;

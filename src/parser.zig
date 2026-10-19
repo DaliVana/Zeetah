@@ -9,6 +9,9 @@ const std = @import("std");
 const common = @import("common.zig");
 const hir = @import("hir.zig");
 const unicode_class = @import("unicode_class.zig");
+const uset = @import("unicode_set.zig");
+const utf8 = @import("utf8.zig");
+const tables = @import("unicode_tables.zig");
 
 const Error = hir.Error;
 const NodeRef = hir.NodeRef;
@@ -70,6 +73,21 @@ fn vertWsSet() [32]u8 {
     return s;
 }
 
+/// PCRE `\h` in codepoint mode: the full Unicode horizontal-space list
+/// (TAB, SPACE, NBSP, OGHAM SPACE MARK, MONGOLIAN VOWEL SEPARATOR, the U+2000
+/// block, NARROW NBSP, MEDIUM MATHEMATICAL SPACE, IDEOGRAPHIC SPACE).
+const horiz_ws_u = [_]common.CodepointRange{
+    .{ .lo = 0x09, .hi = 0x09 },     .{ .lo = 0x20, .hi = 0x20 },     .{ .lo = 0xA0, .hi = 0xA0 },
+    .{ .lo = 0x1680, .hi = 0x1680 }, .{ .lo = 0x180E, .hi = 0x180E }, .{ .lo = 0x2000, .hi = 0x200A },
+    .{ .lo = 0x202F, .hi = 0x202F }, .{ .lo = 0x205F, .hi = 0x205F }, .{ .lo = 0x3000, .hi = 0x3000 },
+};
+
+/// PCRE `\v` / the single-scalar branch of `\R` in codepoint mode: LF, VT, FF,
+/// CR, NEL, LINE SEPARATOR, PARAGRAPH SEPARATOR.
+const vert_ws_u = [_]common.CodepointRange{
+    .{ .lo = 0x0A, .hi = 0x0D }, .{ .lo = 0x85, .hi = 0x85 }, .{ .lo = 0x2028, .hi = 0x2029 },
+};
+
 fn hexVal(c: u8) ?u32 {
     return switch (c) {
         '0'...'9' => @as(u32, c - '0'),
@@ -128,17 +146,25 @@ const MAX_RANGES: usize = 64; // ranges per `[...]`
 // stack before any other ceiling trips. Exceeding it → `Error.TooComplex`.
 const MAX_PARSE_DEPTH: usize = 1000;
 
-/// Per-parse mode flags. `ci`/`dot_all`/`extended` are scoped by `(?flags)` /
-/// `(?flags:..)` exactly like the legacy `(?i)` handling and inherited by the
-/// `{m,n}` re-parse sub-parser. `multiline` and `unicode` are deliberately not
-/// scoped flags here: `multiline` `^`/`$` line anchors are resolved by a
-/// separate prescan (not threaded through this struct), and `unicode` is
-/// rejected upstream as a later-phase feature.
+/// Per-parse mode flags. `ci`/`dot_all`/`extended`/`unicode` are scoped by
+/// `(?flags)` / `(?flags:..)` exactly like the legacy `(?i)` handling and
+/// inherited by the `{m,n}` re-parse sub-parser. `multiline` is not a scoped
+/// flag here: `(?m)` `^`/`$` line anchors are resolved by a separate prescan
+/// (not threaded through this struct).
+///
+/// `unicode` is codepoint mode (`(?u)` / `.unicode`): the match unit is one
+/// UTF-8-encoded scalar (`.`, literals, `\x{…}` > 0xFF, quantifiers), the
+/// shorthand classes / `\b` / `\h\v\R` take their Unicode definitions, `\p`
+/// gains scripts / binary properties, `[…]` gains codepoint ranges, nesting
+/// and `&& -- ~~`, and `(?i)` is Unicode simple case folding. Off (the
+/// default) is the frozen byte-mode contract — nothing below changes meaning
+/// unless this is set.
 pub const ParseFlags = struct {
     ci: bool = false,
     dot_all: bool = false,
     extended: bool = false,
     multiline: bool = false,
+    unicode: bool = false,
 };
 
 /// Lower-cased POSIX class name → byte-set class (`[[:name:]]`). Unknown names
@@ -354,6 +380,7 @@ fn parseInner(
         .dot_all = flags.dot_all,
         .extended = flags.extended,
         .multiline = flags.multiline,
+        .unicode = flags.unicode,
     };
     const root = try p.parseAlt();
     p.skipExt(); // trailing ignorable ws / `#…` comment under `(?x)`
@@ -411,6 +438,8 @@ fn Parser(comptime cap: ?usize) type {
         dot_all: bool = false,
         extended: bool = false,
         multiline: bool = false,
+        /// Codepoint mode (see `ParseFlags.unicode`); scoped like `ci`.
+        unicode: bool = false,
         saw_lazy: bool = false,
         /// Capture-group numbering (group 0 = whole match, so user groups
         /// start at 1) + seen names (duplicate detection only; runtime
@@ -433,15 +462,16 @@ fn Parser(comptime cap: ?usize) type {
         /// group count after parsing (see `parse`) to reject dangling refs.
         max_backref: u32 = 0,
 
-        const Modes = struct { ci: bool, dot_all: bool, extended: bool, multiline: bool };
+        const Modes = struct { ci: bool, dot_all: bool, extended: bool, multiline: bool, unicode: bool };
         fn modes(p: *const Self) Modes {
-            return .{ .ci = p.ci, .dot_all = p.dot_all, .extended = p.extended, .multiline = p.multiline };
+            return .{ .ci = p.ci, .dot_all = p.dot_all, .extended = p.extended, .multiline = p.multiline, .unicode = p.unicode };
         }
         fn restore(p: *Self, m: Modes) void {
             p.ci = m.ci;
             p.dot_all = m.dot_all;
             p.extended = m.extended;
             p.multiline = m.multiline;
+            p.unicode = m.unicode;
         }
 
         /// Reserve this group's number *before* its body is parsed, so nesting
@@ -519,7 +549,7 @@ fn Parser(comptime cap: ?usize) type {
             // final group count is correct and also covers backrefs inside
             // lookarounds.
             if (g > p.max_backref) p.max_backref = g;
-            return p.node(.{ .tag = .backref, .set_idx = g, .fold = p.ci });
+            return p.node(.{ .tag = .backref, .set_idx = g, .fold = p.ci and !p.unicode, .ufold = p.ci and p.unicode });
         }
 
         fn parseNamedBackref(p: *Self) Error!NodeRef {
@@ -534,7 +564,7 @@ fn Parser(comptime cap: ?usize) type {
             const nm = p.pat[s..p.i];
             p.i += 1;
             const g = p.lookupName(nm) orelse return Error.Invalid;
-            return p.node(.{ .tag = .backref, .set_idx = g, .fold = p.ci });
+            return p.node(.{ .tag = .backref, .set_idx = g, .fold = p.ci and !p.unicode, .ufold = p.ci and p.unicode });
         }
 
         /// `\xHH` (up to two hex digits; `\x` alone ⇒ NUL, like PCRE) or
@@ -841,6 +871,7 @@ fn Parser(comptime cap: ?usize) type {
                 .dot_all = p.dot_all,
                 .extended = p.extended,
                 .multiline = p.multiline,
+                .unicode = p.unicode,
                 .capturing = p.capturing,
                 .replay = true,
                 .elide = p.elide or elide,
@@ -980,11 +1011,12 @@ fn Parser(comptime cap: ?usize) type {
                             p.i += 1;
                             return inner;
                         }
-                        if (k == 'i' or k == 'm' or k == 's' or k == 'x' or k == '-') {
+                        if (k == 'i' or k == 'm' or k == 's' or k == 'x' or k == 'u' or k == '-') {
                             var want_ci = p.ci;
                             var want_dot = p.dot_all;
                             var want_ext = p.extended;
                             var want_ml = p.multiline;
+                            var want_uni = p.unicode;
                             var clearing = false;
                             while (p.peek()) |fc| {
                                 switch (fc) {
@@ -993,6 +1025,7 @@ fn Parser(comptime cap: ?usize) type {
                                     's' => want_dot = !clearing,
                                     'x' => want_ext = !clearing,
                                     'm' => want_ml = !clearing,
+                                    'u' => want_uni = !clearing,
                                     else => break,
                                 }
                                 p.i += 1;
@@ -1005,6 +1038,7 @@ fn Parser(comptime cap: ?usize) type {
                                 p.dot_all = want_dot;
                                 p.extended = want_ext;
                                 p.multiline = want_ml;
+                                p.unicode = want_uni;
                                 const inner = try p.parseAlt();
                                 p.restore(saved);
                                 if (p.peek() != ')') return Error.Invalid;
@@ -1017,6 +1051,7 @@ fn Parser(comptime cap: ?usize) type {
                                 p.dot_all = want_dot;
                                 p.extended = want_ext;
                                 p.multiline = want_ml;
+                                p.unicode = want_uni;
                                 return p.emptyLeaf();
                             }
                             return Error.Invalid;
@@ -1033,9 +1068,10 @@ fn Parser(comptime cap: ?usize) type {
                 },
                 ')', '|' => return Error.Invalid,
                 '*', '+', '?', '{', '}' => return Error.Invalid,
-                '[' => return p.parseClass(),
+                '[' => return if (p.unicode) p.parseUClass() else p.parseClass(),
                 '.' => {
                     p.i += 1;
+                    if (p.unicode) return p.anyScalar(!p.dot_all);
                     return p.setLeaf(if (p.dot_all) allBytesSet() else anySet());
                 },
                 '^' => {
@@ -1050,6 +1086,7 @@ fn Parser(comptime cap: ?usize) type {
                     p.i += 1;
                     const e = p.peek() orelse return Error.Invalid;
                     p.i += 1;
+                    if (p.unicode) return p.parseEscapeU(e);
                     return switch (e) {
                         'd' => p.setLeaf(classToSet(common.CharClasses.digit)),
                         'D' => p.setLeaf(classToSet(common.CharClasses.non_digit)),
@@ -1087,10 +1124,440 @@ fn Parser(comptime cap: ?usize) type {
                     };
                 },
                 else => {
+                    if (p.unicode) {
+                        // One scalar of the (UTF-8) pattern text; malformed
+                        // pattern bytes are a syntax error in codepoint mode.
+                        const d = utf8.decodeAt(p.pat, p.i) orelse return Error.Invalid;
+                        p.i += d.len;
+                        return p.cpLeaf(d.cp);
+                    }
                     p.i += 1;
                     return p.setLeaf(singleByteSet(c));
                 },
             }
+        }
+
+        // --- Codepoint mode (`(?u)`) ------------------------------------------
+        //
+        // Every construct below builds a normalized codepoint set in a
+        // `RangeBuf` (fixed array at comptime, heap at runtime) and hands it to
+        // `uclassLeaf`, which emits a plain byte `.set` when the set is ASCII-only
+        // (so class_span / class_seq / Teddy keep applying) and a `.uclass`
+        // otherwise. Case folding (`(?i)`) is Unicode simple folding applied to
+        // the set BEFORE any negation (`(?i)[^k]` must still exclude `K` and the
+        // Kelvin sign) — the Rust `regex-syntax` order.
+
+        /// Per-class working capacity of the comptime buffers (`\P{L}` is ~700
+        /// ranges; a folded `\p{L}` adds ~3 000 singletons before merging).
+        const WORK_CAP: usize = 6144;
+        const Buf = uset.RangeBuf(if (cap == null) null else WORK_CAP);
+
+        fn newBuf(p: *const Self) Buf {
+            return Buf.init(p.alloc);
+        }
+
+        /// Emit a leaf for a normalized, negation-applied codepoint set.
+        fn uclassLeaf(p: *Self, set: *const Buf) Error!NodeRef {
+            const items = set.items();
+            if (uset.isAscii(items)) {
+                const idx = try p.h.addSet(p.alloc, uset.asciiBitmap(items));
+                return p.node(.{ .tag = .set, .set_idx = idx });
+            }
+            const idx = try p.h.addUClass(p.alloc, items);
+            return p.node(.{ .tag = .uclass, .set_idx = idx });
+        }
+
+        /// A single byte `.set` with no case folding (codepoint mode folds at
+        /// the set level, never through `setLeaf`'s ASCII fold).
+        fn rawByteLeaf(p: *Self, b: u8) Error!NodeRef {
+            const idx = try p.h.addSet(p.alloc, singleByteSet(b));
+            return p.node(.{ .tag = .set, .set_idx = idx });
+        }
+
+        /// A literal scalar: under `(?i)` its simple-fold orbit as a class; else
+        /// ASCII ⇒ one byte set, non-ASCII ⇒ its UTF-8 bytes as a concat of
+        /// single-byte sets (so literal extraction / Teddy still see bytes).
+        fn cpLeaf(p: *Self, cp: u21) Error!NodeRef {
+            if (p.ci) {
+                var b = p.newBuf();
+                defer b.deinit();
+                try b.append(.{ .lo = cp, .hi = cp });
+                try uset.foldSimple(&b);
+                return p.uclassLeaf(&b);
+            }
+            var enc: [4]u8 = undefined;
+            const n = utf8.encode(cp, &enc);
+            var cur = try p.rawByteLeaf(enc[0]);
+            for (enc[1..n]) |b| cur = try p.node(.{ .tag = .concat, .a = cur, .b = try p.rawByteLeaf(b) });
+            return cur;
+        }
+
+        /// `.` / `\N`: any scalar, optionally except `\n`.
+        fn anyScalar(p: *Self, except_nl: bool) Error!NodeRef {
+            var b = p.newBuf();
+            defer b.deinit();
+            if (except_nl) {
+                try b.append(.{ .lo = 0, .hi = '\n' - 1 });
+                try b.append(.{ .lo = '\n' + 1, .hi = common.MAX_CODEPOINT });
+            } else try b.append(.{ .lo = 0, .hi = common.MAX_CODEPOINT });
+            try uset.normalize(&b);
+            return p.uclassLeaf(&b);
+        }
+
+        fn complementInPlace(p: *Self, b: *Buf) Error!void {
+            var t = p.newBuf();
+            defer t.deinit();
+            try uset.complement(b.items(), &t);
+            try b.setFrom(t.items());
+        }
+
+        /// Append the Unicode shorthand class `which` ∈ `d D w W s S h H v V` to
+        /// `out` (UTS #18 Annex C `\d \w \s`; PCRE's `\h \v` lists). The
+        /// positive sets are closed under simple folding, so no fold step.
+        fn perlU(p: *Self, out: *Buf, which: u8) Error!void {
+            var t = p.newBuf();
+            defer t.deinit();
+            switch (std.ascii.toLower(which)) {
+                'd' => try t.appendTable(&tables.perl_digit),
+                'w' => try t.appendTable(&tables.perl_word),
+                's' => try t.appendTable(&tables.perl_space),
+                'h' => try t.appendSlice(&horiz_ws_u),
+                'v' => try t.appendSlice(&vert_ws_u),
+                else => unreachable,
+            }
+            try uset.normalize(&t);
+            if (std.ascii.isUpper(which)) try p.complementInPlace(&t);
+            try out.appendSlice(t.items());
+        }
+
+        /// Append `\p{spec}` (`negated` ⇔ `\P`) to `out`: the positive property,
+        /// folded under `(?i)`, then negated — `(?i)\P{Lu}` is "not any cased
+        /// letter", not "anything but uppercase".
+        fn propU(p: *Self, out: *Buf, spec: []const u8, negated: bool) Error!void {
+            const parsed = unicode_class.parseSpec(spec, negated) catch return Error.Unsupported;
+            var positive = parsed;
+            positive.negated = false;
+            var t = p.newBuf();
+            defer t.deinit();
+            var scratch = p.newBuf();
+            defer scratch.deinit();
+            try unicode_class.resolveInto(&t, &scratch, positive);
+            if (p.ci) try uset.foldSimple(&t);
+            if (parsed.negated) try p.complementInPlace(&t);
+            try out.appendSlice(t.items());
+        }
+
+        /// Codepoint-mode escapes (caller consumed `\` and `e`).
+        fn parseEscapeU(p: *Self, e: u8) Error!NodeRef {
+            switch (e) {
+                'd', 'D', 'w', 'W', 's', 'S', 'h', 'H', 'v', 'V' => {
+                    var acc = p.newBuf();
+                    defer acc.deinit();
+                    try p.perlU(&acc, e);
+                    try uset.normalize(&acc);
+                    return p.uclassLeaf(&acc);
+                },
+                'n' => return p.cpLeaf('\n'),
+                't' => return p.cpLeaf('\t'),
+                'r' => return p.cpLeaf('\r'),
+                'f' => return p.cpLeaf(0x0C),
+                'a' => return p.cpLeaf(0x07),
+                'e' => return p.cpLeaf(0x1B),
+                ' ' => return p.cpLeaf(' '),
+                'x' => return p.cpLeaf(try p.parseHexCp()),
+                'o' => return p.cpLeaf(try p.parseOctalBracedCp()),
+                '0' => return p.cpLeaf(p.parseOctalAfterZero()),
+                // `\N{U+hhhh}` names a scalar; bare `\N` is any scalar but `\n`.
+                'N' => return if (p.peek() == '{') p.cpLeaf(try p.parseNamedCp()) else p.anyScalar(true),
+                'R' => return p.parseLineBreakU(),
+                'p', 'P' => {
+                    const spec = try p.readPropSpec();
+                    var acc = p.newBuf();
+                    defer acc.deinit();
+                    try p.propU(&acc, spec, e == 'P');
+                    try uset.normalize(&acc);
+                    return p.uclassLeaf(&acc);
+                },
+                'b' => return p.lookLeaf(.word_boundary_unicode),
+                'B' => return p.lookLeaf(.non_word_boundary_unicode),
+                'A' => return p.lookLeaf(.start_text),
+                'z' => return p.lookLeaf(.end_text),
+                'Z' => return p.lookLeaf(.end_text_before_nl),
+                '1', '2', '3', '4', '5', '6', '7', '8', '9' => return p.parseBackref(e),
+                'k' => return p.parseNamedBackref(),
+                else => return if (escapedPunct(e)) |lit| p.cpLeaf(lit) else Error.Unsupported,
+            }
+        }
+
+        /// `\xHH` (≤ 2 hex digits) or `\x{H…}` as a scalar value (≤ U+10FFFF,
+        /// not a surrogate) — Rust / PCRE-UTF semantics. Caller consumed the `x`.
+        fn parseHexCp(p: *Self) Error!u21 {
+            if (p.peek() == '{') {
+                p.i += 1;
+                var v: u32 = 0;
+                var n: usize = 0;
+                while (p.peek()) |ch| {
+                    const d = hexVal(ch) orelse break;
+                    v = v * 16 + d;
+                    n += 1;
+                    p.i += 1;
+                    if (v > common.MAX_CODEPOINT) return Error.Invalid;
+                }
+                if (n == 0) return Error.Invalid;
+                if (p.peek() != '}') return Error.Invalid;
+                p.i += 1;
+                if (v >= 0xD800 and v <= 0xDFFF) return Error.Invalid;
+                return @intCast(v);
+            }
+            var v: u32 = 0;
+            var n: usize = 0;
+            while (n < 2) : (n += 1) {
+                const ch = p.peek() orelse break;
+                const d = hexVal(ch) orelse break;
+                v = v * 16 + d;
+                p.i += 1;
+            }
+            return @intCast(v);
+        }
+
+        /// `\o{ooo}` as a scalar value. Caller consumed the `o`.
+        fn parseOctalBracedCp(p: *Self) Error!u21 {
+            if (p.peek() != '{') return Error.Invalid;
+            p.i += 1;
+            var v: u32 = 0;
+            var n: usize = 0;
+            while (p.peek()) |ch| {
+                if (ch < '0' or ch > '7') break;
+                v = v * 8 + (ch - '0');
+                n += 1;
+                p.i += 1;
+                if (v > common.MAX_CODEPOINT) return Error.Invalid;
+            }
+            if (n == 0) return Error.Invalid;
+            if (p.peek() != '}') return Error.Invalid;
+            p.i += 1;
+            if (v >= 0xD800 and v <= 0xDFFF) return Error.Invalid;
+            return @intCast(v);
+        }
+
+        /// `\N{U+hhhh}` (caller positioned at the `{`). Character *names*
+        /// (`\N{LATIN SMALL LETTER A}`) are not supported.
+        fn parseNamedCp(p: *Self) Error!u21 {
+            if (p.peek() != '{') return Error.Invalid;
+            p.i += 1;
+            if (!(p.peek() == 'U' and p.i + 1 < p.pat.len and p.pat[p.i + 1] == '+')) {
+                // Skip to the closing brace so the error is "unsupported", not "malformed".
+                while (p.peek()) |ch| {
+                    if (ch == '}') break;
+                    p.i += 1;
+                }
+                if (p.peek() != '}') return Error.Invalid;
+                return Error.Unsupported;
+            }
+            p.i += 2;
+            var v: u32 = 0;
+            var n: usize = 0;
+            while (p.peek()) |ch| {
+                const d = hexVal(ch) orelse break;
+                v = v * 16 + d;
+                n += 1;
+                p.i += 1;
+                if (v > common.MAX_CODEPOINT) return Error.Invalid;
+            }
+            if (n == 0) return Error.Invalid;
+            if (p.peek() != '}') return Error.Invalid;
+            p.i += 1;
+            if (v >= 0xD800 and v <= 0xDFFF) return Error.Invalid;
+            return @intCast(v);
+        }
+
+        /// `\R` in codepoint mode: `(?:\r\n | [\n\x0B\f\r\x85\u2028\u2029])`.
+        fn parseLineBreakU(p: *Self) Error!NodeRef {
+            const cr = try p.rawByteLeaf('\r');
+            const lf = try p.rawByteLeaf('\n');
+            const crlf = try p.node(.{ .tag = .concat, .a = cr, .b = lf });
+            var b = p.newBuf();
+            defer b.deinit();
+            try b.appendSlice(&vert_ws_u);
+            try uset.normalize(&b);
+            const any_nl = try p.uclassLeaf(&b);
+            return p.node(.{ .tag = .alt, .a = crlf, .b = any_nl });
+        }
+
+        const SetOp = enum { intersect, difference, symdiff };
+
+        /// `[…]` in codepoint mode: codepoint members and ranges, escapes,
+        /// shorthand / property / POSIX classes, nested classes, and the set
+        /// operators `&&` (intersection), `--` (difference), `~~` (symmetric
+        /// difference) — Rust precedence: everything parsed so far is the left
+        /// operand, the items up to the next operator or `]` the right one.
+        /// Fold (under `(?i)`) then negate (`[^`) the final set.
+        fn parseUClass(p: *Self) Error!NodeRef {
+            var acc = p.newBuf();
+            defer acc.deinit();
+            const negated = try p.parseUClassBody(&acc);
+            if (p.ci) try uset.foldSimple(&acc);
+            if (negated) try p.complementInPlace(&acc);
+            return p.uclassLeaf(&acc);
+        }
+
+        /// Parse `[` … `]` into `acc` (normalized, operators applied, NOT yet
+        /// folded/negated); returns whether a leading `^` was present.
+        fn parseUClassBody(p: *Self, acc: *Buf) Error!bool {
+            std.debug.assert(p.peek() == '[');
+            p.i += 1;
+            var negated = false;
+            if (p.peek() == '^') {
+                negated = true;
+                p.i += 1;
+            }
+            acc.clear();
+            var rhs = p.newBuf();
+            defer rhs.deinit();
+            var pending: ?SetOp = null;
+            while (true) {
+                const c = p.peek() orelse return Error.Invalid;
+                if (c == ']') break;
+                if ((c == '&' or c == '-' or c == '~') and p.i + 1 < p.pat.len and p.pat[p.i + 1] == c) {
+                    p.i += 2;
+                    try p.applyOp(acc, &rhs, pending);
+                    pending = switch (c) {
+                        '&' => .intersect,
+                        '-' => .difference,
+                        else => .symdiff,
+                    };
+                    continue;
+                }
+                try p.parseUClassItem(if (pending == null) acc else &rhs);
+            }
+            p.i += 1; // ']'
+            try p.applyOp(acc, &rhs, pending);
+            return negated;
+        }
+
+        /// `acc := acc ∘ rhs` for the pending operator (both operands folded
+        /// first under `(?i)`, like Rust); no operator ⇒ just normalize `acc`.
+        fn applyOp(p: *Self, acc: *Buf, rhs: *Buf, op: ?SetOp) Error!void {
+            try uset.normalize(acc);
+            const o = op orelse return;
+            try uset.normalize(rhs);
+            if (p.ci) {
+                try uset.foldSimple(acc);
+                try uset.foldSimple(rhs);
+            }
+            var t = p.newBuf();
+            defer t.deinit();
+            switch (o) {
+                .intersect => try uset.intersect(acc.items(), rhs.items(), &t),
+                .difference => try uset.difference(acc.items(), rhs.items(), &t),
+                .symdiff => {
+                    // (a ∪ b) \ (a ∩ b) with the three buffers at hand.
+                    try uset.intersect(acc.items(), rhs.items(), &t);
+                    try acc.appendSlice(rhs.items());
+                    try uset.normalize(acc);
+                    try uset.difference(acc.items(), t.items(), rhs);
+                    try acc.setFrom(rhs.items());
+                    rhs.clear();
+                    return;
+                },
+            }
+            try acc.setFrom(t.items());
+            rhs.clear();
+        }
+
+        /// One class item appended to `out`: nested class, POSIX class, a
+        /// shorthand / property escape, or a scalar (possibly a range).
+        fn parseUClassItem(p: *Self, out: *Buf) Error!void {
+            const c = p.peek().?;
+            if (c == '[') {
+                if (p.i + 1 < p.pat.len and p.pat[p.i + 1] == ':') return p.parsePosixU(out);
+                var inner = p.newBuf();
+                defer inner.deinit();
+                const neg = try p.parseUClassBody(&inner);
+                if (p.ci) try uset.foldSimple(&inner);
+                if (neg) try p.complementInPlace(&inner);
+                return out.appendSlice(inner.items());
+            }
+            if (c == '\\' and p.i + 1 < p.pat.len) {
+                const e = p.pat[p.i + 1];
+                switch (e) {
+                    'd', 'D', 'w', 'W', 's', 'S', 'h', 'H', 'v', 'V' => {
+                        p.i += 2;
+                        return p.perlU(out, e);
+                    },
+                    'p', 'P' => {
+                        p.i += 2;
+                        const spec = try p.readPropSpec();
+                        return p.propU(out, spec, e == 'P');
+                    },
+                    else => {},
+                }
+            }
+            const lo = try p.classCpU();
+            // `lo-hi` range; `--` is the difference operator and `-]` a literal.
+            if (p.peek() == '-' and p.i + 1 < p.pat.len and p.pat[p.i + 1] != ']' and p.pat[p.i + 1] != '-') {
+                p.i += 1;
+                const hi = try p.classCpU();
+                if (lo <= hi) try out.append(.{ .lo = lo, .hi = hi }); // lo>hi ⇒ empty (byte-mode parity)
+                return;
+            }
+            try out.append(.{ .lo = lo, .hi = lo });
+        }
+
+        /// One scalar member of a codepoint-mode class: a literal (decoded
+        /// UTF-8) or a scalar escape.
+        fn classCpU(p: *Self) Error!u21 {
+            const c = p.peek() orelse return Error.Invalid;
+            if (c == '\\') {
+                p.i += 1;
+                const e = p.peek() orelse return Error.Invalid;
+                p.i += 1;
+                return switch (e) {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    'f' => 0x0C,
+                    'a' => 0x07,
+                    'e' => 0x1B,
+                    'x' => try p.parseHexCp(),
+                    'o' => try p.parseOctalBracedCp(),
+                    '0' => p.parseOctalAfterZero(),
+                    'N' => try p.parseNamedCp(),
+                    else => escapedPunct(e) orelse Error.Unsupported,
+                };
+            }
+            const d = utf8.decodeAt(p.pat, p.i) orelse return Error.Invalid;
+            p.i += d.len;
+            return d.cp;
+        }
+
+        /// `[:name:]` / `[:^name:]` inside a codepoint-mode class: the ASCII
+        /// POSIX class (UTS #18 RL1.2a compatibility definitions, like Rust);
+        /// negation complements over the whole scalar universe.
+        fn parsePosixU(p: *Self, out: *Buf) Error!void {
+            p.i += 2; // "[:"
+            var neg = false;
+            if (p.peek() == '^') {
+                neg = true;
+                p.i += 1;
+            }
+            const start = p.i;
+            while (p.peek()) |ch| {
+                if (ch == ':') break;
+                p.i += 1;
+            }
+            const name = p.pat[start..p.i];
+            if (p.peek() != ':') return Error.Invalid;
+            p.i += 1;
+            if (p.peek() != ']') return Error.Invalid;
+            p.i += 1;
+            const pc = posixClass(name) orelse return Error.Unsupported;
+            var t = p.newBuf();
+            defer t.deinit();
+            for (pc.ranges) |r| try t.append(.{ .lo = r.start, .hi = r.end });
+            try uset.normalize(&t);
+            if (neg) try p.complementInPlace(&t);
+            try out.appendSlice(t.items());
         }
 
         /// `\p{Name}` / `\P{Name}` / `\pL` — resolve the General_Category
@@ -1113,24 +1580,8 @@ fn Parser(comptime cap: ?usize) type {
         /// standalone-`\p` leaf and the in-`[...]` member path so both keep
         /// byte-identical semantics.
         fn readPropBitmap(p: *Self, negated: bool) Error![32]u8 {
-            if (p.ci) return Error.Unsupported; // (?i)+\p: follow-on
-
-            var spec: []const u8 = undefined;
-            if (p.peek() == '{') {
-                p.i += 1;
-                const s = p.i;
-                while (p.peek()) |ch| {
-                    if (ch == '}') break;
-                    p.i += 1;
-                }
-                if (p.peek() != '}') return Error.Invalid;
-                spec = p.pat[s..p.i];
-                p.i += 1; // consume '}'
-            } else {
-                if (p.peek() == null) return Error.Invalid;
-                spec = p.pat[p.i .. p.i + 1];
-                p.i += 1;
-            }
+            if (p.ci) return Error.Unsupported; // byte-mode (?i)+\p: use (?u)
+            const spec = try p.readPropSpec();
 
             // Allocator-free: a regular Latin-1 byte set, so this resolves at
             // comptime exactly like `[a-z]` (no heap → comptime `Pattern` bakes
@@ -1141,6 +1592,26 @@ fn Parser(comptime cap: ?usize) type {
             return unicode_class.resolveLatin1Bitmap(spec, negated) catch |e| return switch (e) {
                 error.UnknownUnicodeProperty, error.UnsupportedUnicodeProperty => Error.Unsupported,
             };
+        }
+
+        /// The spec text of `\p{…}` / `\pX` (caller consumed the `p`/`P`).
+        fn readPropSpec(p: *Self) Error![]const u8 {
+            if (p.peek() == '{') {
+                p.i += 1;
+                const s = p.i;
+                while (p.peek()) |ch| {
+                    if (ch == '}') break;
+                    p.i += 1;
+                }
+                if (p.peek() != '}') return Error.Invalid;
+                const spec = p.pat[s..p.i];
+                p.i += 1; // consume '}'
+                return spec;
+            }
+            if (p.peek() == null) return Error.Invalid;
+            const spec = p.pat[p.i .. p.i + 1];
+            p.i += 1;
+            return spec;
         }
 
         /// `[...]` accumulated straight into a 256-bit membership bitmap so it

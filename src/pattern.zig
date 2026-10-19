@@ -140,6 +140,13 @@ pub const Options = struct {
     /// fold into the DFA), same as `(?m)…` does. Mirrors the runtime
     /// `CompileFlags.multiline`.
     multiline: bool = false,
+    /// Codepoint mode — the peer of `CompileFlags.unicode` / a leading inline
+    /// `(?u)`: `.`, literals and classes match one UTF-8-encoded scalar, `\d
+    /// \w \s \b` and `\p` take their Unicode definitions, `(?i)` is simple
+    /// case folding. Wide classes compile to UTF-8 byte automata when they fit
+    /// the comptime NFA/DFA ceilings, else the pattern bakes the compiled
+    /// backtracker (which decodes scalars) — never a `@compileError` for size.
+    unicode: bool = false,
 };
 
 const MAX_NFA = thompson.MAX_NFA;
@@ -662,14 +669,14 @@ fn buildRegularBuilt(h: *hir.Hir(HIR_CAP), props: properties.Properties, ng: usi
     };
 }
 
-fn buildAll(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) Built {
+fn buildAll(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool, comptime uni: bool) Built {
     @setEvalBranchQuota(8_000_000);
     var h = hir.Hir(HIR_CAP).initComptime();
     // `parseCaptures` is the single source of truth for capture numbering + names
     // (replaces the old standalone `parser.scanGroups`); it fills `gnames`/`ng`.
     var gnames: [hir.MAX_GROUPS + 1]?[]const u8 = @splat(null);
     var ng_groups: usize = 0;
-    parser.parseCaptures(HIR_CAP, &h, undefined, pattern, .{ .ci = ci, .multiline = ml }, &ng_groups, &gnames) catch |e| {
+    parser.parseCaptures(HIR_CAP, &h, undefined, pattern, .{ .ci = ci, .multiline = ml, .unicode = uni }, &ng_groups, &gnames) catch |e| {
         return .{
             .dfa = full_dfa.emptyDfa256(.ok),
             .outcome = switch (e) {
@@ -732,7 +739,14 @@ fn buildAll(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) 
 
     if (props.requires_backtracking or props.has_look) return buildBacktrackBuilt(&h, props, ng, gnames);
 
-    return buildRegularBuilt(&h, props, ng, gnames, ci);
+    const reg = buildRegularBuilt(&h, props, ng, gnames, ci);
+    // A `(?u)` class whose UTF-8 automaton overflows the comptime NFA / DFA
+    // ceilings (`\p{L}` is a few hundred NFA states; `MAX_NFA` is 256) is not
+    // a rejection: the compiled backtracker matches `.uclass` by decoding one
+    // scalar and binary-searching its ranges, so bake that instead. (The
+    // runtime has the lazy DFA for the same case.)
+    if (reg.outcome == .exploded and props.has_uclass) return buildBacktrackBuilt(&h, props, ng, gnames);
+    return reg;
 }
 
 /// Comptime predicate: does `Pattern(pattern, …)` compile (vs. hit one of its
@@ -745,7 +759,14 @@ fn buildAll(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) 
 /// at the generous benchmark budget, so pass matching opts when it matters.)
 /// `ci` = case_insensitive, `ml` = multiline (same as `Options`).
 pub fn compilesAtComptime(comptime pattern: []const u8, comptime ci: bool, comptime ml: bool) bool {
-    const built = comptime buildAll(pattern, ci, ml);
+    const built = comptime buildAll(pattern, ci, ml, false);
+    return built.outcome == .ok;
+}
+
+/// `compilesAtComptime` over a full `Options` value (so codepoint-mode
+/// patterns can be probed too).
+pub fn compilesWith(comptime pattern: []const u8, comptime opts: Options) bool {
+    const built = comptime buildAll(pattern, opts.case_insensitive, opts.multiline, opts.unicode);
     return built.outcome == .ok;
 }
 
@@ -1157,7 +1178,7 @@ fn CaptureSupport(comptime built: Built) type {
 /// doc comment — the `has_dfa`-dependent signatures and `Match` ownership
 /// contract are preserved exactly so callers/tests need no changes.
 pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
-    const built = comptime buildAll(pattern, opts.case_insensitive, opts.multiline);
+    const built = comptime buildAll(pattern, opts.case_insensitive, opts.multiline, opts.unicode);
     const m = built.dfa;
 
     // Blowing the internal construction ceiling is unrepresentable — there is

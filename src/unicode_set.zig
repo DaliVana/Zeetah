@@ -236,6 +236,25 @@ pub fn isAscii(ranges: []const R) bool {
     return ranges.len == 0 or ranges[ranges.len - 1].hi < 0x80;
 }
 
+/// 128-bit membership map of the set's ASCII members (bit `cp` ⇔ `cp` ∈ set,
+/// `cp < 0x80`): the per-scalar fast path of `.uclass` matching, since real
+/// text is overwhelmingly ASCII even in codepoint mode.
+pub fn asciiBits(ranges: []const R) [16]u8 {
+    var bm: [16]u8 = @splat(0);
+    for (ranges) |r| {
+        if (r.lo >= 0x80) break;
+        var c: u32 = r.lo;
+        while (c <= r.hi and c < 0x80) : (c += 1) bm[c >> 3] |= @as(u8, 1) << @as(u3, @intCast(c & 7));
+    }
+    return bm;
+}
+
+/// Membership with the ASCII fast path (`bits` = `asciiBits(ranges)`).
+pub inline fn containsFast(ranges: []const R, bits: *const [16]u8, cp: u21) bool {
+    if (cp < 0x80) return (bits[cp >> 3] & (@as(u8, 1) << @as(u3, @intCast(cp & 7)))) != 0;
+    return utf8.inRanges(ranges, cp);
+}
+
 /// The 256-bit byte map of an ASCII-only set (bits ≥ 0x80 stay clear).
 pub fn asciiBitmap(ranges: []const R) [32]u8 {
     var bm: [32]u8 = @splat(0);

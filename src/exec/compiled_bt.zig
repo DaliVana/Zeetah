@@ -372,9 +372,10 @@ fn SetNode(comptime bm: [32]u8, comptime K: type) type {
 /// sequence is not a scalar and never matches.
 fn UClassNode(comptime ranges: []const hir.CodepointRange, comptime K: type) type {
     return struct {
+        const ascii: [16]u8 = uset.asciiBits(ranges);
         fn run(c: *Ctx, pos: usize) Error!bool {
             const d = utf8.decodeAt(c.input, pos) orelse return false;
-            if (!uset.contains(ranges, d.cp)) return false;
+            if (!uset.containsFast(ranges, &ascii, d.cp)) return false;
             return K.run(c, pos + d.len);
         }
     };
@@ -429,8 +430,54 @@ fn LoopNode(comptime G: type, comptime ref: NodeRef, comptime K: type, comptime 
         const bm = G.hh.sets[bn.set_idx];
         return if (nd.greedy) GreedySetLoop(bm, body, min, track, K) else LazySetLoop(bm, body, min, track, K);
     }
+    if (bn.tag == .uclass and nd.greedy) return GreedyUClassLoop(G.hh.uclassRanges(bn.set_idx), body, min, track, K);
     const L = Loop(G, body, nd.greedy, track, K);
     return if (min == 0) L.Star else L.Plus;
+}
+
+/// Greedy `U*` / `U+` over one codepoint class: the interpreter's
+/// `greedyUClassRun` — scan the maximal run of member scalars, then give the
+/// continuation each end from longest to shortest, one scalar at a time.
+fn GreedyUClassLoop(comptime ranges: []const hir.CodepointRange, comptime body: NodeRef, comptime min: usize, comptime track: bool, comptime K: type) type {
+    return struct {
+        const ascii: [16]u8 = uset.asciiBits(ranges);
+        fn run(c: *Ctx, pos: usize) Error!bool {
+            if (track and seenIn(c.seen, if (min == 0) entryKey(body) else bodyKey(body), pos)) return false;
+            const in = c.input;
+            var e = pos;
+            var n: usize = 0;
+            while (e < in.len) {
+                const b = in[e];
+                if (b < 0x80) {
+                    if ((ascii[b >> 3] & (@as(u8, 1) << @as(u3, @intCast(b & 7)))) == 0) break;
+                    e += 1;
+                } else {
+                    const d = utf8.decodeAt(in, e) orelse break;
+                    if (!uset.contains(ranges, d.cp)) break;
+                    e += d.len;
+                }
+                n += 1;
+            }
+            if (n < min) return false;
+            const saved = c.seen;
+            defer c.seen = saved;
+            var p = e;
+            while (true) {
+                try tick(c);
+                var here: Seen = undefined;
+                if (track) {
+                    here = .{ .key = if (p == pos) entryKey(body) else loopKey(body), .pos = p, .prev = saved };
+                    c.seen = &here;
+                }
+                if (try K.run(c, p)) return true;
+                if (n == min) break;
+                const d = utf8.decodeBefore(c.input, p) orelse unreachable;
+                p -= d.len;
+                n -= 1;
+            }
+            return false;
+        }
+    };
 }
 
 /// Greedy `C*` / `C+` over one byte class: scan the maximal run, then hand the

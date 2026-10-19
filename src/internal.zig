@@ -45,6 +45,9 @@ pub const Pattern = @import("pattern.zig").Pattern;
 pub const PatternOptions = @import("pattern.zig").Options;
 pub const compilesAtComptime = @import("pattern.zig").compilesAtComptime;
 
+/// `compilesAtComptime` over a full `PatternOptions` value (codepoint mode included).
+pub const compilesWith = @import("pattern.zig").compilesWith;
+
 pub const properties = @import("properties.zig");
 pub const Properties = @import("properties.zig").Properties;
 pub const seq_extract = @import("exec/seq_extract.zig");
@@ -66,6 +69,8 @@ pub const compiled_bt = @import("exec/compiled_bt.zig");
 pub const onepass = @import("exec/onepass.zig");
 pub const class_span = @import("exec/class_span.zig");
 pub const class_seq = @import("exec/class_seq.zig");
+pub const seek = @import("exec/seek.zig");
+pub const delegate = @import("exec/delegate.zig");
 pub const word_set = @import("exec/word_set.zig");
 
 // Single source of truth: the public `version` in root.zig (kept in lockstep

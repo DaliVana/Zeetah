@@ -78,6 +78,9 @@ pub const PatternOptions = @import("pattern.zig").Options;
 /// the comptime path can't represent. `ci` matches `Options.case_insensitive`.
 pub const compilesAtComptime = @import("pattern.zig").compilesAtComptime;
 
+/// `compilesAtComptime` over a full `PatternOptions` value (codepoint mode included).
+pub const compilesWith = @import("pattern.zig").compilesWith;
+
 /// Type-safe fluent builder for constructing patterns programmatically.
 pub const Builder = @import("builder.zig").Builder;
 

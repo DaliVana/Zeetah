@@ -129,8 +129,10 @@ test "flags: case_insensitive / dot_all / multiline + inline flags" {
     try eq(@as(usize, 3), lines.len);
     try eqs("gamma", lines[2].slice);
 
-    // unicode flag is the one rejected flag
-    try std.testing.expectError(error.NotImplemented, Regex.compileWithFlags(a, "x", .{ .unicode = true }));
+    // the unicode flag selects codepoint mode (`.` is one scalar)
+    var u = try Regex.compileWithFlags(a, "x.", .{ .unicode = true });
+    defer u.deinit();
+    try std.testing.expectEqualStrings("xé", (try u.find("xé")).?.slice);
 
     inline for (.{ "(?i)hello", "(?i:ab)c", "(?s)a.b", "(?x) a b c", "(?m)^x" }) |p| {
         var r = try Regex.compile(a, p);

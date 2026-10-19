@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const common = @import("common.zig");
+const uset = @import("unicode_set.zig");
 
 pub const NodeRef = u32;
 
@@ -19,8 +20,10 @@ pub const NodeRef = u32;
 pub const CodepointRange = common.CodepointRange;
 
 /// A `.uclass` descriptor: `len` ranges starting at `off` in the store's
-/// `uranges` pool (normalized, surrogate-free, negation folded in).
-pub const UClass = struct { off: u32, len: u32 };
+/// `uranges` pool (normalized, surrogate-free, negation folded in), plus the
+/// set's 128-bit ASCII membership map (`unicode_set.asciiBits`) — the
+/// per-scalar fast path of the backtracking tier.
+pub const UClass = struct { off: u32, len: u32, ascii: [16]u8 = @splat(0) };
 
 /// Sentinel "no child". Real refs are indices `< node_count`.
 pub const none: NodeRef = std.math.maxInt(NodeRef);
@@ -315,14 +318,15 @@ pub fn Hir(comptime cap: ?usize) type {
                 if (same) return @intCast(k);
             }
             const off = self.urange_count;
+            const desc: UClass = .{ .off = @intCast(off), .len = @intCast(ranges.len), .ascii = uset.asciiBits(ranges) };
             if (cap != null) {
                 if (self.uclass_count >= MAX_UCLASSES or off + ranges.len > URANGE_CAP) return Error.TooComplex;
                 for (ranges, 0..) |r, i| self.uranges[off + i] = r;
-                self.uclasses[self.uclass_count] = .{ .off = @intCast(off), .len = @intCast(ranges.len) };
+                self.uclasses[self.uclass_count] = desc;
             } else {
                 if (self.uclass_count >= MAX_UCLASSES_RUNTIME or off + ranges.len > MAX_URANGES_RUNTIME) return Error.TooComplex;
                 self.uranges.appendSlice(allocator, ranges) catch return Error.TooComplex;
-                self.uclasses.append(allocator, .{ .off = @intCast(off), .len = @intCast(ranges.len) }) catch return Error.TooComplex;
+                self.uclasses.append(allocator, desc) catch return Error.TooComplex;
             }
             self.urange_count += ranges.len;
             const id: u32 = @intCast(self.uclass_count);
@@ -337,6 +341,16 @@ pub fn Hir(comptime cap: ?usize) type {
             return pool[d.off .. d.off + d.len];
         }
 
+        /// The descriptor of `.uclass` index `idx` (ranges window + ASCII map).
+        pub fn uclassDesc(self: *const Self, idx: u32) *const UClass {
+            return if (cap != null) &self.uclasses[idx] else &self.uclasses.items[idx];
+        }
+
+        /// `cp` ∈ `.uclass` `idx`: one bit test for ASCII, else a binary search.
+        pub inline fn uclassContains(self: *const Self, idx: u32, cp: u21) bool {
+            return uset.containsFast(self.uclassRanges(idx), &self.uclassDesc(idx).ascii, cp);
+        }
+
         /// Copy the `.uclass` tables of `src` wholesale (a trimmed/baked copy of
         /// a comptime store; node refs and `set_idx` values stay valid). Pads
         /// the unused comptime pool so the value is fully defined.
@@ -349,7 +363,7 @@ pub fn Hir(comptime cap: ?usize) type {
             @memcpy(self.uranges[0..src.urange_count], src.uranges[0..src.urange_count]);
             @memset(self.uranges[src.urange_count..], .{ .lo = 0, .hi = 0 });
             @memcpy(self.uclasses[0..src.uclass_count], src.uclasses[0..src.uclass_count]);
-            @memset(self.uclasses[src.uclass_count..], .{ .off = 0, .len = 0 });
+            @memset(self.uclasses[src.uclass_count..], .{ .off = 0, .len = 0, .ascii = @splat(0) });
         }
 
         pub fn node(self: *const Self, ref: NodeRef) HNode {

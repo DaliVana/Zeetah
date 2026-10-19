@@ -715,6 +715,7 @@ pub const Regex = struct {
             .dot_all = flags.dot_all,
             .extended = flags.extended,
             .multiline = flags.multiline,
+            .unicode = flags.unicode,
         };
 
         var backing: std.ArrayList(u8) = .empty;
@@ -1042,10 +1043,9 @@ pub const Regex = struct {
         // of the inline `(?i)`/`(?s)`/`(?x)`/`(?m)` groups (see
         // `parser.ParseFlags`); `multiline` just routes `^`/`$` to
         // `start_line`/`end_line` look nodes and disables the anchored prescan.
-        // `unicode` (codepoint-aware classes) is a later phase the
-        // byte-oriented DFA does not model yet.
-        if (flags.unicode)
-            return RegexError.NotImplemented;
+        // `unicode` is the codepoint-mode peer of inline `(?u)`: scoped in the
+        // parser like the others; the NFA lowers its classes to UTF-8 byte
+        // automata, so no engine below needs to know.
 
         // Dupe the pattern FIRST and parse the copy: `parseCaptures` reports the
         // `(?<name>)` name slices as aliases into the parsed source, so they must
@@ -1066,6 +1066,7 @@ pub const Regex = struct {
             .dot_all = flags.dot_all,
             .extended = flags.extended,
             .multiline = flags.multiline,
+            .unicode = flags.unicode,
         }, &ng0, &gnames0) catch |e| {
             // A huge pure-literal alternation (e.g. a 5000-word dictionary)
             // overflows `MAX_NODES` during parse. It is trivially regular, so
