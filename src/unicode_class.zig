@@ -1,43 +1,42 @@
-//! Resolution and lowering of Unicode property classes (`\p{...}` / `\P{...}`).
+//! Resolution of Unicode property classes (`\p{...}` / `\P{...}` / `\pX`).
 //!
-//! Scope (UTS #18 RL1.2 — General_Category only):
-//!   * one- and two-letter general categories (`\p{L}`, `\p{Lu}`, `\p{Nd}`, …)
-//!     and the super-categories `L M N P S Z C`,
-//!   * long names and value aliases, matched loosely per UAX #44-LM3,
-//!   * negation via `\P{...}`, `\p{^...}`, or an enclosing `[^...]`,
-//!   * the `gc=` / `General_Category=` property-name prefix,
-//!   * the special values `Any`, `ASCII`, `Assigned`.
+//! Two front doors, one spec grammar (`parseSpec`):
+//!   * **codepoint mode** (`(?u)`): `resolveInto` — General_Category (all
+//!     UAX #44 aliases and the super-categories, `L&`), `Script`,
+//!     `Script_Extensions`, every binary property in the generated tables,
+//!     and the specials `Any` / `ASCII` / `Assigned`; `prop=value`,
+//!     `prop:value`, `prop!=value`, a leading `^`, `\P`; UAX44-LM3 loose name
+//!     matching with an optional `Is` prefix. Bare names resolve special →
+//!     General_Category → binary property → Script (Rust `regex-syntax`
+//!     order, which keeps `\p{Sc}` = Currency_Symbol and `\p{Cf}` = Format).
+//!   * **byte mode**: `resolveLatin1Bitmap` — the frozen contract: only
+//!     General_Category / specials, restricted to codepoints ≤ 0xFF; scripts,
+//!     binary properties and script extensions are recognised but rejected
+//!     with `error.UnsupportedUnicodeProperty` (→ `NotImplemented`).
 //!
-//! Scripts, script extensions and binary properties are recognised but rejected
-//! with `error.UnsupportedUnicodeProperty` so callers can surface a clear,
-//! actionable message rather than silently mis-tokenising.
-//!
-//! The result is always a sorted, non-overlapping, surrogate-free set of
-//! codepoint ranges with negation already folded in. The NFA compiler expands
-//! that into a UTF-8 byte automaton; the backtracker tests it per codepoint.
+//! Results are normalized, surrogate-free `CodepointRange` sets with negation
+//! folded in (`unicode_set`). The parser turns them into `.uclass` HIR nodes,
+//! the NFA compiler into UTF-8 byte automata, the backtrackers test them per
+//! decoded codepoint.
 
 const std = @import("std");
 const common = @import("common.zig");
 const tables = @import("unicode_tables.zig");
-// Property-resolution errors (`error.UnknownUnicodeProperty` /
-// `error.UnsupportedUnicodeProperty` / `error.OutOfMemory`) are global errors,
-// not part of the public `RegexError`: the parser catches them and remaps to
-// `error.NotImplemented` before they can escape `compile`.
+const uset = @import("unicode_set.zig");
 
 pub const CodepointRange = common.CodepointRange;
 pub const unicode_version = tables.unicode_version;
 
 const Cat = tables.Category;
 
-/// Surrogate code points — never valid Unicode scalar values, so always
-/// excluded from both positive and negated property sets.
-const SURR_LO: common.Codepoint = 0xD800;
-const SURR_HI: common.Codepoint = 0xDFFF;
+/// Property-resolution errors. Global errors, not part of the public
+/// `RegexError`: the parser remaps both to `error.NotImplemented`.
+pub const ParseError = error{ UnknownUnicodeProperty, UnsupportedUnicodeProperty };
 
 // --- Loose name matching (UAX #44-LM3) -------------------------------------
 
 /// Normalize a property or value name: lowercase, drop spaces / `_` / `-`.
-/// A leading "is" is handled by the lookup (tried with and without).
+/// A leading "is" is handled by the lookups (tried with and without).
 fn normalize(buf: []u8, name: []const u8) []const u8 {
     var n: usize = 0;
     for (name) |c| {
@@ -55,7 +54,7 @@ fn normalize(buf: []u8, name: []const u8) []const u8 {
 
 const Special = enum { any, ascii, assigned };
 
-const NameResult = union(enum) {
+const GcResult = union(enum) {
     cats: []const Cat,
     special: Special,
 };
@@ -74,20 +73,21 @@ fn one(comptime c: Cat) []const Cat {
 }
 
 /// Map an already-normalized general-category value name to its categories.
-fn lookupGc(norm: []const u8) ?NameResult {
+fn lookupGc(norm: []const u8) ?GcResult {
     const eq = std.mem.eql;
-    const Entry = struct { []const u8, NameResult };
+    const Entry = struct { []const u8, GcResult };
     const table = [_]Entry{
         // Super-categories
         .{ "l", .{ .cats = L } },                           .{ "letter", .{ .cats = L } },
         .{ "lc", .{ .cats = LC } },                         .{ "casedletter", .{ .cats = LC } },
-        .{ "m", .{ .cats = M } },                           .{ "mark", .{ .cats = M } },
-        .{ "combiningmark", .{ .cats = M } },               .{ "n", .{ .cats = N } },
-        .{ "number", .{ .cats = N } },                      .{ "p", .{ .cats = P } },
-        .{ "punctuation", .{ .cats = P } },                 .{ "punct", .{ .cats = P } },
-        .{ "s", .{ .cats = S } },                           .{ "symbol", .{ .cats = S } },
-        .{ "z", .{ .cats = Z } },                           .{ "separator", .{ .cats = Z } },
-        .{ "c", .{ .cats = C } },                           .{ "other", .{ .cats = C } },
+        .{ "l&", .{ .cats = LC } },                         .{ "m", .{ .cats = M } },
+        .{ "mark", .{ .cats = M } },                        .{ "combiningmark", .{ .cats = M } },
+        .{ "n", .{ .cats = N } },                           .{ "number", .{ .cats = N } },
+        .{ "p", .{ .cats = P } },                           .{ "punctuation", .{ .cats = P } },
+        .{ "punct", .{ .cats = P } },                       .{ "s", .{ .cats = S } },
+        .{ "symbol", .{ .cats = S } },                      .{ "z", .{ .cats = Z } },
+        .{ "separator", .{ .cats = Z } },                   .{ "c", .{ .cats = C } },
+        .{ "other", .{ .cats = C } },
         // Letters
         .{ "lu", .{ .cats = one(.Lu) } },                   .{ "uppercaseletter", .{ .cats = one(.Lu) } },
         .{ "ll", .{ .cats = one(.Ll) } },                   .{ "lowercaseletter", .{ .cats = one(.Ll) } },
@@ -104,32 +104,29 @@ fn lookupGc(norm: []const u8) ?NameResult {
         .{ "letternumber", .{ .cats = one(.Nl) } },         .{ "no", .{ .cats = one(.No) } },
         .{ "othernumber", .{ .cats = one(.No) } },
         // Punctuation
-                 .{ "pc", .{ .cats = one(.Pc) } },
-        .{ "connectorpunctuation", .{ .cats = one(.Pc) } }, .{ "pd", .{ .cats = one(.Pd) } },
-        .{ "dashpunctuation", .{ .cats = one(.Pd) } },      .{ "ps", .{ .cats = one(.Ps) } },
-        .{ "openpunctuation", .{ .cats = one(.Ps) } },      .{ "pe", .{ .cats = one(.Pe) } },
-        .{ "closepunctuation", .{ .cats = one(.Pe) } },     .{ "pi", .{ .cats = one(.Pi) } },
-        .{ "initialpunctuation", .{ .cats = one(.Pi) } },   .{ "pf", .{ .cats = one(.Pf) } },
-        .{ "finalpunctuation", .{ .cats = one(.Pf) } },     .{ "po", .{ .cats = one(.Po) } },
-        .{ "otherpunctuation", .{ .cats = one(.Po) } },
+        .{ "pc", .{ .cats = one(.Pc) } },                   .{ "connectorpunctuation", .{ .cats = one(.Pc) } },
+        .{ "pd", .{ .cats = one(.Pd) } },                   .{ "dashpunctuation", .{ .cats = one(.Pd) } },
+        .{ "ps", .{ .cats = one(.Ps) } },                   .{ "openpunctuation", .{ .cats = one(.Ps) } },
+        .{ "pe", .{ .cats = one(.Pe) } },                   .{ "closepunctuation", .{ .cats = one(.Pe) } },
+        .{ "pi", .{ .cats = one(.Pi) } },                   .{ "initialpunctuation", .{ .cats = one(.Pi) } },
+        .{ "pf", .{ .cats = one(.Pf) } },                   .{ "finalpunctuation", .{ .cats = one(.Pf) } },
+        .{ "po", .{ .cats = one(.Po) } },                   .{ "otherpunctuation", .{ .cats = one(.Po) } },
         // Symbols
-            .{ "sm", .{ .cats = one(.Sm) } },
-        .{ "mathsymbol", .{ .cats = one(.Sm) } },           .{ "sc", .{ .cats = one(.Sc) } },
-        .{ "currencysymbol", .{ .cats = one(.Sc) } },       .{ "sk", .{ .cats = one(.Sk) } },
-        .{ "modifiersymbol", .{ .cats = one(.Sk) } },       .{ "so", .{ .cats = one(.So) } },
-        .{ "othersymbol", .{ .cats = one(.So) } },
+        .{ "sm", .{ .cats = one(.Sm) } },                   .{ "mathsymbol", .{ .cats = one(.Sm) } },
+        .{ "sc", .{ .cats = one(.Sc) } },                   .{ "currencysymbol", .{ .cats = one(.Sc) } },
+        .{ "sk", .{ .cats = one(.Sk) } },                   .{ "modifiersymbol", .{ .cats = one(.Sk) } },
+        .{ "so", .{ .cats = one(.So) } },                   .{ "othersymbol", .{ .cats = one(.So) } },
         // Separators
-                 .{ "zs", .{ .cats = one(.Zs) } },
-        .{ "spaceseparator", .{ .cats = one(.Zs) } },       .{ "zl", .{ .cats = one(.Zl) } },
-        .{ "lineseparator", .{ .cats = one(.Zl) } },        .{ "zp", .{ .cats = one(.Zp) } },
-        .{ "paragraphseparator", .{ .cats = one(.Zp) } },
+        .{ "zs", .{ .cats = one(.Zs) } },                   .{ "spaceseparator", .{ .cats = one(.Zs) } },
+        .{ "zl", .{ .cats = one(.Zl) } },                   .{ "lineseparator", .{ .cats = one(.Zl) } },
+        .{ "zp", .{ .cats = one(.Zp) } },                   .{ "paragraphseparator", .{ .cats = one(.Zp) } },
         // Other
-          .{ "cc", .{ .cats = one(.Cc) } },
-        .{ "control", .{ .cats = one(.Cc) } },              .{ "cntrl", .{ .cats = one(.Cc) } },
-        .{ "cf", .{ .cats = one(.Cf) } },                   .{ "format", .{ .cats = one(.Cf) } },
-        .{ "cs", .{ .cats = one(.Cs) } },                   .{ "surrogate", .{ .cats = one(.Cs) } },
-        .{ "co", .{ .cats = one(.Co) } },                   .{ "privateuse", .{ .cats = one(.Co) } },
-        .{ "cn", .{ .cats = one(.Cn) } },                   .{ "unassigned", .{ .cats = one(.Cn) } },
+        .{ "cc", .{ .cats = one(.Cc) } },                   .{ "control", .{ .cats = one(.Cc) } },
+        .{ "cntrl", .{ .cats = one(.Cc) } },                .{ "cf", .{ .cats = one(.Cf) } },
+        .{ "format", .{ .cats = one(.Cf) } },               .{ "cs", .{ .cats = one(.Cs) } },
+        .{ "surrogate", .{ .cats = one(.Cs) } },            .{ "co", .{ .cats = one(.Co) } },
+        .{ "privateuse", .{ .cats = one(.Co) } },           .{ "cn", .{ .cats = one(.Cn) } },
+        .{ "unassigned", .{ .cats = one(.Cn) } },
         // Special values
         .{ "any", .{ .special = .any } },                   .{ "ascii", .{ .special = .ascii } },
         .{ "assigned", .{ .special = .assigned } },
@@ -145,126 +142,54 @@ fn lookupGc(norm: []const u8) ?NameResult {
     return null;
 }
 
-/// Names that are valid Unicode properties/values but outside current scope
-/// (scripts, script extensions, blocks, binary properties). Recognising them
-/// lets us return the actionable `UnsupportedUnicodeProperty` instead of the
-/// generic `UnknownUnicodeProperty` for, e.g., `\p{Greek}` or `\p{White_Space}`.
-fn isUnsupportedProperty(norm: []const u8) bool {
-    const known = [_][]const u8{
-        // property names
-        "script",            "sc",                        "scriptextensions",      "scx",
-        "block",             "blk",                       "age",
-        // common binary properties
-                          "whitespace",
-        "alphabetic",        "uppercase",                 "lowercase",             "emoji",
-        "emojipresentation", "emojimodifier",             "noncharactercodepoint", "math",
-        "hexdigit",          "asciihexdigit",             "dash",                  "diacritic",
-        "extender",          "ideographic",               "joincontrol",           "quotationmark",
-        "softdotted",        "defaultignorablecodepoint", "whitespacelm3",
-        // common script value names (bare `\p{Greek}` shorthand)
-                "common",
-        "latin",             "greek",                     "cyrillic",              "armenian",
-        "hebrew",            "arabic",                    "syriac",                "thaana",
-        "devanagari",        "bengali",                   "gurmukhi",              "gujarati",
-        "oriya",             "tamil",                     "telugu",                "kannada",
-        "malayalam",         "sinhala",                   "thai",                  "lao",
-        "tibetan",           "myanmar",                   "georgian",              "hangul",
-        "ethiopic",          "cherokee",                  "mongolian",             "hiragana",
-        "katakana",          "bopomofo",                  "han",                   "yi",
-        "coptic",            "inherited",                 "runic",                 "ogham",
-        "khmer",             "braille",
-    };
-    for (known) |k| {
-        if (std.mem.eql(u8, k, norm)) return true;
-    }
-    return false;
-}
-
-// --- Range-set construction ------------------------------------------------
-
-const RangeList = std.ArrayList(CodepointRange);
-
-fn appendCat(list: *RangeList, a: std.mem.Allocator, cat: Cat) !void {
-    for (tables.rangesFor(cat)) |r| {
-        try list.append(a, .{ .lo = r.lo, .hi = r.hi });
-    }
-}
-
-fn lessThan(_: void, x: CodepointRange, y: CodepointRange) bool {
-    return x.lo < y.lo;
-}
-
-/// Sort, merge adjacent/overlapping ranges, and remove the surrogate hole.
-/// Result is written back into `list`.
-fn normalizeRanges(list: *RangeList, a: std.mem.Allocator) !void {
-    std.mem.sort(CodepointRange, list.items, {}, lessThan);
-
-    var merged: RangeList = .empty;
-    defer merged.deinit(a);
-    for (list.items) |r| {
-        if (merged.items.len > 0) {
-            const last = &merged.items[merged.items.len - 1];
-            if (r.lo <= @as(u32, last.hi) + 1) {
-                if (r.hi > last.hi) last.hi = r.hi;
-                continue;
-            }
+/// Binary search a generated, name-sorted alias table.
+fn lookupNamed(comptime Entry: type, table: []const Entry, norm: []const u8) ?@FieldType(Entry, "id") {
+    var lo: usize = 0;
+    var hi: usize = table.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        switch (std.mem.order(u8, table[mid].name, norm)) {
+            .lt => lo = mid + 1,
+            .gt => hi = mid,
+            .eq => return table[mid].id,
         }
-        try merged.append(a, r);
     }
-
-    // Subtract the surrogate range [D800, DFFF].
-    list.clearRetainingCapacity();
-    for (merged.items) |r| {
-        if (r.hi < SURR_LO or r.lo > SURR_HI) {
-            try list.append(a, r);
-            continue;
-        }
-        if (r.lo < SURR_LO) try list.append(a, .{ .lo = r.lo, .hi = SURR_LO - 1 });
-        if (r.hi > SURR_HI) try list.append(a, .{ .lo = SURR_HI + 1, .hi = r.hi });
-    }
+    return null;
 }
 
-/// Complement `list` within the valid scalar universe
-/// [0, 0x10FFFF] \ [D800, DFFF]. `list` must already be normalized.
-fn complement(list: *RangeList, a: std.mem.Allocator) !void {
-    var out: RangeList = .empty;
-    defer out.deinit(a);
-
-    var expected: u32 = 0;
-    for (list.items) |r| {
-        if (r.lo > expected) {
-            try out.append(a, .{ .lo = @intCast(expected), .hi = @intCast(r.lo - 1) });
-        }
-        expected = @as(u32, r.hi) + 1;
-    }
-    if (expected <= common.MAX_CODEPOINT) {
-        try out.append(a, .{ .lo = @intCast(expected), .hi = common.MAX_CODEPOINT });
-    }
-
-    list.clearRetainingCapacity();
-    try list.appendSlice(a, out.items);
-    try normalizeRanges(list, a); // re-clip the surrogate hole
+fn lookupScript(norm: []const u8) ?tables.Script {
+    if (lookupNamed(tables.ScriptName, &tables.script_names, norm)) |s| return s;
+    if (norm.len > 2 and std.mem.startsWith(u8, norm, "is"))
+        return lookupNamed(tables.ScriptName, &tables.script_names, norm[2..]);
+    return null;
 }
 
-/// Parsed `\p{...}` spec: the resolved general-category lookup and whether the
-/// overall set is negated (folding `\P`, a leading `^`, and an enclosing `[^]`).
-const ParsedSpec = struct { found: NameResult, negated: bool };
+fn lookupBinary(norm: []const u8) ?tables.BinaryProp {
+    if (lookupNamed(tables.BinaryName, &tables.binary_names, norm)) |p| return p;
+    if (norm.len > 2 and std.mem.startsWith(u8, norm, "is"))
+        return lookupNamed(tables.BinaryName, &tables.binary_names, norm[2..]);
+    return null;
+}
 
-/// Parse the text inside `\p{...}` (or a single letter for `\pX`) down to its
-/// general-category lookup and negation flag — the prologue shared by `resolve`
-/// (allocating, full-Unicode) and `resolveLatin1Bitmap` (alloc-free, Latin-1),
-/// so the two stay membership- and error-identical by construction rather than
-/// by hand-kept verbatim copies.
-///
-/// Handles, in order: surrounding whitespace, a leading `^` negation, an
-/// optional `gc=` / `General_Category:` (`=` or `:`) property prefix that must
-/// name general-category, then the loose value-name lookup. The
-/// unsupported-vs-unknown error distinction lives here. Non-allocating (only
-/// stack scratch), so it is usable from the comptime `Pattern` bake path.
-fn parseSpec(spec: []const u8, outer_negated: bool) error{
-    UnknownUnicodeProperty,
-    UnsupportedUnicodeProperty,
-}!ParsedSpec {
+// --- Spec grammar ----------------------------------------------------------
+
+/// A resolved property query.
+pub const Query = union(enum) {
+    cats: []const Cat,
+    special: Special,
+    script: tables.Script,
+    scx: tables.Script,
+    binary: tables.BinaryProp,
+};
+
+/// Parsed `\p{...}` spec: the query and whether the overall set is negated
+/// (folding `\P`, a leading `^`, `!=`, a binary `=No`, and an enclosing `[^]`).
+pub const Parsed = struct { query: Query, negated: bool };
+
+/// Parse the text inside `\p{...}` (or a single letter for `\pX`). Full
+/// codepoint-mode grammar (see the module doc). Non-allocating (stack scratch
+/// only), so it runs inside the comptime `Pattern` bake.
+pub fn parseSpec(spec: []const u8, outer_negated: bool) ParseError!Parsed {
     var s = std.mem.trim(u8, spec, " \t");
     if (s.len == 0) return error.UnknownUnicodeProperty;
 
@@ -275,85 +200,127 @@ fn parseSpec(spec: []const u8, outer_negated: bool) error{
         if (s.len == 0) return error.UnknownUnicodeProperty;
     }
 
-    // Optional `property=value` (or `property:value`) prefix.
-    var value = s;
     var nbuf: [64]u8 = undefined;
+    var vbuf: [64]u8 = undefined;
+
+    // `property=value` / `property:value` / `property!=value`.
     if (std.mem.indexOfAny(u8, s, "=:")) |eq_idx| {
-        const prop = normalize(&nbuf, s[0..eq_idx]);
-        const is_gc = std.mem.eql(u8, prop, "gc") or
-            std.mem.eql(u8, prop, "generalcategory");
-        if (!is_gc) {
-            return if (isUnsupportedProperty(prop))
-                error.UnsupportedUnicodeProperty
-            else
-                error.UnknownUnicodeProperty;
+        var prop_end = eq_idx;
+        if (s[eq_idx] == '=' and eq_idx > 0 and s[eq_idx - 1] == '!') {
+            negated = !negated;
+            prop_end -= 1;
         }
-        value = std.mem.trim(u8, s[eq_idx + 1 ..], " \t");
+        const prop = normalize(&nbuf, s[0..prop_end]);
+        const value = normalize(&vbuf, std.mem.trim(u8, s[eq_idx + 1 ..], " \t"));
+        if (value.len == 0) return error.UnknownUnicodeProperty;
+        const eq = std.mem.eql;
+        if (eq(u8, prop, "gc") or eq(u8, prop, "generalcategory")) {
+            const g = lookupGc(value) orelse return error.UnknownUnicodeProperty;
+            return .{ .query = switch (g) {
+                .cats => |c| .{ .cats = c },
+                .special => |sp| .{ .special = sp },
+            }, .negated = negated };
+        }
+        if (eq(u8, prop, "sc") or eq(u8, prop, "script")) {
+            const sc = lookupScript(value) orelse return error.UnknownUnicodeProperty;
+            return .{ .query = .{ .script = sc }, .negated = negated };
+        }
+        if (eq(u8, prop, "scx") or eq(u8, prop, "scriptextensions")) {
+            const sc = lookupScript(value) orelse return error.UnknownUnicodeProperty;
+            return .{ .query = .{ .scx = sc }, .negated = negated };
+        }
+        if (lookupBinary(prop)) |bp| {
+            // `Alphabetic=Yes` / `=No` (and the y/n/t/f/true/false spellings).
+            const yes = eq(u8, value, "y") or eq(u8, value, "yes") or eq(u8, value, "t") or eq(u8, value, "true");
+            const no = eq(u8, value, "n") or eq(u8, value, "no") or eq(u8, value, "f") or eq(u8, value, "false");
+            if (!yes and !no) return error.UnknownUnicodeProperty;
+            return .{ .query = .{ .binary = bp }, .negated = if (no) !negated else negated };
+        }
+        return error.UnknownUnicodeProperty;
     }
 
-    var vbuf: [64]u8 = undefined;
-    const norm = normalize(&vbuf, value);
-    const found = lookupGc(norm) orelse {
-        return if (isUnsupportedProperty(norm))
-            error.UnsupportedUnicodeProperty
-        else
-            error.UnknownUnicodeProperty;
-    };
-
-    return .{ .found = found, .negated = negated };
+    // Bare value: special / gc → binary property → script.
+    const norm = normalize(&vbuf, s);
+    if (lookupGc(norm)) |g| {
+        return .{ .query = switch (g) {
+            .cats => |c| .{ .cats = c },
+            .special => |sp| .{ .special = sp },
+        }, .negated = negated };
+    }
+    if (lookupBinary(norm)) |bp| return .{ .query = .{ .binary = bp }, .negated = negated };
+    if (lookupScript(norm)) |sc| return .{ .query = .{ .script = sc }, .negated = negated };
+    return error.UnknownUnicodeProperty;
 }
 
-/// Resolve `spec` (the text inside `\p{...}`, or a single letter for `\pX`).
-/// `outer_negated` is true for `\P`. Caller owns the returned slice.
+/// Byte-mode spec parser: the same grammar, but anything outside
+/// General_Category / the specials is `UnsupportedUnicodeProperty` (the frozen
+/// byte-mode contract — scripts and binary properties are "valid but not
+/// available without `(?u)`").
+fn parseSpecLatin1(spec: []const u8, outer_negated: bool) ParseError!Parsed {
+    const p = try parseSpec(spec, outer_negated);
+    return switch (p.query) {
+        .cats, .special => p,
+        .script, .scx, .binary => error.UnsupportedUnicodeProperty,
+    };
+}
+
+// --- Range-set construction ------------------------------------------------
+
+/// Append the raw (unnormalized) ranges of `q` to `buf`. `.assigned` is
+/// appended as `Cn` — the caller flips negation (assigned = ¬Cn).
+fn appendQuery(buf: anytype, q: Query) uset.Error!void {
+    switch (q) {
+        .cats => |cats| for (cats) |c| try buf.appendTable(tables.rangesFor(c)),
+        .special => |sp| switch (sp) {
+            .any => try buf.append(.{ .lo = 0, .hi = common.MAX_CODEPOINT }),
+            .ascii => try buf.append(.{ .lo = 0, .hi = 0x7F }),
+            .assigned => try buf.appendTable(tables.rangesFor(.Cn)),
+        },
+        .script => |sc| try buf.appendTable(tables.scriptRanges(sc)),
+        .scx => |sc| try buf.appendTable(tables.scxRanges(sc)),
+        .binary => |bp| try buf.appendTable(tables.binaryRanges(bp)),
+    }
+}
+
+/// Resolve `parsed` into `out` (cleared first): a normalized, surrogate-free
+/// set with the negation folded in. `scratch` is a second `RangeBuf` the
+/// complement step clobbers. Both are `unicode_set.RangeBuf(…)` values.
+pub fn resolveInto(out: anytype, scratch: anytype, parsed: Parsed) uset.Error!void {
+    out.clear();
+    var negated = parsed.negated;
+    if (parsed.query == .special and parsed.query.special == .assigned) negated = !negated;
+    try appendQuery(out, parsed.query);
+    try uset.normalize(out);
+    if (negated) {
+        try uset.complement(out.items(), scratch);
+        try out.setFrom(scratch.items());
+    }
+}
+
+/// Allocating convenience over `parseSpec` + `resolveInto` (full Unicode).
+/// Caller owns the returned slice.
 pub fn resolve(
     a: std.mem.Allocator,
     spec: []const u8,
     outer_negated: bool,
 ) ![]CodepointRange {
     const parsed = try parseSpec(spec, outer_negated);
-
-    var list: RangeList = .empty;
-    errdefer list.deinit(a);
-
-    switch (parsed.found) {
-        .cats => |cats| {
-            for (cats) |c| try appendCat(&list, a, c);
-            try normalizeRanges(&list, a);
-        },
-        .special => |sp| switch (sp) {
-            .any => try list.append(a, .{ .lo = 0, .hi = common.MAX_CODEPOINT }),
-            .ascii => try list.append(a, .{ .lo = 0, .hi = 0x7F }),
-            .assigned => {
-                try appendCat(&list, a, .Cn);
-                try normalizeRanges(&list, a);
-                try complement(&list, a); // assigned = ¬Cn
-            },
-        },
-    }
-    if (parsed.found == .special and parsed.found.special == .any) try normalizeRanges(&list, a);
-
-    if (parsed.negated) try complement(&list, a);
-
-    return list.toOwnedSlice(a) catch error.OutOfMemory;
+    var out = uset.RangeBuf(null).init(a);
+    defer out.deinit();
+    var scratch = uset.RangeBuf(null).init(a);
+    defer scratch.deinit();
+    resolveInto(&out, &scratch, parsed) catch return error.OutOfMemory;
+    return a.dupe(CodepointRange, out.items());
 }
 
-/// Allocator-free resolution of `\p{spec}` straight to its **Latin-1 byte
-/// set** (codepoints 0..0xFF ∩ property), the engine's byte-oriented `\p`
-/// semantics. Result is byte-identical to `resolve(...)` followed by clipping
-/// every range to ≤0xFF and rasterising into a 256-bit map — but it never
-/// touches an allocator, so the comptime `Pattern` pipeline can bake `\p`
-/// exactly like `[a-z]` (the runtime parser uses it too: no alloc/free, no
-/// full-Unicode normalisation just to discard everything >0xFF).
-///
-/// Equivalence argument: surrogates (0xD800+) and every codepoint a
-/// normalise/merge step touches are >0xFF, so for the Latin-1 window the
-/// sort/merge/surrogate-removal in `resolve` are membership-preserving
-/// no-ops, and a universe complement restricted to [0,0xFF] is exactly a
-/// 256-bit inversion. The spec parsing (trim, leading `^`, `gc=`/`:` prefix,
-/// loose-name lookup, unsupported-vs-unknown) is shared with `resolve` through
-/// `parseSpec`, so the error contract is identical by construction.
-pub fn resolveLatin1Bitmap(spec: []const u8, outer_negated: bool) ![32]u8 {
-    const parsed = try parseSpec(spec, outer_negated);
+/// Allocator-free byte-mode resolution of `\p{spec}` straight to its
+/// **Latin-1 byte set** (codepoints 0..0xFF ∩ property) — the engine's
+/// byte-oriented `\p` semantics, byte-identical to `resolve(...)` clipped to
+/// ≤0xFF and rasterised. Never touches an allocator, so the comptime
+/// `Pattern` pipeline bakes `\p` exactly like `[a-z]`. Only
+/// General_Category / specials are available here (see `parseSpecLatin1`).
+pub fn resolveLatin1Bitmap(spec: []const u8, outer_negated: bool) ParseError![32]u8 {
+    const parsed = try parseSpecLatin1(spec, outer_negated);
 
     var bm: [32]u8 = @splat(0);
     const B = struct {
@@ -370,7 +337,7 @@ pub fn resolveLatin1Bitmap(spec: []const u8, outer_negated: bool) ![32]u8 {
             for (tables.rangesFor(c)) |r| setRange(m, r.lo, r.hi);
         }
     };
-    switch (parsed.found) {
+    switch (parsed.query) {
         .cats => |cats| for (cats) |c| B.cat(&bm, c),
         .special => |sp| switch (sp) {
             .any => @memset(&bm, 0xFF),
@@ -380,140 +347,40 @@ pub fn resolveLatin1Bitmap(spec: []const u8, outer_negated: bool) ![32]u8 {
                 B.invert(&bm);
             },
         },
+        .script, .scx, .binary => unreachable, // rejected by parseSpecLatin1
     }
     if (parsed.negated) B.invert(&bm);
     return bm;
-}
-
-/// Combine an arbitrary (unsorted, possibly overlapping) set of codepoint
-/// ranges into a normalized, surrogate-free set, optionally complemented.
-/// Used by the character-class parser when a `[...]` mixes literal ranges,
-/// predefined escapes, and `\p{...}` and/or carries an enclosing `[^...]`.
-/// Caller owns the returned slice.
-pub fn buildSet(
-    a: std.mem.Allocator,
-    input: []const CodepointRange,
-    negated: bool,
-) ![]CodepointRange {
-    var list: RangeList = .empty;
-    errdefer list.deinit(a);
-    list.appendSlice(a, input) catch return error.OutOfMemory;
-    normalizeRanges(&list, a) catch return error.OutOfMemory;
-    if (negated) complement(&list, a) catch return error.OutOfMemory;
-    return list.toOwnedSlice(a) catch error.OutOfMemory;
-}
-
-// --- UTF-8 sub-automaton lowering ------------------------------------------
-
-/// A single inclusive byte range within a UTF-8 sequence step.
-pub const Utf8Range = struct { lo: u8, hi: u8 };
-
-/// One UTF-8 byte-range sequence (1–4 steps) covering a scalar sub-range.
-pub const Utf8Sequence = struct {
-    parts: [4]Utf8Range = undefined,
-    len: u8 = 0,
-};
-
-fn maxScalar(nbytes: u3) u32 {
-    return switch (nbytes) {
-        1 => 0x7F,
-        2 => 0x7FF,
-        3 => 0xFFFF,
-        else => 0x10FFFF,
-    };
-}
-
-fn encodeLen(cp: u21) u3 {
-    return std.unicode.utf8CodepointSequenceLength(cp) catch unreachable;
-}
-
-/// Produce the UTF-8 byte-range sequences covering scalar range [start, end]
-/// (assumed surrogate-free). Port of the well-known utf8-ranges algorithm.
-fn pushRange(out: *std.ArrayList(Utf8Sequence), a: std.mem.Allocator, start: u32, end: u32) !void {
-    std.debug.assert(start <= end);
-
-    // Split across UTF-8 length boundaries.
-    var i: u3 = 1;
-    while (i < 4) : (i += 1) {
-        const m = maxScalar(i);
-        if (start <= m and m < end) {
-            try pushRange(out, a, start, m);
-            try pushRange(out, a, m + 1, end);
-            return;
-        }
-    }
-
-    // Split so that each continuation-byte position spans a clean range.
-    i = 1;
-    while (i < 4) : (i += 1) {
-        const mask: u32 = (@as(u32, 1) << (6 * @as(u5, i))) - 1;
-        if ((start & ~mask) != (end & ~mask)) {
-            if ((start & mask) != 0) {
-                try pushRange(out, a, start, start | mask);
-                try pushRange(out, a, (start | mask) + 1, end);
-                return;
-            }
-            if ((end & mask) != mask) {
-                try pushRange(out, a, start, (end & ~mask) - 1);
-                try pushRange(out, a, end & ~mask, end);
-                return;
-            }
-        }
-    }
-
-    // [start, end] now forms a single sequence of independent byte ranges.
-    var sb: [4]u8 = undefined;
-    var eb: [4]u8 = undefined;
-    const n = encodeLen(@intCast(end));
-    _ = std.unicode.utf8Encode(@intCast(start), &sb) catch unreachable;
-    _ = std.unicode.utf8Encode(@intCast(end), &eb) catch unreachable;
-
-    var seq: Utf8Sequence = .{};
-    seq.len = n;
-    var j: usize = 0;
-    while (j < n) : (j += 1) {
-        seq.parts[j] = .{ .lo = sb[j], .hi = eb[j] };
-    }
-    try out.append(a, seq);
-}
-
-/// Lower a normalized codepoint range set into UTF-8 byte-range sequences.
-/// Caller owns the returned slice.
-pub fn toUtf8Sequences(
-    a: std.mem.Allocator,
-    ranges: []const CodepointRange,
-) ![]Utf8Sequence {
-    var out: std.ArrayList(Utf8Sequence) = .empty;
-    errdefer out.deinit(a);
-    for (ranges) |r| {
-        try pushRange(&out, a, r.lo, r.hi);
-    }
-    return out.toOwnedSlice(a);
 }
 
 // --- Tests -----------------------------------------------------------------
 
 const testing = std.testing;
 
+fn has(r: []const CodepointRange, cp: u21) bool {
+    return uset.contains(r, cp);
+}
+
 test "resolve general category Lu" {
     const r = try resolve(testing.allocator, "Lu", false);
     defer testing.allocator.free(r);
-    const uc = common.UnicodeClass{ .ranges = r };
-    try testing.expect(uc.matches('A'));
-    try testing.expect(uc.matches(0x0391)); // GREEK CAPITAL ALPHA
-    try testing.expect(!uc.matches('a'));
-    try testing.expect(!uc.matches('0'));
+    try testing.expect(has(r, 'A'));
+    try testing.expect(has(r, 0x0391)); // GREEK CAPITAL ALPHA
+    try testing.expect(!has(r, 'a'));
+    try testing.expect(!has(r, '0'));
 }
 
 test "resolve loose names and aliases" {
-    inline for (.{ "Letter", "letter", "general_category=L", "gc=Letter", "  L  " }) |spec| {
+    inline for (.{ "Letter", "letter", "general_category=L", "gc=Letter", "  L  ", "IsLetter", "gc:L" }) |spec| {
         const r = try resolve(testing.allocator, spec, false);
         defer testing.allocator.free(r);
-        const uc = common.UnicodeClass{ .ranges = r };
-        try testing.expect(uc.matches('Q'));
-        try testing.expect(uc.matches(0x4E2D)); // CJK 中
-        try testing.expect(!uc.matches('5'));
+        try testing.expect(has(r, 'Q'));
+        try testing.expect(has(r, 0x4E2D)); // CJK 中
+        try testing.expect(!has(r, '5'));
     }
+    const lc = try resolve(testing.allocator, "L&", false);
+    defer testing.allocator.free(lc);
+    try testing.expect(has(lc, 'a') and has(lc, 'A') and !has(lc, 0x4E2D));
 }
 
 test "negation forms agree" {
@@ -522,45 +389,115 @@ test "negation forms agree" {
     defer a.free(p);
     const c = try resolve(a, "^L", false); // \p{^L}
     defer a.free(c);
-    const up = common.UnicodeClass{ .ranges = p };
-    const uc = common.UnicodeClass{ .ranges = c };
+    const ne = try resolve(a, "gc!=L", false); // \p{gc!=L}
+    defer a.free(ne);
     for ([_]u21{ 'a', 'Z', '0', ' ', 0x4E2D, 0x1F600 }) |cp| {
-        try testing.expectEqual(up.matches(cp), uc.matches(cp));
+        try testing.expectEqual(has(p, cp), has(c, cp));
+        try testing.expectEqual(has(p, cp), has(ne, cp));
     }
-    try testing.expect(up.matches('0'));
-    try testing.expect(!up.matches('a'));
-    try testing.expect(!up.matches(0xD800)); // surrogates never match
+    try testing.expect(has(p, '0'));
+    try testing.expect(!has(p, 'a'));
+    try testing.expect(!has(p, 0xD800)); // surrogates never match
 }
 
-test "unsupported vs unknown property" {
-    try testing.expectError(error.UnsupportedUnicodeProperty, resolve(testing.allocator, "Greek", false));
-    try testing.expectError(error.UnsupportedUnicodeProperty, resolve(testing.allocator, "Script=Han", false));
-    try testing.expectError(error.UnknownUnicodeProperty, resolve(testing.allocator, "Frobnicate", false));
-}
-
-test "utf8 sequence lowering round-trips membership" {
+test "scripts, script extensions, binary properties" {
     const a = testing.allocator;
-    const r = try resolve(a, "N", false);
-    defer a.free(r);
-    const seqs = try toUtf8Sequences(a, r);
-    defer a.free(seqs);
-    // ASCII '7' encodes to a single 1-byte sequence that some branch accepts.
-    var buf: [4]u8 = undefined;
-    const n = try std.unicode.utf8Encode(0x0668, &buf); // ARABIC-INDIC DIGIT EIGHT
-    var ok = false;
-    for (seqs) |s| {
-        if (s.len != n) continue;
-        var all = true;
-        for (0..s.len) |k| {
-            if (buf[k] < s.parts[k].lo or buf[k] > s.parts[k].hi) {
-                all = false;
-                break;
-            }
-        }
-        if (all) {
-            ok = true;
-            break;
-        }
-    }
-    try testing.expect(ok);
+    const greek = try resolve(a, "Greek", false);
+    defer a.free(greek);
+    try testing.expect(has(greek, 0x3B1) and !has(greek, 'a'));
+    const grek = try resolve(a, "sc=Grek", false);
+    defer a.free(grek);
+    try testing.expectEqual(greek.len, grek.len);
+    const han = try resolve(a, "Script:Han", false);
+    defer a.free(han);
+    try testing.expect(has(han, 0x4E2D));
+    // U+30FC KATAKANA-HIRAGANA PROLONGED SOUND MARK: sc=Common, scx={Hira, Kana}.
+    const hira = try resolve(a, "Hiragana", false);
+    defer a.free(hira);
+    const hira_x = try resolve(a, "scx=Hira", false);
+    defer a.free(hira_x);
+    try testing.expect(!has(hira, 0x30FC));
+    try testing.expect(has(hira_x, 0x30FC));
+    try testing.expect(has(hira_x, 0x3042)); // あ
+    const ws = try resolve(a, "White_Space", false);
+    defer a.free(ws);
+    try testing.expect(has(ws, ' ') and has(ws, 0x2028) and has(ws, 0x85) and !has(ws, 'a'));
+    const alpha = try resolve(a, "alpha", false); // alias of Alphabetic
+    defer a.free(alpha);
+    try testing.expect(has(alpha, 'a') and has(alpha, 0x4E2D) and !has(alpha, '1'));
+    const not_alpha = try resolve(a, "Alphabetic=No", false);
+    defer a.free(not_alpha);
+    try testing.expect(!has(not_alpha, 'a') and has(not_alpha, '1'));
+    const emoji = try resolve(a, "Emoji_Presentation", false);
+    defer a.free(emoji);
+    try testing.expect(has(emoji, 0x1F600));
+    const unk = try resolve(a, "Unknown", false);
+    defer a.free(unk);
+    try testing.expect(has(unk, 0x0378)); // unassigned Greek slot
+    try testing.expect(!has(unk, 'a'));
+}
+
+test "specials: Any / ASCII / Assigned" {
+    const a = testing.allocator;
+    const any = try resolve(a, "Any", false);
+    defer a.free(any);
+    try testing.expectEqual(@as(u32, 0x110000 - 0x800), uset.count(any));
+    const asc = try resolve(a, "ASCII", false);
+    defer a.free(asc);
+    try testing.expectEqual(@as(u32, 128), uset.count(asc));
+    const assigned = try resolve(a, "Assigned", false);
+    defer a.free(assigned);
+    try testing.expect(has(assigned, 'a') and !has(assigned, 0x0378));
+    const unassigned = try resolve(a, "Assigned", true);
+    defer a.free(unassigned);
+    try testing.expect(!has(unassigned, 'a') and has(unassigned, 0x0378));
+}
+
+test "ambiguous short names resolve to general categories" {
+    const a = testing.allocator;
+    const sc = try resolve(a, "Sc", false); // Currency_Symbol, not Script
+    defer a.free(sc);
+    try testing.expect(has(sc, '$') and !has(sc, 'a'));
+    const cf = try resolve(a, "Cf", false); // Format
+    defer a.free(cf);
+    try testing.expect(has(cf, 0x200D));
+}
+
+test "unknown property" {
+    try testing.expectError(error.UnknownUnicodeProperty, resolve(testing.allocator, "Frobnicate", false));
+    try testing.expectError(error.UnknownUnicodeProperty, resolve(testing.allocator, "sc=Frob", false));
+    try testing.expectError(error.UnknownUnicodeProperty, resolve(testing.allocator, "Alphabetic=maybe", false));
+    try testing.expectError(error.UnknownUnicodeProperty, resolve(testing.allocator, "", false));
+}
+
+test "byte-mode Latin-1 bitmap: gc only, scripts/binary unsupported" {
+    const bm = try resolveLatin1Bitmap("L", false);
+    try testing.expect(common.hasBit(&bm, 'a'));
+    try testing.expect(common.hasBit(&bm, 0xC0)); // À
+    try testing.expect(!common.hasBit(&bm, 0xB7)); // ·
+    const nl = try resolveLatin1Bitmap("L", true);
+    try testing.expect(!common.hasBit(&nl, 'a'));
+    try testing.expect(common.hasBit(&nl, 0xB7));
+    try testing.expectError(error.UnsupportedUnicodeProperty, resolveLatin1Bitmap("Greek", false));
+    try testing.expectError(error.UnsupportedUnicodeProperty, resolveLatin1Bitmap("Script=Han", false));
+    try testing.expectError(error.UnsupportedUnicodeProperty, resolveLatin1Bitmap("White_Space", false));
+    try testing.expectError(error.UnknownUnicodeProperty, resolveLatin1Bitmap("Frobnicate", false));
+    // Equivalent to the full resolution clipped to ≤0xFF.
+    const full = try resolve(testing.allocator, "N", false);
+    defer testing.allocator.free(full);
+    const nb = try resolveLatin1Bitmap("N", false);
+    var c: u32 = 0;
+    while (c < 256) : (c += 1) try testing.expectEqual(has(full, @intCast(c)), common.hasBit(&nb, @intCast(c)));
+}
+
+test "comptime resolution into fixed buffers" {
+    const r = comptime blk: {
+        @setEvalBranchQuota(200_000);
+        var out = uset.RangeBuf(1024).init(undefined);
+        var scratch = uset.RangeBuf(1024).init(undefined);
+        const parsed = parseSpec("Greek", false) catch unreachable;
+        resolveInto(&out, &scratch, parsed) catch unreachable;
+        break :blk .{ .n = out.len(), .alpha = uset.contains(out.items(), 0x3B1), .a = uset.contains(out.items(), 'a') };
+    };
+    try testing.expect(r.n > 0 and r.alpha and !r.a);
 }

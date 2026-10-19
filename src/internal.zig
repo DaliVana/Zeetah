@@ -27,6 +27,10 @@ pub const RegexCache = @import("thread_safety.zig").RegexCache(Regex);
 
 // Internal shared modules
 pub const common = @import("common.zig");
+pub const utf8 = @import("utf8.zig");
+pub const unicode_set = @import("unicode_set.zig");
+pub const unicode_class = @import("unicode_class.zig");
+pub const unicode_tables = @import("unicode_tables.zig");
 pub const prefilter = @import("prefilter.zig");
 pub const simd = @import("simd.zig");
 pub const comptime_dfa = @import("exec/comptime_dfa.zig");
