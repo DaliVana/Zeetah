@@ -39,6 +39,8 @@ const hir = @import("../hir.zig");
 const backtrack = @import("backtrack.zig");
 const seek_mod = @import("seek.zig");
 const cc = @import("charclass.zig");
+const utf8 = @import("../utf8.zig");
+const uset = @import("../unicode_set.zig");
 const class_span = @import("class_span.zig");
 const search = @import("search.zig");
 const line_dfa = @import("line_dfa.zig");
@@ -220,6 +222,7 @@ fn analyze(comptime cap: usize, comptime h: hir.Hir(cap)) Info(h.node_count) {
         r.wb[i] = switch (nd.tag) {
             .empty, .look, .look_around => .{ .min = 0, .max = 0, .bounded = true },
             .set => .{ .min = 1, .max = 1, .bounded = true },
+            .uclass => .{ .min = uset.minUtf8Len(h.uclassRanges(nd.set_idx)), .max = uset.maxUtf8Len(h.uclassRanges(nd.set_idx)), .bounded = true },
             .concat => .{ .min = r.wb[a].min + r.wb[b].min, .max = r.wb[a].max + r.wb[b].max, .bounded = r.wb[a].bounded and r.wb[b].bounded },
             .alt => .{ .min = @min(r.wb[a].min, r.wb[b].min), .max = @max(r.wb[a].max, r.wb[b].max), .bounded = r.wb[a].bounded and r.wb[b].bounded },
             .opt => .{ .min = 0, .max = r.wb[a].max, .bounded = r.wb[a].bounded },
@@ -245,9 +248,11 @@ fn same(comptime G: type, x: NodeRef, y: NodeRef) bool {
     if (x == hir.none or y == hir.none) return false;
     const a = G.hh.nodes[x];
     const b = G.hh.nodes[y];
-    if (a.tag != b.tag or a.greedy != b.greedy or a.fold != b.fold) return false;
+    if (a.tag != b.tag or a.greedy != b.greedy or a.fold != b.fold or a.ufold != b.ufold) return false;
     return switch (a.tag) {
         .set => std.mem.eql(u8, &G.hh.sets[a.set_idx], &G.hh.sets[b.set_idx]),
+        // Interned by `addUClass`: equal sets share one index.
+        .uclass => a.set_idx == b.set_idx,
         .empty => true,
         .look, .backref => a.set_idx == b.set_idx,
         .concat, .alt => same(G, a.a, b.a) and same(G, a.b, b.b),
@@ -334,6 +339,7 @@ fn Node(comptime G: type, comptime ref: NodeRef, comptime K: type, comptime cyc:
     switch (nd.tag) {
         .empty => return K,
         .set => return SetNode(G.hh.sets[nd.set_idx], K),
+        .uclass => return UClassNode(G.hh.uclassRanges(nd.set_idx), K),
         .look => return LookNode(@intCast(nd.set_idx), K),
         .concat => {
             const items = flatten(G, .concat, ref);
@@ -346,7 +352,7 @@ fn Node(comptime G: type, comptime ref: NodeRef, comptime K: type, comptime cyc:
         .opt => return OptNode(G, nd.a, nd.greedy, K, cyc),
         .star, .plus => return LoopNode(G, ref, K, cyc),
         .cap => return CapNode(G, ref, K, cyc),
-        .backref => return BackrefNode(nd.set_idx, nd.fold, K),
+        .backref => return BackrefNode(nd.set_idx, nd.fold, nd.ufold, K),
         .atomic => return AtomicNode(G, nd.a, K),
         .look_around => return LookAroundNode(G, ref, K),
     }
@@ -357,6 +363,19 @@ fn SetNode(comptime bm: [32]u8, comptime K: type) type {
         fn run(c: *Ctx, pos: usize) Error!bool {
             if (pos < c.input.len and inSet(bm, c.input[pos])) return K.run(c, pos + 1);
             return false;
+        }
+    };
+}
+
+/// One UTF-8-encoded scalar from a comptime codepoint set: decode, binary
+/// search the (comptime) sorted ranges, continue past its bytes. An invalid
+/// sequence is not a scalar and never matches.
+fn UClassNode(comptime ranges: []const hir.CodepointRange, comptime K: type) type {
+    return struct {
+        fn run(c: *Ctx, pos: usize) Error!bool {
+            const d = utf8.decodeAt(c.input, pos) orelse return false;
+            if (!uset.contains(ranges, d.cp)) return false;
+            return K.run(c, pos + d.len);
         }
     };
 }
@@ -562,7 +581,7 @@ fn CapNode(comptime G: type, comptime ref: NodeRef, comptime K: type, comptime c
     };
 }
 
-fn BackrefNode(comptime group: u32, comptime fold: bool, comptime K: type) type {
+fn BackrefNode(comptime group: u32, comptime fold: bool, comptime ufold: bool, comptime K: type) type {
     // Same guard as `CapNode`: `Ctx.slots` is sized to `MAX_GROUPS`, and a
     // backref past it must fail softly, not index out of bounds.
     if (group > hir.MAX_GROUPS) return Fail;
@@ -573,6 +592,11 @@ fn BackrefNode(comptime group: u32, comptime fold: bool, comptime K: type) type 
             if (s < 0 or e < 0 or e < s) return K.run(c, pos); // unset → empty
             const su: usize = @intCast(s);
             const w: usize = @as(usize, @intCast(e)) - su;
+            if (ufold) {
+                // `(?iu)`: scalar-wise simple folding (width may differ).
+                const e2 = utf8.eqlFold(c.input[su .. su + w], c.input, pos) orelse return false;
+                return K.run(c, e2);
+            }
             if (pos + w > c.input.len) return false;
             const a = c.input[pos .. pos + w];
             const b = c.input[su .. su + w];

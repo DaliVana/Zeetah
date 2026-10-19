@@ -815,7 +815,7 @@ fn Parser(comptime cap: ?usize) type {
         fn capsAlwaysWritten(p: *const Self, ref: NodeRef, mandatory: bool) bool {
             const nd = p.h.node(ref);
             return switch (nd.tag) {
-                .empty, .set, .look => true,
+                .empty, .set, .uclass, .look => true,
                 .backref => false,
                 .cap => mandatory and p.capsAlwaysWritten(nd.a, true),
                 .concat => p.capsAlwaysWritten(nd.a, mandatory) and p.capsAlwaysWritten(nd.b, mandatory),

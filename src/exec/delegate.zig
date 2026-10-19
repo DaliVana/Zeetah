@@ -48,7 +48,7 @@ fn delegatable(h: *const H, ref: NodeRef) bool {
     if (ref == hir.none) return false;
     const nd = h.node(ref);
     return switch (nd.tag) {
-        .empty, .set => true,
+        .empty, .set, .uclass => true,
         .concat => delegatable(h, nd.a) and delegatable(h, nd.b),
         .star, .plus, .opt => nd.greedy and delegatable(h, nd.a),
         // alt (priority/longest mismatch), lazy (handled above via !greedy),
@@ -80,6 +80,7 @@ fn minLen(h: *const H, ref: NodeRef) usize {
     return switch (nd.tag) {
         .empty => 0,
         .set => 1,
+        .uclass => 1, // ≥ one byte (a lead byte) — a lower bound suffices here
         .concat => minLen(h, nd.a) + minLen(h, nd.b),
         .plus => minLen(h, nd.a),
         .star, .opt => 0,

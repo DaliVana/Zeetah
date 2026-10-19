@@ -97,7 +97,7 @@ fn regularGreedy(comptime cap: ?usize, h: *const hir.Hir(cap), ref: hir.NodeRef)
     const nd = h.node(ref);
     return switch (nd.tag) {
         .alt, .backref, .look_around, .look, .atomic => false,
-        .empty, .set => true,
+        .empty, .set, .uclass => true,
         .star, .plus, .opt => nd.greedy and regularGreedy(cap, h, nd.a),
         .cap => regularGreedy(cap, h, nd.a),
         .concat => regularGreedy(cap, h, nd.a) and regularGreedy(cap, h, nd.b),

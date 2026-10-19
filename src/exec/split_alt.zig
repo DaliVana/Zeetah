@@ -122,7 +122,7 @@ fn dfaEligible(h: *const H, ref: NodeRef) bool {
     const nd = h.node(ref);
     return switch (nd.tag) {
         .look, .look_around, .backref, .atomic => false,
-        .empty, .set => true,
+        .empty, .set, .uclass => true,
         .concat, .alt => dfaEligible(h, nd.a) and dfaEligible(h, nd.b),
         .star, .plus, .opt, .cap => dfaEligible(h, nd.a),
     };

@@ -7,6 +7,8 @@
 
 const std = @import("std");
 const hir = @import("hir.zig");
+const utf8 = @import("utf8.zig");
+const common = @import("common.zig");
 
 const Error = hir.Error;
 const NodeRef = hir.NodeRef;
@@ -173,6 +175,17 @@ pub fn Nfa(comptime cap: ?usize) type {
             b.n_sets += 1;
             b.n_edges += 1;
         }
+
+        // Edge accessors for the UTF-8 compiler's state-dedup verification.
+        fn edgeCount(b: *const Self) usize {
+            return b.n_edges;
+        }
+        fn edgeTo(b: *const Self, ei: usize) usize {
+            return b.e_to[ei];
+        }
+        fn edgeSet(b: *const Self, ei: usize) *const [32]u8 {
+            return &b.sets[b.e_set[ei]];
+        }
     };
 }
 
@@ -237,6 +250,16 @@ const RtBuilder = struct {
         try b.sets.append(b.a, set);
     }
 
+    fn edgeCount(b: *const RtBuilder) usize {
+        return b.e_from.items.len;
+    }
+    fn edgeTo(b: *const RtBuilder, ei: usize) usize {
+        return b.e_to.items[ei];
+    }
+    fn edgeSet(b: *const RtBuilder, ei: usize) *const [32]u8 {
+        return &b.sets.items[b.e_set.items[ei]];
+    }
+
     /// Move the lists into an exact-size `Nfa(null)` (the builder is left empty).
     fn finish(b: *RtBuilder, frag: Frag) E!Nfa(null) {
         var out: Nfa(null) = .{ .n_states = b.n_states, .start = frag.start, .accept = frag.accept };
@@ -253,6 +276,166 @@ const RtBuilder = struct {
         return out;
     }
 };
+
+// --- UTF-8 class compiler ----------------------------------------------------
+//
+// A `.uclass` is lowered to a byte automaton over the UTF-8 encodings of its
+// members. The naive lowering (one alternation branch per byte-range sequence,
+// each a fresh chain of states) is ~3 000 states for `\p{L}`; this is a port
+// of regex-automata's `Utf8Compiler`: the sorted sequences (`utf8.SeqIter`
+// over a normalized set emits them in lexicographic order, with ranges at each
+// position either equal or disjoint) are fed into Daciuk's incremental
+// minimal-acyclic-automaton construction. A trie node is frozen into an NFA
+// state as soon as the next sequence leaves it, and a frozen node whose
+// transition list equals an already-compiled state's reuses that state
+// (bounded hash map, verified against the builder's own edges — the map holds
+// only `{hash, state, first_edge, n}`). Suffixes like `[80-BF][80-BF]` are thus
+// shared: `\p{L}` compiles to a few hundred states, `(?u).` to the classic
+// nine-sequence / ~15-state automaton. One edge per transition, each with a
+// range bitmap; disjoint ranges make the branch order irrelevant for
+// leftmost-first.
+
+const Utf8Trans = struct { lo: u8, hi: u8, next: u16 };
+const Utf8Last = struct { lo: u8, hi: u8 };
+
+/// Distinct transitions one trie level can hold: ≤ 128 ASCII ranges + ≤ 51
+/// lead-byte ranges at the root, ≤ 64 continuation ranges below.
+const UTF8_MAX_TRANS = 256;
+const Utf8Node = struct {
+    trans: [UTF8_MAX_TRANS]Utf8Trans = undefined,
+    n: usize = 0,
+    /// The pending transition whose target is still being built.
+    last: ?Utf8Last = null,
+
+    fn setLast(self: *Utf8Node, next: usize) void {
+        if (self.last) |l| {
+            std.debug.assert(self.n < UTF8_MAX_TRANS);
+            self.trans[self.n] = .{ .lo = l.lo, .hi = l.hi, .next = @intCast(next) };
+            self.n += 1;
+            self.last = null;
+        }
+    }
+};
+
+const UTF8_MAP_SIZE = 1024;
+const Utf8MapEntry = struct { hash: u64 = 0, state: u16 = 0, first_edge: u32 = 0, n: u16 = 0, used: bool = false };
+
+fn rangeSet(lo: u8, hi: u8) [32]u8 {
+    var s: [32]u8 = @splat(0);
+    var c: usize = lo;
+    while (c <= hi) : (c += 1) common.setBit(&s, @intCast(c));
+    return s;
+}
+
+fn Utf8Compiler(comptime B: type) type {
+    return struct {
+        const Self = @This();
+
+        b: *B,
+        /// The single accept state every sequence ends in.
+        target: usize,
+        /// Uncompiled trie path: root + at most one node per encoded byte.
+        uncompiled: [5]Utf8Node = undefined,
+        depth: usize = 0,
+        map: [UTF8_MAP_SIZE]Utf8MapEntry = @splat(.{}),
+
+        fn init(b: *B, target: usize) Self {
+            var self = Self{ .b = b, .target = target };
+            self.uncompiled[0] = .{};
+            self.depth = 1;
+            return self;
+        }
+
+        /// Add the next (lexicographically larger) byte-range sequence.
+        fn add(self: *Self, seq: []const utf8.ByteRange) B.E!void {
+            var prefix_len: usize = 0;
+            while (prefix_len < seq.len and prefix_len < self.depth) : (prefix_len += 1) {
+                const l = self.uncompiled[prefix_len].last orelse break;
+                if (l.lo != seq[prefix_len].lo or l.hi != seq[prefix_len].hi) break;
+            }
+            std.debug.assert(prefix_len < seq.len);
+            try self.compileFrom(prefix_len);
+            self.addSuffix(seq[prefix_len..]);
+        }
+
+        /// Freeze (compile) every node deeper than `from`, linking each into its
+        /// parent's pending transition; the node at `from` keeps its transition
+        /// list open but gets its pending target resolved.
+        fn compileFrom(self: *Self, from: usize) B.E!void {
+            var next = self.target;
+            while (from + 1 < self.depth) {
+                self.depth -= 1;
+                const node = &self.uncompiled[self.depth];
+                node.setLast(next);
+                next = try self.compile(node.trans[0..node.n]);
+            }
+            self.uncompiled[from].setLast(next);
+        }
+
+        /// One NFA state for a frozen transition list, reusing an identical
+        /// already-compiled state when the bounded map still remembers it.
+        fn compile(self: *Self, trans: []const Utf8Trans) B.E!usize {
+            var h: u64 = 0xcbf29ce484222325; // FNV-1a over (lo, hi, next)
+            for (trans) |t| {
+                inline for (.{ t.lo, t.hi, @as(u8, @truncate(t.next)), @as(u8, @truncate(t.next >> 8)) }) |byte| {
+                    h ^= byte;
+                    h *%= 0x100000001b3;
+                }
+            }
+            const slot: usize = @intCast(h % UTF8_MAP_SIZE);
+            const e = &self.map[slot];
+            if (e.used and e.hash == h and e.n == trans.len and self.verify(e.*, trans)) return e.state;
+            const s = try self.b.addState();
+            const first = self.b.edgeCount();
+            for (trans) |t| try self.b.addSetEdge(s, t.next, rangeSet(t.lo, t.hi));
+            e.* = .{ .hash = h, .state = @intCast(s), .first_edge = @intCast(first), .n = @intCast(trans.len), .used = true };
+            return s;
+        }
+
+        fn verify(self: *const Self, e: Utf8MapEntry, trans: []const Utf8Trans) bool {
+            for (trans, 0..) |t, i| {
+                const ei = e.first_edge + i;
+                if (self.b.edgeTo(ei) != t.next) return false;
+                if (!std.mem.eql(u8, self.b.edgeSet(ei), &rangeSet(t.lo, t.hi))) return false;
+            }
+            return true;
+        }
+
+        fn addSuffix(self: *Self, seq: []const utf8.ByteRange) void {
+            std.debug.assert(seq.len > 0);
+            const top = &self.uncompiled[self.depth - 1];
+            std.debug.assert(top.last == null);
+            top.last = .{ .lo = seq[0].lo, .hi = seq[0].hi };
+            for (seq[1..]) |r| {
+                std.debug.assert(self.depth < self.uncompiled.len);
+                self.uncompiled[self.depth] = .{ .last = .{ .lo = r.lo, .hi = r.hi } };
+                self.depth += 1;
+            }
+        }
+
+        /// Compile the remaining path and the root; returns the start state.
+        fn finish(self: *Self) B.E!usize {
+            try self.compileFrom(0);
+            std.debug.assert(self.depth == 1);
+            const root = &self.uncompiled[0];
+            std.debug.assert(root.last == null);
+            self.depth = 0;
+            return self.compile(root.trans[0..root.n]);
+        }
+    };
+}
+
+/// Lower a `.uclass` member set into a UTF-8 byte automaton fragment.
+fn lowerUClass(b: anytype, ranges: []const hir.CodepointRange) @TypeOf(b.*).E!Frag {
+    const accept = try b.addState();
+    var uc = Utf8Compiler(@TypeOf(b.*)).init(b, accept);
+    for (ranges) |r| {
+        var it = utf8.SeqIter.init(r.lo, r.hi);
+        while (it.next()) |seq| try uc.add(seq.slice());
+    }
+    const start = try uc.finish();
+    return .{ .start = start, .accept = accept };
+}
 
 /// Lower `ref` into builder `b` (comptime `Nfa(N)` or runtime `RtBuilder`).
 /// Emission order is identical for both, so state numbering and edge priority
@@ -272,6 +455,7 @@ fn lower(b: anytype, comptime hcap: ?usize, h: *const hir.Hir(hcap), ref: NodeRe
             try b.addSetEdge(s, a, h.setBitmap(nd.set_idx));
             return .{ .start = s, .accept = a };
         },
+        .uclass => return lowerUClass(b, h.uclassRanges(nd.set_idx)),
         .look => {
             const s = try b.addState();
             const a = try b.addState();

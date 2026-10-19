@@ -642,6 +642,9 @@ pub const LazyProg = struct {
             .start_line => before == CTX_EDGE or before == CTX_NL,
             .end_line => after == CTX_EDGE or after == CTX_NL,
             .end_text_before_nl => unreachable, // `lookSupported` excludes `\Z`
+            // `lookSupported` excludes these: they need up to 4 bytes of
+            // context per side (a decoded scalar), not one byte class.
+            .word_boundary_unicode, .non_word_boundary_unicode => unreachable,
         };
     }
 
@@ -651,12 +654,16 @@ pub const LazyProg = struct {
     }
 
     /// Every look edge is expressible with one byte of context on each side —
-    /// all but `\Z` (end of text OR a final `\n`: two bytes of lookahead).
+    /// all but `\Z` (end of text OR a final `\n`: two bytes of lookahead) and
+    /// the Unicode word boundaries (a decoded scalar, up to 4 bytes, per side).
     pub fn lookSupported(nfa: *const thompson.Nfa(null)) bool {
         var ei: usize = 0;
         while (ei < nfa.n_edges) : (ei += 1) {
-            if (nfa.e_kind[ei] == .look and
-                @as(LookKind, @fromBackingInt(@intCast(nfa.e_look[ei]))) == .end_text_before_nl) return false;
+            if (nfa.e_kind[ei] != .look) continue;
+            switch (@as(LookKind, @fromBackingInt(@intCast(nfa.e_look[ei])))) {
+                .end_text_before_nl, .word_boundary_unicode, .non_word_boundary_unicode => return false,
+                else => {},
+            }
         }
         return true;
     }

@@ -11,6 +11,7 @@
 const std = @import("std");
 const hir = @import("hir.zig");
 const common = @import("common.zig");
+const uset = @import("unicode_set.zig");
 const seq_extract = @import("exec/seq_extract.zig");
 
 const NodeRef = hir.NodeRef;
@@ -73,13 +74,34 @@ pub const Properties = struct {
     /// route it to a single O(n) reverse pass seeded from the end boundaries.
     /// Gated additionally on `min_len >= 1` and (at the call site) `ng == 0`.
     rev_end: ?EndKind = null,
+    /// The pattern contains a `.uclass` (a codepoint set with non-ASCII
+    /// members, `(?u)` only). Regular — the NFA lowers it to a UTF-8 byte
+    /// automaton — but the comptime `Pattern` uses it to fall back to the
+    /// compiled backtracker when that automaton overflows its small NFA
+    /// ceiling (the runtime has the lazy DFA for that).
+    has_uclass: bool = false,
 };
+
+fn containsUClass(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) bool {
+    const nd = h.node(ref);
+    return switch (nd.tag) {
+        .uclass => true,
+        .empty, .set, .look, .backref => false,
+        .concat, .alt => containsUClass(cap, h, nd.a) or containsUClass(cap, h, nd.b),
+        .star, .plus, .opt, .cap, .atomic, .look_around => containsUClass(cap, h, nd.a),
+    };
+}
+
+/// Can a `.uclass` match the byte `\n` (only U+000A encodes it)?
+fn uclassHasNewline(comptime cap: ?usize, h: *const hir.Hir(cap), idx: u32) bool {
+    return uset.contains(h.uclassRanges(idx), '\n');
+}
 
 fn containsLook(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) bool {
     const nd = h.node(ref);
     return switch (nd.tag) {
         .look => true,
-        .empty, .set, .backref, .look_around => false,
+        .empty, .set, .uclass, .backref, .look_around => false,
         .concat, .alt => containsLook(cap, h, nd.a) or containsLook(cap, h, nd.b),
         .star, .plus, .opt, .cap, .atomic => containsLook(cap, h, nd.a),
     };
@@ -153,6 +175,7 @@ fn walkLineBody(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, w: *
             break :blk false; // \b \A \z \B … not line-anchored ⇒ keep on NFA
         },
         .set => !setHasNewline(cap, h, nd.set_idx),
+        .uclass => !uclassHasNewline(cap, h, nd.set_idx),
         .empty => true,
         .star, .plus, .opt => {
             if (!nd.greedy) w.prio = true; // lazy quantifier
@@ -314,6 +337,9 @@ fn walkRevBody(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, w: *R
         .set => if (setHasNewline(cap, h, nd.set_idx)) {
             w.nl_set = true;
         },
+        .uclass => if (uclassHasNewline(cap, h, nd.set_idx)) {
+            w.nl_set = true;
+        },
         .empty => {},
         .star, .plus, .opt, .cap => walkRevBody(cap, h, nd.a, w),
         .concat, .alt => {
@@ -348,7 +374,7 @@ fn containsCap(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) bool 
     const nd = h.node(ref);
     return switch (nd.tag) {
         .cap => true,
-        .empty, .set, .look, .backref, .look_around => false,
+        .empty, .set, .uclass, .look, .backref, .look_around => false,
         .concat, .alt => containsCap(cap, h, nd.a) or containsCap(cap, h, nd.b),
         .star, .plus, .opt, .atomic => containsCap(cap, h, nd.a),
     };
@@ -360,7 +386,7 @@ fn containsBacktrack(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef)
         // `.atomic` (atomic group / possessive) changes the matched language
         // and the DFA cannot fold it → it must run on the tree backtracker.
         .backref, .look_around, .atomic => true,
-        .empty, .set, .look => false,
+        .empty, .set, .uclass, .look => false,
         .concat, .alt => containsBacktrack(cap, h, nd.a) or containsBacktrack(cap, h, nd.b),
         .star, .plus, .opt, .cap => containsBacktrack(cap, h, nd.a),
     };
@@ -373,6 +399,7 @@ fn minLen(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) usize {
     return switch (nd.tag) {
         .empty => 0,
         .set => 1,
+        .uclass => uset.minUtf8Len(h.uclassRanges(nd.set_idx)),
         .concat => minLen(cap, h, nd.a) + minLen(cap, h, nd.b),
         .alt => @min(minLen(cap, h, nd.a), minLen(cap, h, nd.b)),
         .star, .opt => 0,
@@ -388,6 +415,7 @@ fn maxLen(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) ?usize {
     switch (nd.tag) {
         .empty => return 0,
         .set => return 1,
+        .uclass => return uset.maxUtf8Len(h.uclassRanges(nd.set_idx)),
         .concat => {
             const l = maxLen(cap, h, nd.a) orelse return null;
             const r = maxLen(cap, h, nd.b) orelse return null;
@@ -423,6 +451,11 @@ pub fn firstBytes(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, se
         .set => {
             const bm = h.setBitmap(nd.set_idx);
             for (set, 0..) |*b, i| b.* |= bm[i];
+            return .{ .ok = true, .nullable = false };
+        },
+        .uclass => {
+            // Every member's UTF-8 lead byte (never a continuation byte).
+            uset.leadBytes(h.uclassRanges(nd.set_idx), set);
             return .{ .ok = true, .nullable = false };
         },
         .concat => {
@@ -471,6 +504,12 @@ fn allSetsUniversal(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, 
             for (bm) |b| bits += @popCount(b);
             return bits >= UNIVERSAL_MIN;
         },
+        .uclass => {
+            // `(?u).` / `\P{Cc}`-like: all but ≤ 2 scalars ⇒ no selectivity.
+            seen.* = true;
+            const universe: u32 = 0x110000 - 0x800;
+            return uset.count(h.uclassRanges(nd.set_idx)) + 2 >= universe;
+        },
         .concat, .alt => allSetsUniversal(cap, h, nd.a, seen) and allSetsUniversal(cap, h, nd.b, seen),
         .star, .plus, .opt, .cap, .atomic => allSetsUniversal(cap, h, nd.a, seen),
     };
@@ -499,6 +538,7 @@ pub fn analyze(comptime cap: ?usize, h: *const hir.Hir(cap)) Properties {
     p.saw_lazy = h.saw_lazy;
     p.min_len = minLen(cap, h, h.root);
     p.max_len = maxLen(cap, h, h.root);
+    p.has_uclass = containsUClass(cap, h, h.root);
 
     if (p.min_len >= 1) {
         var set = std.mem.zeroes([32]u8);

@@ -11,8 +11,16 @@
 //! Thompson walk produces fixed NFA fragment shapes.
 
 const std = @import("std");
+const common = @import("common.zig");
 
 pub const NodeRef = u32;
+
+/// An inclusive codepoint range (`.uclass` member storage).
+pub const CodepointRange = common.CodepointRange;
+
+/// A `.uclass` descriptor: `len` ranges starting at `off` in the store's
+/// `uranges` pool (normalized, surrogate-free, negation folded in).
+pub const UClass = struct { off: u32, len: u32 };
 
 /// Sentinel "no child". Real refs are indices `< node_count`.
 pub const none: NodeRef = std.math.maxInt(NodeRef);
@@ -22,6 +30,14 @@ pub const Tag = enum(u8) {
     empty,
     /// Consumes one byte from `set_idx`'s 256-bit bitmap.
     set,
+    /// Consumes one UTF-8-encoded Unicode scalar value from the codepoint set
+    /// `uclasses[set_idx]` (codepoint mode `(?u)` only). An ASCII-only set is
+    /// emitted as a plain `.set` by the parser, so every byte-class fast path
+    /// keeps applying; this node is reserved for sets with members ≥ U+0080.
+    /// `thompson` lowers it to a suffix-shared UTF-8 byte automaton; the tree
+    /// and compiled backtrackers decode one scalar and test membership. An
+    /// invalid UTF-8 sequence in the haystack never matches.
+    uclass,
     /// `a` then `b` (left-leaning chains model n-ary concat).
     concat,
     /// `a` or `b` (left-leaning chains model n-ary alternation).
@@ -94,6 +110,14 @@ pub const LookKind = enum(u8) {
     end_text_before_nl, // \Z
     start_line, // ^ under (?m)
     end_line, // $ under (?m)
+    /// `\b` under `(?u)`: Unicode word boundary — the neighbours are decoded
+    /// scalars tested against the UTS #18 Annex C `\w` (`utf8.isWordCp`); an
+    /// undecodable neighbour counts as non-word. Not foldable into the byte-
+    /// context lazy DFA (it needs up to 4 bytes of context each side), so
+    /// look patterns with it run on the bounded backtracker / PikeVM.
+    word_boundary_unicode,
+    /// `\B` under `(?u)`.
+    non_word_boundary_unicode,
 };
 
 pub const HNode = struct {
@@ -110,6 +134,10 @@ pub const HNode = struct {
     /// parsed under `(?i)`, so `(?i)(ab)\1` must match "abAB" (the group's
     /// text in any case, like the literals/classes `(?i)` already folds).
     fold: bool = false,
+    /// `backref` only: the reference was parsed under `(?iu)` — compare
+    /// scalar-by-scalar under Unicode simple case folding (`utf8.eqlFold`;
+    /// the matched byte length may differ from the group's: `K` vs `K`).
+    ufold: bool = false,
 };
 
 /// Overflow / unsupported / invalid signalling for the parser → HIR stage.
@@ -129,6 +157,13 @@ pub const MAX_SETS: usize = 4096;
 /// stay ≤ 65535 so the NFA's `u16` set ids never overflow.
 pub const MAX_NODES_RUNTIME: usize = 1 << 17;
 pub const MAX_SETS_RUNTIME: usize = 65535;
+/// `.uclass` storage ceilings. Comptime: a fixed pool (`\P{L}` is ~700 ranges;
+/// identical classes are interned once, so the cl100k tokenizer's seven
+/// property classes need ~2 000). Runtime: generous heap ceilings.
+pub const URANGE_CAP: usize = 8192;
+pub const MAX_UCLASSES: usize = 256;
+pub const MAX_URANGES_RUNTIME: usize = 1 << 20;
+pub const MAX_UCLASSES_RUNTIME: usize = 65535;
 /// Runtime HIR depth ceiling. The analyses, the NFA lowering and the cloner
 /// walk the tree recursively; the old 4096-node ceiling bounded their depth
 /// implicitly, and this keeps that bound now that the node ceiling is larger
@@ -147,6 +182,11 @@ pub fn Hir(comptime cap: ?usize) type {
         node_count: usize,
         sets: if (cap) |c| [c][32]u8 else std.ArrayListUnmanaged([32]u8),
         set_count: usize,
+        /// `.uclass` codepoint-range pool + descriptors (see `UClass`).
+        uranges: if (cap != null) [URANGE_CAP]CodepointRange else std.ArrayListUnmanaged(CodepointRange),
+        urange_count: usize,
+        uclasses: if (cap != null) [MAX_UCLASSES]UClass else std.ArrayListUnmanaged(UClass),
+        uclass_count: usize,
         /// Root node ref, set by the parser when it finishes.
         root: NodeRef,
         /// Prescan results (see `parser.prescan`).
@@ -164,6 +204,10 @@ pub fn Hir(comptime cap: ?usize) type {
                 .node_count = 0,
                 .sets = undefined,
                 .set_count = 0,
+                .uranges = undefined,
+                .urange_count = 0,
+                .uclasses = undefined,
+                .uclass_count = 0,
                 .root = none,
                 .anchored_start = false,
                 .anchored_end = false,
@@ -179,6 +223,10 @@ pub fn Hir(comptime cap: ?usize) type {
                 .node_count = 0,
                 .sets = .empty,
                 .set_count = 0,
+                .uranges = .empty,
+                .urange_count = 0,
+                .uclasses = .empty,
+                .uclass_count = 0,
                 .root = none,
                 .anchored_start = false,
                 .anchored_end = false,
@@ -190,6 +238,8 @@ pub fn Hir(comptime cap: ?usize) type {
             if (cap == null) {
                 self.nodes.deinit(allocator);
                 self.sets.deinit(allocator);
+                self.uranges.deinit(allocator);
+                self.uclasses.deinit(allocator);
             }
         }
 
@@ -246,6 +296,62 @@ pub fn Hir(comptime cap: ?usize) type {
             return id;
         }
 
+        /// Intern a normalized codepoint set as a `.uclass` member set and
+        /// return its index. Identical sets (same ranges) share one entry, so
+        /// a property class used several times costs one copy of its ranges.
+        pub fn addUClass(self: *Self, allocator: std.mem.Allocator, ranges: []const CodepointRange) Error!u32 {
+            // Dedup: compare against every existing class of equal length.
+            var k: usize = 0;
+            while (k < self.uclass_count) : (k += 1) {
+                const ex = self.uclassRanges(@intCast(k));
+                if (ex.len != ranges.len) continue;
+                var same = true;
+                for (ex, ranges) |x, y| {
+                    if (x.lo != y.lo or x.hi != y.hi) {
+                        same = false;
+                        break;
+                    }
+                }
+                if (same) return @intCast(k);
+            }
+            const off = self.urange_count;
+            if (cap != null) {
+                if (self.uclass_count >= MAX_UCLASSES or off + ranges.len > URANGE_CAP) return Error.TooComplex;
+                for (ranges, 0..) |r, i| self.uranges[off + i] = r;
+                self.uclasses[self.uclass_count] = .{ .off = @intCast(off), .len = @intCast(ranges.len) };
+            } else {
+                if (self.uclass_count >= MAX_UCLASSES_RUNTIME or off + ranges.len > MAX_URANGES_RUNTIME) return Error.TooComplex;
+                self.uranges.appendSlice(allocator, ranges) catch return Error.TooComplex;
+                self.uclasses.append(allocator, .{ .off = @intCast(off), .len = @intCast(ranges.len) }) catch return Error.TooComplex;
+            }
+            self.urange_count += ranges.len;
+            const id: u32 = @intCast(self.uclass_count);
+            self.uclass_count += 1;
+            return id;
+        }
+
+        /// The member ranges of `.uclass` index `idx`.
+        pub fn uclassRanges(self: *const Self, idx: u32) []const CodepointRange {
+            const d = if (cap != null) self.uclasses[idx] else self.uclasses.items[idx];
+            const pool: []const CodepointRange = if (cap != null) self.uranges[0..self.urange_count] else self.uranges.items;
+            return pool[d.off .. d.off + d.len];
+        }
+
+        /// Copy the `.uclass` tables of `src` wholesale (a trimmed/baked copy of
+        /// a comptime store; node refs and `set_idx` values stay valid). Pads
+        /// the unused comptime pool so the value is fully defined.
+        pub fn copyUClasses(self: *Self, src: anytype) void {
+            comptime std.debug.assert(cap != null);
+            self.urange_count = src.urange_count;
+            self.uclass_count = src.uclass_count;
+            // Bulk ops (one comptime step each) — a per-element loop over the
+            // 8192-slot pool would blow the default eval branch quota.
+            @memcpy(self.uranges[0..src.urange_count], src.uranges[0..src.urange_count]);
+            @memset(self.uranges[src.urange_count..], .{ .lo = 0, .hi = 0 });
+            @memcpy(self.uclasses[0..src.uclass_count], src.uclasses[0..src.uclass_count]);
+            @memset(self.uclasses[src.uclass_count..], .{ .off = 0, .len = 0 });
+        }
+
         pub fn node(self: *const Self, ref: NodeRef) HNode {
             if (cap != null) return self.nodes[ref];
             return self.nodes.items[ref];
@@ -294,7 +400,7 @@ pub fn cloneSubtree(
             }
             return switch (nd.tag) {
                 // look / backref are leaves (set_idx = LookKind / group).
-                .look, .backref => dst.addNode(a, .{ .tag = nd.tag, .set_idx = nd.set_idx, .fold = nd.fold }),
+                .look, .backref => dst.addNode(a, .{ .tag = nd.tag, .set_idx = nd.set_idx, .fold = nd.fold, .ufold = nd.ufold }),
                 // look_around carries a sub-expression.
                 else => dst.addNode(a, .{
                     .tag = .look_around,
@@ -307,6 +413,10 @@ pub fn cloneSubtree(
         .set => {
             const idx = try dst.addSet(a, src.setBitmap(nd.set_idx));
             return dst.addNode(a, .{ .tag = .set, .set_idx = idx });
+        },
+        .uclass => {
+            const idx = try dst.addUClass(a, src.uclassRanges(nd.set_idx));
+            return dst.addNode(a, .{ .tag = .uclass, .set_idx = idx });
         },
         .concat, .alt => {
             const la = try cloneSubtree(dcap, scap, dst, a, src, nd.a, relax_irregular);

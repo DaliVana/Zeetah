@@ -404,7 +404,7 @@ fn containsBackref(comptime cap: ?usize, h: *const hir.Hir(cap), ref: hir.NodeRe
     const nd = h.node(ref);
     return switch (nd.tag) {
         .backref => true,
-        .empty, .set, .look => false,
+        .empty, .set, .uclass, .look => false,
         .concat, .alt => containsBackref(cap, h, nd.a) or containsBackref(cap, h, nd.b),
         .star, .plus, .opt, .cap, .atomic, .look_around => containsBackref(cap, h, nd.a),
     };
@@ -903,6 +903,7 @@ fn CaptureSupport(comptime built: Built) type {
         for (0..NN) |i| t.nodes[i] = src_h.nodes[i];
         for (0..src_h.set_count) |s| t.sets[s] = src_h.sets[s];
         for (src_h.set_count..NN) |s| t.sets[s] = @splat(0);
+        t.copyUClasses(&src_h);
         break :blk t;
     };
 
@@ -1211,6 +1212,7 @@ pub fn Pattern(comptime pattern: []const u8, comptime opts: Options) type {
             // Pad unused set slots so the comptime value is fully defined
             // (#sets ≤ #nodes, so `[set_count..NN]` is the padding range).
             for (src_h.set_count..NN) |s| t.sets[s] = @splat(0);
+            t.copyUClasses(&src_h);
             break :blk t;
         };
         return struct {

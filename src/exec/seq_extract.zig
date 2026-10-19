@@ -230,7 +230,7 @@ pub fn wholeLiteral(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, 
             return wholeLiteral(cap, h, nd.b, buf, l);
         },
         .cap, .atomic => return wholeLiteral(cap, h, nd.a, buf, len), // transparent
-        .alt, .star, .plus, .opt, .look, .backref, .look_around => return null,
+        .alt, .star, .plus, .opt, .look, .backref, .look_around, .uclass => return null,
     }
 }
 
@@ -261,7 +261,7 @@ fn trailingRun(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, buf: 
             return trailingRun(cap, h, nd.a, buf, r, exact);
         },
         .cap, .atomic => return trailingRun(cap, h, nd.a, buf, len, exact), // transparent
-        .alt, .star, .plus, .opt, .look, .backref, .look_around => {
+        .alt, .star, .plus, .opt, .look, .backref, .look_around, .uclass => {
             exact.* = false;
             return len;
         },
@@ -415,7 +415,7 @@ fn expandNode(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) ?LitSe
         ),
         .opt => return unionSets(litEmpty(), expandNode(cap, h, nd.a) orelse return null),
         .cap, .atomic => return expandNode(cap, h, nd.a), // transparent
-        .star, .plus, .look, .look_around, .backref => return null,
+        .star, .plus, .look, .look_around, .backref, .uclass => return null,
     }
 }
 
@@ -556,7 +556,7 @@ fn scanRequired(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef, best
         },
         .plus => scanRequired(cap, h, nd.a, best, bestf),
         .cap, .atomic => scanRequired(cap, h, nd.a, best, bestf), // transparent
-        .star, .opt, .alt, .empty, .look, .backref, .look_around => {},
+        .star, .opt, .alt, .empty, .look, .backref, .look_around, .uclass => {},
     }
 }
 

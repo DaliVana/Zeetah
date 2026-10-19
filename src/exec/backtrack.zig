@@ -14,6 +14,8 @@ const full_dfa = @import("full_dfa.zig");
 const seek_mod = @import("seek.zig");
 const delegate = @import("delegate.zig");
 const cc = @import("charclass.zig");
+const utf8 = @import("../utf8.zig");
+const uset = @import("../unicode_set.zig");
 const class_span = @import("class_span.zig");
 const search = @import("search.zig");
 
@@ -149,6 +151,10 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
             return switch (nd.tag) {
                 .empty, .look, .look_around => .{ .min = 0, .max = 0, .bounded = true },
                 .set => .{ .min = 1, .max = 1, .bounded = true },
+                .uclass => blk: {
+                    const r = self.h.uclassRanges(nd.set_idx);
+                    break :blk .{ .min = uset.minUtf8Len(r), .max = uset.maxUtf8Len(r), .bounded = true };
+                },
                 .concat => {
                     const l = self.widthBounds(nd.a);
                     const r = self.widthBounds(nd.b);
@@ -227,6 +233,13 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
                         return self.cont(pos + 1, k);
                     return false;
                 },
+                .uclass => {
+                    // One decoded scalar, tested against the sorted range set
+                    // (an invalid sequence is not a scalar ⇒ no match).
+                    const d = utf8.decodeAt(self.input, pos) orelse return false;
+                    if (!uset.contains(self.h.uclassRanges(nd.set_idx), d.cp)) return false;
+                    return self.cont(pos + d.len, k);
+                },
                 .look => {
                     if (cc.lookHolds(@intCast(nd.set_idx), self.input, pos)) return self.cont(pos, k);
                     return false;
@@ -296,6 +309,12 @@ pub fn BacktrackerG(comptime cap: ?usize) type {
                     if (s < 0 or e < 0 or e < s) return self.cont(pos, k); // unset → empty
                     const su: usize = @intCast(s);
                     const w: usize = @as(usize, @intCast(e)) - su;
+                    // `(?iu)` backref: scalar-wise simple case folding; the
+                    // matched width may differ from the group's (`K` vs `K`).
+                    if (nd.ufold) {
+                        const e2 = utf8.eqlFold(self.input[su .. su + w], self.input, pos) orelse return false;
+                        return self.cont(e2, k);
+                    }
                     if (pos + w > self.input.len) return false;
                     const a = self.input[pos .. pos + w];
                     const b = self.input[su .. su + w];
