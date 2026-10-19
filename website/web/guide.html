@@ -125,8 +125,9 @@ pub fn example(allocator: std.mem.Allocator) !void {
     std.debug.print("{} {d}\n", .{ yes, n });
 }</code></pre>
         <div class="callout">
-          <b>Offsets are bytes.</b> Zeetah is byte-oriented: <code>.</code> matches one byte, <code>\w</code> and <code>\d</code>
+          <b>Offsets are bytes.</b> Zeetah is byte-oriented by default: <code>.</code> matches one byte, <code>\w</code> and <code>\d</code>
           are ASCII, and positions are offsets into the UTF-8 text. For ASCII text that is the same as character positions.
+          For character-level matching switch on <a href="#unicode">Unicode mode</a>; offsets stay byte offsets.
         </div>
         <p>To walk every match, use the iterator (or <code>findAll</code> for an allocated slice):</p>
         <pre><code class="zig">var it = re.iterator("555-1234 or 555-9876");
@@ -187,6 +188,7 @@ defer allocator.free(parts); // "red", "green", "blue"</code></pre>
               <tr><td><code>.multiline</code></td><td><code>(?m)</code></td><td><code>^</code> and <code>$</code> match at every line</td></tr>
               <tr><td><code>.dot_all</code></td><td><code>(?s)</code></td><td><code>.</code> also matches <code>\n</code></td></tr>
               <tr><td><code>.extended</code></td><td><code>(?x)</code></td><td>whitespace is ignored and <code>#</code> starts a comment</td></tr>
+              <tr><td><code>.unicode</code></td><td><code>(?u)</code></td><td>Unicode mode: <code>.</code> is one character, <code>\w \d \s \b \p{…}</code> are Unicode, <code>(?i)</code> folds by Unicode rules (<a href="#unicode">details</a>)</td></tr>
             </tbody>
           </table>
         </div>
@@ -197,6 +199,30 @@ defer allocator.free(parts); // "red", "green", "blue"</code></pre>
 defer re.deinit();
 const n = try re.count("Item one\nitem two\nnot an item"); // 2</code></pre>
         <p><a class="try" href="./#s=eyJwIjoiXml0ZW0iLCJmIjoiZ2ltIiwidCI6Ikl0ZW0gb25lXG5pdGVtIHR3b1xubm90IGFuIGl0ZW0ifQ">Open in tester</a></p>
+
+        <h3 id="unicode">Unicode mode</h3>
+        <p>Byte mode is the default and never changes: <code>.</code> is one byte, <code>\w</code> <code>\d</code> <code>\b</code> are ASCII and
+          <code>\p{…}</code> covers only the Latin-1 range. Set <code>.unicode = true</code> (or write <code>(?u)</code>, which can also be scoped
+          as <code>(?u:…)</code>) and the match unit becomes one Unicode character:</p>
+        <pre><code class="zig">var re = try zeetah.Regex.compileWithFlags(allocator, "\\w+", .{ .unicode = true });
+defer re.deinit();
+const m = (try re.find("naïve café")).?; // m.slice == "naïve"   (byte mode stops at "na")
+
+var greek = try zeetah.Regex.compile(allocator, "(?u)\\p{Greek}+");
+defer greek.deinit();
+const n = try greek.count("alpha αβγ beta δ"); // 2</code></pre>
+        <p><a class="try" href="./#s=eyJwIjoiXFx3KyIsImYiOiJndSIsInQiOiJuYcOvdmUgY2Fmw6kg4oCUIOaXpeacrOiqnuOBruODhuOCreOCueODiCwg0J_RgNC40LLQtdGCINC80LjRgCwg2aHZotmjIn0">Open in tester</a></p>
+        <ul>
+          <li><code>.</code>, <code>\N</code>, literal characters, <code>\x{1F600}</code> and <code>\N{U+E9}</code> match one character; <code>.{3}</code> is three characters.</li>
+          <li><code>\d</code> is any decimal digit, <code>\s</code> Unicode white space, <code>\w</code> letters, marks, digits and connectors (UTS #18); <code>\b</code> follows <code>\w</code>.</li>
+          <li><code>\p{…}</code> accepts general categories (<code>\p{Lu}</code>, <code>\p{Letter}</code>), scripts (<code>\p{Greek}</code>, <code>\p{sc=Han}</code>), script extensions (<code>\p{scx=Hira}</code>) and binary properties (<code>\p{Alphabetic}</code>, <code>\p{Emoji_Presentation}</code>), negated with <code>\P</code>, <code>\p{^…}</code> or <code>!=</code>.</li>
+          <li>Classes take character ranges (<code>[à-ÿ]</code>), nested classes and the set operators <code>&amp;&amp;</code>, <code>--</code>, <code>~~</code>: <code>[\p{L}--\p{Lu}]</code> is every lowercase-or-other letter.</li>
+          <li><code>(?i)</code> uses Unicode simple case folding: <code>(?iu)k</code> matches <code>k</code>, <code>K</code> and the Kelvin sign, <code>(?iu)σ</code> matches σ, Σ and ς.</li>
+          <li>Invalid UTF-8 in the text never matches a character construct and is never an error.</li>
+        </ul>
+        <p>Wide classes compile to UTF-8 byte automata and run on the DFA engines, so they are slower than the SIMD byte-class paths
+          (expect lazy-DFA speed for <code>\p{L}+</code>). Not supported: <code>\X</code>, full case folding (<code>ß</code> ≡ <code>ss</code>),
+          normalization and block properties.</p>
 
         <h2 id="comptime">Compile-time regex with Pattern</h2>
         <p>When the pattern is known at compile time, <code>zeetah.Pattern</code> compiles it during <code>zig build</code> and bakes
@@ -210,8 +236,9 @@ pub fn report(input: []const u8) void {
     }
     std.debug.print("{d} dates\n", .{Date.count(input)});
 }</code></pre>
-        <p><code>Pattern</code> options are <code>.case_insensitive</code> and <code>.multiline</code>; use inline <code>(?s)</code> and
-          <code>(?x)</code> for the others.</p>
+        <p><code>Pattern</code> options are <code>.case_insensitive</code>, <code>.multiline</code> and <code>.unicode</code>; use inline
+          <code>(?s)</code> and <code>(?x)</code> for the others. A Unicode class too wide for the compile-time automaton limits is baked as a
+          compiled backtracker rather than failing the build.</p>
 
         <h2 id="errors">Errors and safety</h2>
         <p>Zeetah returns a small, typed error set, so you can tell a broken pattern from an unsupported one:</p>
@@ -221,7 +248,7 @@ pub fn report(input: []const u8) void {
             <tbody>
               <tr><td><code>EmptyPattern</code></td><td>compile</td><td>the pattern was <code>""</code></td></tr>
               <tr><td><code>InvalidPattern</code></td><td>compile</td><td>malformed syntax, such as <code>abc(</code> or <code>a{3,2}</code></td></tr>
-              <tr><td><code>NotImplemented</code></td><td>compile</td><td>valid but unsupported, such as <code>\p{Greek}</code> or code points above 0xFF</td></tr>
+              <tr><td><code>NotImplemented</code></td><td>compile</td><td>valid but unsupported, such as <code>\p{Greek}</code> or <code>\x{100}</code> without <code>(?u)</code>, or <code>\N{name}</code></td></tr>
               <tr><td><code>PatternTooComplex</code></td><td>compile</td><td>too large to build within the engine's limits</td></tr>
               <tr><td><code>MatchBudgetExceeded</code></td><td>match</td><td>a backtracking pattern hit its step budget on this input</td></tr>
               <tr><td><code>OutOfMemory</code></td><td>either</td><td>an allocation failed</td></tr>
@@ -243,14 +270,15 @@ pub fn report(input: []const u8) void {
           <table class="syntax">
             <thead><tr><th>Syntax</th><th>Matches</th></tr></thead>
             <tbody>
-              <tr><td><code>.</code></td><td>any byte except newline (any byte with <code>(?s)</code>)</td></tr>
-              <tr><td><code>\d \w \s</code></td><td>digit, word character, whitespace (ASCII); <code>\D \W \S</code> negate them</td></tr>
-              <tr><td><code>\h \v \R \N</code></td><td>horizontal whitespace, vertical whitespace, any line break, any byte but newline</td></tr>
-              <tr><td><code>[abc] [^abc] [a-z]</code></td><td>a set, a negated set, a range</td></tr>
-              <tr><td><code>[[:alpha:]]</code></td><td>POSIX classes such as alpha, digit, alnum, space, punct, xdigit</td></tr>
-              <tr><td><code>\p{L} \P{Nd}</code></td><td>Unicode general categories, restricted to the Latin-1 byte range</td></tr>
+              <tr><td><code>.</code></td><td>any byte except newline (any byte with <code>(?s)</code>); any character with <code>(?u)</code></td></tr>
+              <tr><td><code>\d \w \s</code></td><td>digit, word character, whitespace (ASCII; Unicode with <code>(?u)</code>); <code>\D \W \S</code> negate them</td></tr>
+              <tr><td><code>\h \v \R \N</code></td><td>horizontal whitespace, vertical whitespace, any line break, any byte but newline (Unicode lists with <code>(?u)</code>)</td></tr>
+              <tr><td><code>[abc] [^abc] [a-z]</code></td><td>a set, a negated set, a range (character ranges with <code>(?u)</code>)</td></tr>
+              <tr><td><code>[[:alpha:]]</code></td><td>POSIX classes such as alpha, digit, alnum, space, punct, xdigit (always ASCII)</td></tr>
+              <tr><td><code>[\p{L}--\p{Lu}] [[a-z]&amp;&amp;[^aeiou]] [\w~~\d]</code></td><td>nested classes and set difference, intersection, symmetric difference (<code>(?u)</code> only)</td></tr>
+              <tr><td><code>\p{L} \P{Nd} \p{Greek} \p{scx=Hira} \p{Alphabetic}</code></td><td>Unicode properties: general categories (Latin-1 range in byte mode; all of Unicode with <code>(?u)</code>), scripts, script extensions and binary properties (<code>(?u)</code> only)</td></tr>
               <tr><td><code>^ $ \A \z \Z</code></td><td>start and end of text (of a line with <code>(?m)</code>)</td></tr>
-              <tr><td><code>\b \B</code></td><td>word boundary, not a word boundary</td></tr>
+              <tr><td><code>\b \B</code></td><td>word boundary, not a word boundary (Unicode with <code>(?u)</code>)</td></tr>
               <tr><td><code>* + ? {n} {n,} {n,m}</code></td><td>greedy repetition</td></tr>
               <tr><td><code>*? +? ?? {n,m}?</code></td><td>lazy repetition (as few as possible)</td></tr>
               <tr><td><code>*+ ++ ?+ {n,m}+</code></td><td>possessive repetition (never gives back)</td></tr>
@@ -260,8 +288,8 @@ pub fn report(input: []const u8) void {
               <tr><td><code>(?=…) (?!…)</code></td><td>lookahead, negative lookahead</td></tr>
               <tr><td><code>(?&lt;=…) (?&lt;!…)</code></td><td>lookbehind, negative lookbehind (fixed width)</td></tr>
               <tr><td><code>(?&gt;…)</code></td><td>atomic group</td></tr>
-              <tr><td><code>(?i) (?m) (?s) (?x) (?i:…)</code></td><td>inline flags, for the rest of the group or scoped</td></tr>
-              <tr><td><code>\xHH \x{HH} \0 \n \t \r</code></td><td>byte escapes</td></tr>
+              <tr><td><code>(?i) (?m) (?s) (?x) (?u) (?i:…)</code></td><td>inline flags, for the rest of the group or scoped</td></tr>
+              <tr><td><code>\xHH \x{HH} \0 \n \t \r</code></td><td>byte escapes; with <code>(?u)</code> code points up to <code>\x{10FFFF}</code>, also <code>\N{U+hhhh}</code></td></tr>
             </tbody>
           </table>
         </div>

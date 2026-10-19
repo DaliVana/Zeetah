@@ -8,7 +8,8 @@ running entirely in the browser, plus two documentation pages: a usage guide
 - **Live matching**: highlights every match in the test string as you type,
   with the selected match's capture groups colored inside it. Click a match in
   the text or the list, or step through them with the arrows.
-- **Flags**: `g` (all matches), `i`, `m`, `s`, `x`.
+- **Flags**: `g` (all matches), `i`, `m`, `s`, `x`, `u` (Zeetah's Unicode
+  mode: characters instead of bytes, Unicode `\w \b \p{…}`, case folding).
 - **Engine insight**: shows which of Zeetah's executors the pattern was routed
   to (`literal`, `class_span`, `dfa`, `lazy_dfa`, `backtrack`, …), how long it
   took to compile and match, and a one-click `count()` benchmark over 1 MiB.
@@ -42,8 +43,9 @@ directly (streaming compile when served as `application/wasm`).
 While `serve` runs, a `zig build` in another terminal updates `zig-out/web/`
 in place, so a page reload picks up the change.
 
-Options: `-Doptimize=small` gives a smaller module (about 0.9 MB vs 1.2 MB for
-the default `fast`), `-Dport=9000` changes the `serve` port, and
+Options: `-Doptimize=small` gives a smaller module (about 1.1 MB vs 1.4 MB for
+the default `fast`; roughly 180 KB of either is Zeetah's Unicode property and
+case-folding tables), `-Dport=9000` changes the `serve` port, and
 `-Dsite-url=https://example.org/regex/` sets the public URL (see below).
 
 ## Deploy and SEO
@@ -107,9 +109,10 @@ numbers in the tester FAQ and `llms.txt` in sync with the Zeetah README.
 
 ## Notes
 
-- Zeetah is byte-oriented: `.` matches one byte, `\w`/`\d`/`\b` are ASCII, and
-  match offsets are byte offsets into the UTF-8 text. The page maps them back
-  to characters for highlighting.
+- Zeetah is byte-oriented by default: `.` matches one byte, `\w`/`\d`/`\b` are
+  ASCII. The `u` flag switches the engine to Unicode mode (`.unicode`). Match
+  offsets are byte offsets into the UTF-8 text either way; the page maps them
+  back to characters for highlighting.
 - The module is built with `simd128`, so Zeetah's portable vector scans use
   Wasm SIMD (Chrome 91+, Firefox 89+, Safari 16.4+). Zeetah's byte-shuffle
   kernels (NEON `tbl` / SSSE3 `pshufb`) have no wasm port yet, so a few

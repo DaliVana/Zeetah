@@ -24,6 +24,21 @@
     N: 'any byte except a newline',
     R: 'a line break (\\r\\n, or one of \\n \\v \\f \\r NEL)',
   };
+  /** The same shorthands in Unicode mode (the `u` flag / `(?u)`). */
+  const SHORTHAND_U = {
+    d: 'a decimal digit of any script (Unicode Nd)',
+    D: 'any character except a decimal digit',
+    w: 'a word character (Unicode letters, marks, digits, connectors)',
+    W: 'any character except a word character',
+    s: 'a Unicode whitespace character',
+    S: 'any character except whitespace',
+    h: 'horizontal whitespace (tab, space, NBSP, U+2000–U+200A, U+3000, …)',
+    H: 'any character except horizontal whitespace',
+    v: 'vertical whitespace (LF, VT, FF, CR, NEL, U+2028, U+2029)',
+    V: 'any character except vertical whitespace',
+    N: 'any character except a newline',
+    R: 'a line break (\\r\\n, or one of \\n \\v \\f \\r NEL U+2028 U+2029)',
+  };
   const ANCHOR_ESC = {
     b: 'a word boundary',
     B: 'a position that is not a word boundary',
@@ -31,6 +46,8 @@
     z: 'the very end of the text',
     Z: 'the end of the text, or just before a final newline',
   };
+  const ANCHOR_ESC_U = { ...ANCHOR_ESC, b: 'a Unicode word boundary', B: 'a position that is not a Unicode word boundary' };
+  const uplus = (hex) => 'U+' + hex.toUpperCase().padStart(4, '0');
   const CHAR_ESC = { n: 'newline (\\n)', t: 'tab (\\t)', r: 'carriage return (\\r)', f: 'form feed (\\f)', e: 'escape (0x1B)', a: 'bell (0x07)' };
   const POSIX = {
     alpha: 'letters', digit: 'digits', alnum: 'letters and digits', upper: 'uppercase letters', lower: 'lowercase letters',
@@ -48,12 +65,26 @@
   };
 
   /** Read an escape starting at p[i] === '\\'. `inSet` selects the
-   *  character-set meaning (no anchors or back-references there). */
-  function readEscape(p, i, inSet) {
+   *  character-set meaning (no anchors or back-references there); `uni` is
+   *  Unicode mode (escapes denote characters, not bytes). */
+  function readEscape(p, i, inSet, uni) {
     const c = p[i + 1];
+    const SH = uni ? SHORTHAND_U : SHORTHAND;
+    const AN = uni ? ANCHOR_ESC_U : ANCHOR_ESC;
+    const unit = uni ? 'the code point ' : 'the byte 0x';
     if (c === undefined) return { end: i + 1, type: 'error', desc: 'a trailing backslash escapes nothing' };
-    if (SHORTHAND[c] && !(inSet && (c === 'R' || c === 'N'))) return { end: i + 2, type: 'class', desc: SHORTHAND[c], item: SHORTHAND[c] };
-    if (!inSet && ANCHOR_ESC[c]) return { end: i + 2, type: 'anchor', desc: ANCHOR_ESC[c] };
+    // \N{U+hhhh}: a code point by number (Unicode mode only).
+    if (c === 'N' && p[i + 2] === '{') {
+      const j = p.indexOf('}', i + 3);
+      if (j < 0) return { end: p.length, type: 'error', desc: 'unterminated \\N{…} escape' };
+      const body = p.slice(i + 3, j);
+      const m = /^U\+([0-9a-fA-F]+)$/.exec(body);
+      if (!m) return { end: j + 1, type: 'error', desc: 'only \\N{U+hhhh} is supported, not character names' };
+      if (!uni) return { end: j + 1, type: 'error', desc: '\\N{U+…} needs Unicode mode (the u flag or (?u))' };
+      return { end: j + 1, type: 'escape', desc: 'the code point ' + uplus(m[1]), item: uplus(m[1]) };
+    }
+    if (SH[c] && !(inSet && (c === 'R' || c === 'N'))) return { end: i + 2, type: 'class', desc: SH[c], item: SH[c] };
+    if (!inSet && AN[c]) return { end: i + 2, type: 'anchor', desc: AN[c] };
     if (!inSet && c >= '1' && c <= '9') {
       let j = i + 1;
       while (isDigit(p[j] || '')) j++;
@@ -72,23 +103,27 @@
         const j = p.indexOf('}', i + 3);
         if (j < 0) return { end: p.length, type: 'error', desc: 'unterminated \\x{…} escape' };
         const v = p.slice(i + 3, j);
-        return { end: j + 1, type: 'escape', desc: 'the byte 0x' + v.toUpperCase(), item: '0x' + v.toUpperCase() };
+        if (!uni && parseInt(v, 16) > 0xff) return { end: j + 1, type: 'error', desc: 'a code point above 0xFF needs Unicode mode (the u flag or (?u))' };
+        const item = uni ? uplus(v) : '0x' + v.toUpperCase();
+        return { end: j + 1, type: 'escape', desc: unit + (uni ? uplus(v) : v.toUpperCase()), item };
       }
       let j = i + 2;
       while (j < i + 4 && isHex(p[j] || '')) j++;
-      const v = p.slice(i + 2, j) || '0';
-      return { end: j, type: 'escape', desc: 'the byte 0x' + v.toUpperCase().padStart(2, '0'), item: '0x' + v.toUpperCase() };
+      const v = (p.slice(i + 2, j) || '0').toUpperCase().padStart(2, '0');
+      return { end: j, type: 'escape', desc: unit + (uni ? uplus(v) : v), item: uni ? uplus(v) : '0x' + v };
     }
     if (c === 'o' && p[i + 2] === '{') {
       const j = p.indexOf('}', i + 3);
       if (j < 0) return { end: p.length, type: 'error', desc: 'unterminated \\o{…} escape' };
-      return { end: j + 1, type: 'escape', desc: 'the byte with octal value ' + p.slice(i + 3, j), item: 'octal ' + p.slice(i + 3, j) };
+      const what = uni ? 'the code point' : 'the byte';
+      return { end: j + 1, type: 'escape', desc: what + ' with octal value ' + p.slice(i + 3, j), item: 'octal ' + p.slice(i + 3, j) };
     }
     if (c === '0') {
       let j = i + 2;
       while (j < i + 4 && /[0-7]/.test(p[j] || '')) j++;
       const v = p.slice(i + 2, j);
-      return { end: j, type: 'escape', desc: v ? 'the byte with octal value ' + v : 'the NUL byte (0x00)', item: v ? 'octal ' + v : 'NUL' };
+      const what = uni ? 'the code point' : 'the byte';
+      return { end: j, type: 'escape', desc: v ? what + ' with octal value ' + v : 'the NUL character (0x00)', item: v ? 'octal ' + v : 'NUL' };
     }
     if (c === 'p' || c === 'P') {
       let name;
@@ -107,7 +142,17 @@
         neg = !neg;
         name = name.slice(1);
       }
-      const d = (neg ? 'any byte NOT in' : 'a byte in') + ' Unicode category ' + name + ' (Latin-1 range)';
+      if (/!=/.test(name)) {
+        neg = !neg;
+        name = name.replace('!=', '=');
+      }
+      let d;
+      if (uni) {
+        const kind = /[=:]/.test(name) ? 'Unicode property ' : 'Unicode category, script or property ';
+        d = (neg ? 'any character NOT in ' : 'a character in ') + kind + name;
+      } else {
+        d = (neg ? 'any byte NOT in' : 'a byte in') + ' Unicode category ' + name + ' (Latin-1 range; scripts and properties need the u flag)';
+      }
       return { end, type: 'class', desc: d, item: (neg ? 'not ' : '') + '\\p{' + name + '}' };
     }
     if (CHAR_ESC[c]) return { end: i + 2, type: 'escape', desc: CHAR_ESC[c], item: CHAR_ESC[c] };
@@ -115,8 +160,12 @@
     return { end: i + 2, type: 'escape', desc: 'the literal character ' + show(c), item: show(c), lit: c };
   }
 
-  /** Parse a `[...]` set at p[i] === '['. */
-  function readSet(p, i) {
+  const SET_OPS = { '&&': 'AND', '--': 'MINUS', '~~': 'XOR' };
+
+  /** Parse a `[...]` set at p[i] === '['. In Unicode mode (`uni`) sets may
+   *  nest and use the operators `&&` (intersection), `--` (difference) and
+   *  `~~` (symmetric difference). */
+  function readSet(p, i, uni) {
     let j = i + 1;
     let neg = false;
     if (p[j] === '^') {
@@ -128,12 +177,26 @@
     while (j < p.length) {
       if (p[j] === ']' && !first) {
         const list = items.length > 8 ? items.slice(0, 8).join(', ') + ', …' : items.join(', ');
-        return { end: j + 1, type: 'set', desc: (neg ? 'any byte except ' : 'one of: ') + (list || 'nothing') };
+        const what = uni ? 'any character except ' : 'any byte except ';
+        return { end: j + 1, type: 'set', desc: (neg ? what : 'one of: ') + (list || 'nothing') };
       }
       first = false;
       let atom;
       let atomEnd;
       let lit = null;
+      const op = SET_OPS[p.slice(j, j + 2)];
+      if (uni && op) {
+        items.push(op);
+        j += 2;
+        continue;
+      }
+      if (uni && p[j] === '[' && p[j + 1] !== ':') {
+        const inner = readSet(p, j, uni);
+        if (inner.type === 'error') return inner;
+        items.push('(' + inner.desc + ')');
+        j = inner.end;
+        continue;
+      }
       if (p[j] === '[' && p[j + 1] === ':') {
         const k = p.indexOf(':]', j + 2);
         if (k < 0) return { end: p.length, type: 'error', desc: 'unterminated POSIX class [:…:]' };
@@ -143,28 +206,33 @@
         atom = (pneg ? 'not ' : '') + (POSIX[name] || 'POSIX [:' + name + ':]');
         atomEnd = k + 2;
       } else if (p[j] === '\\') {
-        const e = readEscape(p, j, true);
+        const e = readEscape(p, j, true, uni);
         if (e.type === 'error') return { end: e.end, type: 'error', desc: e.desc };
         atom = e.item || e.desc;
         lit = e.lit !== undefined ? e.lit : null;
         atomEnd = e.end;
       } else {
-        lit = p[j];
-        atom = show(p[j]);
-        atomEnd = j + 1;
+        // One code point (a surrogate pair stays together).
+        const cp = p.codePointAt(j);
+        const len = cp > 0xffff ? 2 : 1;
+        lit = p.slice(j, j + len);
+        atom = show(lit);
+        atomEnd = j + len;
       }
-      // Range a-z (a '-' before ']' is a literal dash).
-      if (lit !== null && p[atomEnd] === '-' && p[atomEnd + 1] !== undefined && p[atomEnd + 1] !== ']') {
-        let hiEnd = atomEnd + 2;
-        let hi = p[atomEnd + 1];
+      // Range a-z (a '-' before ']' is a literal dash; '--' is the difference operator in Unicode mode).
+      if (lit !== null && p[atomEnd] === '-' && p[atomEnd + 1] !== undefined && p[atomEnd + 1] !== ']' && !(uni && p[atomEnd + 1] === '-')) {
+        const hcp = p.codePointAt(atomEnd + 1);
+        let hiEnd = atomEnd + 1 + (hcp > 0xffff ? 2 : 1);
+        let hi = p.slice(atomEnd + 1, hiEnd);
         if (hi === '\\') {
-          const e = readEscape(p, atomEnd + 1, true);
+          const e = readEscape(p, atomEnd + 1, true, uni);
           hi = e.lit !== undefined ? e.lit : e.item;
           hiEnd = e.end;
         }
-        atom = show(lit) + '–' + (hi.length === 1 ? show(hi) : hi);
+        const hiIsChar = hi.codePointAt(0) !== undefined && [...hi].length === 1;
+        atom = show(lit) + '–' + (hiIsChar ? show(hi) : hi);
         atomEnd = hiEnd;
-        if (hi.length === 1 && lit > hi) return { end: atomEnd, type: 'error', desc: 'range ' + lit + '-' + hi + ' is out of order' };
+        if (hiIsChar && lit.codePointAt(0) > hi.codePointAt(0)) return { end: atomEnd, type: 'error', desc: 'range ' + lit + '-' + hi + ' is out of order' };
       }
       items.push(atom);
       j = atomEnd;
@@ -235,10 +303,11 @@
     const p = pattern;
     const tokens = [];
     const groups = [];
-    const stack = []; // open groups: { token, ext, multi, dotall }
+    const stack = []; // open groups: { token, ext, multi, dotall, uni }
     let ext = flags.includes('x');
     let multi = flags.includes('m');
     let dotall = flags.includes('s');
+    let uni = flags.includes('u');
     let canRepeat = false; // is there an atom a quantifier could apply to?
     let error = null;
     const fail = (start, end, desc) => {
@@ -267,7 +336,7 @@
       }
 
       if (c === '\\') {
-        const e = readEscape(p, i, false);
+        const e = readEscape(p, i, false, uni);
         if (e.type === 'error') fail(i, e.end, e.desc);
         else tokens.push({ start: i, end: e.end, type: e.type, desc: e.desc, depth, lit: e.lit });
         canRepeat = e.type !== 'anchor' && e.type !== 'error';
@@ -275,7 +344,7 @@
         continue;
       }
       if (c === '[') {
-        const s = readSet(p, i);
+        const s = readSet(p, i, uni);
         if (s.type === 'error') fail(i, s.end, s.desc);
         else tokens.push({ start: i, end: s.end, type: 'set', desc: s.desc, depth });
         canRepeat = s.type !== 'error';
@@ -287,7 +356,7 @@
         let tok = null;
         const rest = p.slice(i + 1);
         const named = /^\?(?:P?<([A-Za-z_][A-Za-z0-9_]*)>|'([A-Za-z_][A-Za-z0-9_]*)')/.exec(rest);
-        const flagGroup = /^\?([imsxU]*)(?:-([imsxU]*))?([:)])/.exec(rest);
+        const flagGroup = /^\?([imsxuU]*)(?:-([imsxuU]*))?([:)])/.exec(rest);
         const lookKey = ['?<=', '?<!', '?=', '?!', '?>', '?:'].find((k) => rest.startsWith(k));
         if (lookKey) {
           j = i + 1 + lookKey.length;
@@ -301,7 +370,7 @@
         } else if (flagGroup && (flagGroup[1] || flagGroup[2])) {
           const on = flagGroup[1] || '';
           const off = flagGroup[2] || '';
-          const names = { i: 'case-insensitive', m: 'multiline', s: 'dot matches newline', x: 'extended', U: 'swap greedy' };
+          const names = { i: 'case-insensitive', m: 'multiline', s: 'dot matches newline', x: 'extended', u: 'Unicode mode', U: 'swap greedy' };
           const parts = [...on].map((f) => names[f] || f).concat([...off].map((f) => 'not ' + (names[f] || f)));
           j = i + 1 + flagGroup[0].length;
           if (flagGroup[3] === ')') {
@@ -312,6 +381,8 @@
             if (off.includes('m')) multi = false;
             if (on.includes('s')) dotall = true;
             if (off.includes('s')) dotall = false;
+            if (on.includes('u')) uni = true;
+            if (off.includes('u')) uni = false;
             tokens.push({ start: i, end: j, type: 'flags', desc: 'turn on ' + parts.join(', ') + ' for the rest of the enclosing group', depth });
             canRepeat = false;
             i = j;
@@ -331,7 +402,7 @@
         }
         const t = { start: i, end: j, depth, ...tok };
         tokens.push(t);
-        stack.push({ token: t, ext, multi, dotall });
+        stack.push({ token: t, ext, multi, dotall, uni });
         if (tok.scoped) {
           const { on, off } = tok.scoped;
           if (on.includes('x')) ext = true;
@@ -340,6 +411,8 @@
           if (off.includes('m')) multi = false;
           if (on.includes('s')) dotall = true;
           if (off.includes('s')) dotall = false;
+          if (on.includes('u')) uni = true;
+          if (off.includes('u')) uni = false;
         }
         canRepeat = false;
         i = j;
@@ -352,7 +425,7 @@
           i++;
           continue;
         }
-        ({ ext, multi, dotall } = open);
+        ({ ext, multi, dotall, uni } = open);
         tokens.push({ start: i, end: i + 1, type: 'close', desc: 'end of ' + open.token.desc.split(':')[0], depth: stack.length, group: open.token.group, pair: open.token });
         open.token.pair = tokens[tokens.length - 1];
         canRepeat = true;
@@ -375,7 +448,8 @@
         continue;
       }
       if (c === '.') {
-        tokens.push({ start: i, end: i + 1, type: 'dot', desc: dotall ? 'any byte, including newline' : 'any byte except newline', depth });
+        const unit = uni ? 'character' : 'byte';
+        tokens.push({ start: i, end: i + 1, type: 'dot', desc: dotall ? 'any ' + unit + ', including newline' : 'any ' + unit + ' except newline', depth });
         canRepeat = true;
         i++;
         continue;

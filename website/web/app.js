@@ -9,7 +9,7 @@
   const dec = new TextDecoder();
 
   const STORE_KEY = 'zeetah:tester';
-  const FLAG_ORDER = 'gimsx';
+  const FLAG_ORDER = 'gimsxu';
   const EXEC_LIMIT = 100000; // matches fetched per run
   const MAX_MARKS = 5000; // matches highlighted in the test string
   const MAX_ROWS = 1000; // matches listed in the Matches tab
@@ -40,7 +40,7 @@
 
   const ERRORS = {
     InvalidPattern: 'Malformed syntax.',
-    NotImplemented: 'Valid regex, but not supported by Zeetah (for example \\p scripts, code points above 0xFF, an unknown POSIX class, or (?u)).',
+    NotImplemented: 'Valid regex, but not supported by Zeetah (for example \\p{Greek} or a code point above 0xFF without the u flag, an unknown property or POSIX class, or \\N{name}).',
     PatternTooComplex: 'Too large to build: a compile-time construction ceiling was exceeded.',
     MatchBudgetExceeded: 'The backtracker hit its step budget on this input. Zeetah returns this error instead of hanging.',
     OutOfMemory: 'Out of memory.',
@@ -51,7 +51,7 @@
   // Quick reference: `before` + (selection or `ph`) + `after` is inserted.
   const REF = [
     ['Character classes', true, [
-      ['.', 'any byte except newline'],
+      ['.', 'any byte except newline (any character with u)'],
       ['\\d', 'digit 0-9'],
       ['\\D', 'not a digit'],
       ['\\w', 'word character A-Z a-z 0-9 _'],
@@ -66,7 +66,9 @@
       ['[^abc]', 'anything but a, b, c', '[^', ']', 'abc'],
       ['[a-z]', 'range a to z', '[', ']', 'a-z'],
       ['[[:alpha:]]', 'POSIX class', '[[:', ':]]', 'alpha'],
-      ['\\p{L}', 'Unicode category (Latin-1)', '\\p{', '}', 'L'],
+      ['\\p{L}', 'Unicode category (Latin-1; all of Unicode with u)', '\\p{', '}', 'L'],
+      ['\\p{Greek}', 'Unicode script or property (needs u)', '\\p{', '}', 'Greek'],
+      ['[a-z--[aeiou]]', 'set difference; also && and ~~ (needs u)', '[', ']', 'a-z--[aeiou]'],
     ]],
     ['Anchors', false, [
       ['^', 'start of text (line with m)'],
@@ -74,7 +76,7 @@
       ['\\A', 'start of text'],
       ['\\z', 'end of text'],
       ['\\Z', 'end, before a final newline'],
-      ['\\b', 'word boundary'],
+      ['\\b', 'word boundary (Unicode with u)'],
       ['\\B', 'not a word boundary'],
     ]],
     ['Quantifiers', false, [
@@ -109,7 +111,8 @@
       ['\\t', 'tab'],
       ['\\r', 'carriage return'],
       ['\\xHH', 'byte by hex value', '\\x', '', '41'],
-      ['\\x{HH}', 'byte, braced form', '\\x{', '}', '41'],
+      ['\\x{HH}', 'byte, braced form (code point with u)', '\\x{', '}', '41'],
+      ['\\N{U+HHHH}', 'code point (needs u)', '\\N{U+', '}', '1F600'],
       ['\\0', 'NUL byte'],
     ]],
     ['Inline flags', false, [
@@ -117,6 +120,7 @@
       ['(?m)', 'multiline from here'],
       ['(?s)', 'dot matches newline from here'],
       ['(?x)', 'extended (ignore whitespace)'],
+      ['(?u)', 'Unicode mode from here'],
       ['(?i:…)', 'case-insensitive inside only', '(?i:', ')'],
     ]],
   ];
@@ -725,6 +729,7 @@
     if (f.includes('m')) fields.push('.multiline = true');
     if (f.includes('s')) fields.push('.dot_all = true');
     if (f.includes('x')) fields.push('.extended = true');
+    if (f.includes('u')) fields.push('.unicode = true');
     const groups = compiled && compiled.info ? compiled.info.groups : ex.groups;
     const lit = zigString(p);
     const L = [];
@@ -757,13 +762,14 @@
       L.push('', `    const replaced = try re.${fn}(allocator, input, ${zigString(state.template)});`, '    defer allocator.free(replaced);');
     }
     L.push('}', '');
-    // Comptime: PatternOptions has case_insensitive and multiline; s/x go inline.
+    // Comptime: PatternOptions has case_insensitive, multiline and unicode; s/x go inline.
     let cp = p;
     if (f.includes('x')) cp = '(?x)' + cp;
     if (f.includes('s')) cp = '(?s)' + cp;
     const opts = [];
     if (f.includes('i')) opts.push('.case_insensitive = true');
     if (f.includes('m')) opts.push('.multiline = true');
+    if (f.includes('u')) opts.push('.unicode = true');
     L.push('// Comptime: compiled while your program builds; allocation-free at runtime.');
     L.push('// A pattern past a comptime construction limit is a compile error; use Regex then.');
     L.push(`const P = zeetah.Pattern(${zigString(cp)}, .{${opts.length ? ' ' + opts.join(', ') + ' ' : ''}});`, '');

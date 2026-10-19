@@ -366,7 +366,7 @@ share the `parser → HIR` front end. Regular patterns bake a minimized DFA (or 
 comptime Teddy literal); non-regular ones bake the **same bounded tree-backtracker**
 the runtime uses — so **captures** (numbered + named), **lookaround**,
 **backreferences**, **atomic/possessive** quantifiers, **word boundaries**
-(`\b`/`\B`) and **`(?m)` line anchors** all work at compile time. `\p` (Latin-1)
+(`\b`/`\B`) and **`(?m)` line anchors** all work at compile time. `\p` (Latin-1 in byte mode, full Unicode under `.unicode`)
 is supported (allocator-free resolver).
 
 A `Pattern` bakes one matcher with **no runtime fallback**, so the constructs that

@@ -77,6 +77,24 @@ test('byte offsets over UTF-8', () => {
   assert.deepEqual(spans(z.exec('café é')), [[3, 5], [6, 8]]);
 });
 
+test('unicode flag: characters, Unicode \\w, scripts, set ops, case folding', () => {
+  z.compile('.', 'u');
+  assert.deepEqual(spans(z.exec('aé😀')), [[0, 1], [1, 3], [3, 7]]);
+  z.compile('\\w+', 'u');
+  assert.deepEqual(spans(z.exec('naïve café')), [[0, 6], [7, 12]]);
+  z.compile('\\p{Greek}+', 'u');
+  assert.deepEqual(spans(z.exec('abc αβγ')), [[4, 10]]);
+  z.compile('[\\p{L}--\\p{Lu}]+', 'u');
+  assert.deepEqual(spans(z.exec('abCDef')), [[0, 2], [4, 6]]);
+  z.compile('(?iu)k');
+  assert.equal(z.exec('kK\u212A').matches.length, 3);
+  // Byte mode is unchanged: `.` is one byte, \w stops at the first non-ASCII byte.
+  z.compile('.');
+  assert.equal(z.exec('aé😀').matches.length, 7);
+  z.compile('\\w+');
+  assert.deepEqual(spans(z.exec('naïve café')), [[0, 2], [4, 6], [7, 10]]);
+});
+
 test('replace with template, first and all', () => {
   z.compile('(\\w+)@(\\w+)');
   assert.equal(z.replace('a@b c@d', '$2 at $1'), 'b at a d at c');
@@ -159,6 +177,14 @@ test('explainer locates obvious syntax errors', () => {
   assert.equal(parse('[abc').error.start, 0);
   assert.equal(parse('*a').error.start, 0);
   assert.match(parse('a{3,2}').error.desc, /out of order/);
+});
+
+test('explainer understands the u flag', () => {
+  assert.equal(parse('(?u)[\\p{L}--\\p{Lu}]+\\N{U+1F600}', '').error, null);
+  assert.equal(parse('[a-z&&[^aeiou]]+\\x{1F600}', 'u').error, null);
+  assert.match(parse('.', 'u').tokens[0].desc, /character/);
+  assert.match(parse('.', '').tokens[0].desc, /byte/);
+  assert.match(parse('(?u)\\b', '').tokens[1].desc, /Unicode/);
 });
 
 test('explainer merges literal runs before quantifiers', () => {

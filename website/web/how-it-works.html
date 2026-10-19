@@ -187,9 +187,11 @@
         <ul>
           <li><b>Leftmost-first</b>, like Perl, PCRE, RE2 and Rust: the first alternative that matches wins, and every engine agrees
             on the same match. Randomized differential tests pin the engines to each other.</li>
-          <li><b>Byte-oriented.</b> The engine works on bytes: <code>.</code> matches one byte, <code>\w</code> <code>\d</code>
-            <code>\b</code> are ASCII and <code>\p{…}</code> covers the Latin-1 range. A codepoint-aware Unicode mode is reserved as a
-            future opt-in flag.</li>
+          <li><b>Byte-oriented by default, Unicode on request.</b> The engine works on bytes: <code>.</code> matches one byte,
+            <code>\w</code> <code>\d</code> <code>\b</code> are ASCII and <code>\p{…}</code> covers the Latin-1 range. The <code>u</code> flag
+            (<code>.unicode</code>, inline <code>(?u)</code>) switches to Unicode characters: a class becomes one node that compiles to a
+            compact UTF-8 byte automaton (so the DFA tier runs unchanged), <code>\w</code> <code>\b</code> <code>\p{Script}</code> take their
+            Unicode definitions and <code>(?i)</code> uses simple case folding. The backtracker decodes one character per class test.</li>
           <li><b>Captures on demand.</b> <code>find</code> returns only the match span. <code>captures</code> then re-runs a small
             engine over just that span to fill in the groups, so captures never cost a second pass over the whole text.</li>
         </ul>

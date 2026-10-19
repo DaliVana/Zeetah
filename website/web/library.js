@@ -123,6 +123,18 @@
       text: 'Zeetah is a regex engine. ZEETAH runs in wasm. zeetah is byte-oriented.',
     },
     {
+      name: 'Unicode words (u flag)',
+      pattern: '\\w+',
+      flags: 'gu',
+      text: 'naïve café — 日本語のテキスト, Привет мир, ١٢٣ and emoji 😀.',
+    },
+    {
+      name: 'Greek or Cyrillic script (u flag)',
+      pattern: '\\p{Greek}+|\\p{Cyrillic}+',
+      flags: 'gu',
+      text: 'alpha αβγ, Привет мир, beta δ; latin stays out.',
+    },
+    {
       name: 'Key=value pairs (extended mode)',
       pattern: '(?<key>[a-z_]+)   # the key\n=\n(?<value>\\S+)     # up to whitespace',
       flags: 'gx',

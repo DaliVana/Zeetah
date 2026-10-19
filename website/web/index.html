@@ -125,7 +125,7 @@
           "name": "Which regex syntax does Zeetah support?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "Perl and PCRE style syntax: character classes and POSIX classes, \\d \\w \\s and \\b, anchors, greedy, lazy and possessive quantifiers, alternation, capturing, non-capturing and named groups, lookahead, fixed-width lookbehind, backreferences, atomic groups and the inline flags (?i) (?m) (?s) (?x). Matching is byte-oriented: \\w and \\d are ASCII and . matches one byte."
+            "text": "Perl and PCRE style syntax: character classes and POSIX classes, \\d \\w \\s and \\b, Unicode properties \\p{L} \\p{Greek}, anchors, greedy, lazy and possessive quantifiers, alternation, capturing, non-capturing and named groups, lookahead, fixed-width lookbehind, backreferences, atomic groups and the inline flags (?i) (?m) (?s) (?x) (?u). Matching is byte-oriented by default (\\w and \\d are ASCII, . matches one byte); the u flag switches to Unicode characters, scripts and properties, and Unicode case folding."
           }
         },
         {
@@ -157,7 +157,7 @@
           "name": "Does this tester behave like JavaScript's RegExp?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "No. It runs the real Zeetah engine compiled to WebAssembly, so results match what your Zig program will see. Like JavaScript it uses leftmost-first matching, but Zeetah works on UTF-8 bytes: \\w is ASCII, . matches a single byte, and match positions are byte offsets."
+            "text": "No. It runs the real Zeetah engine compiled to WebAssembly, so results match what your Zig program will see. Like JavaScript it uses leftmost-first matching, but Zeetah works on UTF-8 bytes by default: \\w is ASCII and . matches a single byte. Its u flag, like JavaScript's, makes . match one character and \\w \\b \\p{…} Unicode-aware. Match positions are always byte offsets."
           }
         },
         {
@@ -241,6 +241,7 @@
           <button class="flag" type="button" data-flag="m" title="^ and $ match at line boundaries, same as (?m)"><b>m</b>multiline</button>
           <button class="flag" type="button" data-flag="s" title=". also matches a newline, same as (?s)"><b>s</b>dot all</button>
           <button class="flag" type="button" data-flag="x" title="Ignore whitespace and allow # comments, same as (?x)"><b>x</b>extended</button>
+          <button class="flag" type="button" data-flag="u" title="Unicode mode: . matches one character, \w \d \b and \p{…} are Unicode, (?i) folds by Unicode rules, same as (?u)"><b>u</b>unicode</button>
         </div>
 
         <div class="status" id="status" aria-live="polite"></div>
@@ -353,6 +354,7 @@
           <li><b>Bounded backtracking.</b> Backreferences and lookaround run under a step budget and return <code>error.MatchBudgetExceeded</code> instead of hanging.</li>
           <li><b>SIMD where it pays.</b> Teddy multi-literal search and 64-byte bitmask scans for character-class runs.</li>
           <li><b>Compile-time regex.</b> <code>zeetah.Pattern</code> builds the matcher at comptime: no allocator, no runtime compile.</li>
+          <li><b>Unicode, opt-in.</b> The <code>u</code> flag (<code>.unicode</code>, inline <code>(?u)</code>) switches to character-level matching with Unicode <code>\w</code> <code>\b</code>, <code>\p{Script}</code> properties, class set operations and case folding; byte mode stays the default.</li>
           <li><b>No dependencies.</b> Zig standard library only; every allocation goes through the allocator you pass.</li>
         </ul>
         <div class="about-links">
@@ -373,7 +375,7 @@
         </div>
         <div class="faq-item">
           <h3>Which regex syntax does Zeetah support?</h3>
-          <p>Perl and PCRE style syntax: character classes and POSIX classes, \d \w \s and \b, anchors, greedy, lazy and possessive quantifiers, alternation, capturing, non-capturing and named groups, lookahead, fixed-width lookbehind, backreferences, atomic groups and the inline flags (?i) (?m) (?s) (?x). Matching is byte-oriented: \w and \d are ASCII and . matches one byte.</p>
+          <p>Perl and PCRE style syntax: character classes and POSIX classes, \d \w \s and \b, Unicode properties \p{L} \p{Greek}, anchors, greedy, lazy and possessive quantifiers, alternation, capturing, non-capturing and named groups, lookahead, fixed-width lookbehind, backreferences, atomic groups and the inline flags (?i) (?m) (?s) (?x) (?u). Matching is byte-oriented by default (\w and \d are ASCII, . matches one byte); the u flag switches to Unicode characters, scripts and properties, and Unicode case folding.</p>
         </div>
         <div class="faq-item">
           <h3>Is Zeetah safe from ReDoS (catastrophic backtracking)?</h3>
@@ -389,7 +391,7 @@
         </div>
         <div class="faq-item">
           <h3>Does this tester behave like JavaScript&#x27;s RegExp?</h3>
-          <p>No. It runs the real Zeetah engine compiled to WebAssembly, so results match what your Zig program will see. Like JavaScript it uses leftmost-first matching, but Zeetah works on UTF-8 bytes: \w is ASCII, . matches a single byte, and match positions are byte offsets.</p>
+          <p>No. It runs the real Zeetah engine compiled to WebAssembly, so results match what your Zig program will see. Like JavaScript it uses leftmost-first matching, but Zeetah works on UTF-8 bytes by default: \w is ASCII and . matches a single byte. Its u flag, like JavaScript&#x27;s, makes . match one character and \w \b \p{…} Unicode-aware. Match positions are always byte offsets.</p>
         </div>
         <div class="faq-item">
           <h3>Is my text sent to a server?</h3>
@@ -401,7 +403,7 @@
 
   <footer class="foot">
     <p>Runs entirely in your browser: Zeetah compiled to WebAssembly (wasm32 + SIMD128), no server round-trips.
-      Zeetah is byte-oriented, so <code>.</code> matches one byte, <code>\w</code> is ASCII and offsets are UTF-8 byte offsets.</p>
+      Zeetah is byte-oriented by default (<code>.</code> matches one byte, <code>\w</code> is ASCII); the <code>u</code> flag switches to Unicode characters. Offsets are UTF-8 byte offsets either way.</p>
     <p class="foot-links"><a href="./">Regex tester</a> · <a href="guide.html">Guide</a> · <a href="how-it-works.html">How it works</a> ·
       <a href="https://github.com/DaliVana/Zeetah" rel="noopener">GitHub</a> · <a href="llms.txt">llms.txt</a> · MIT license</p>
   </footer>

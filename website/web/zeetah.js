@@ -13,8 +13,9 @@
   const dec = new TextDecoder('utf-8'); // non-fatal: a split code point decodes as U+FFFD
   const NONE = 0xffffffff;
 
-  /** Flag letters accepted by `compile`, mapped to the shim's flag bits. */
-  const FLAG_BITS = { i: 1, m: 2, s: 4, x: 8 };
+  /** Flag letters accepted by `compile`, mapped to the shim's flag bits
+   *  (`u` is Zeetah's codepoint mode, `.unicode`). */
+  const FLAG_BITS = { i: 1, m: 2, s: 4, x: 8, u: 16 };
 
   class ZeetahError extends Error {
     constructor(code, op) {
@@ -149,7 +150,7 @@
 
     // --- API -------------------------------------------------------------------
 
-    /** Compile `pattern` with flag letters from "imsx" (others ignored).
+    /** Compile `pattern` with flag letters from "imsxu" (others ignored).
      *  Returns { engine, groups: [{ index, name }] }. */
     compile(pattern, flags = '') {
       let bits = 0;

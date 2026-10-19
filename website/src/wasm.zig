@@ -93,9 +93,9 @@ export fn zt_version() i32 {
 // --- compile ---------------------------------------------------------------
 
 /// Flag bits: 1 = case_insensitive (i), 2 = multiline (m), 4 = dot_all (s),
-/// 8 = extended (x). Replaces the previously compiled regex. Returns 0, or -1
-/// on a compile error (`EmptyPattern`, `InvalidPattern`, `NotImplemented`,
-/// `PatternTooComplex`, `OutOfMemory`).
+/// 8 = extended (x), 16 = unicode (u, codepoint mode). Replaces the previously
+/// compiled regex. Returns 0, or -1 on a compile error (`EmptyPattern`,
+/// `InvalidPattern`, `NotImplemented`, `PatternTooComplex`, `OutOfMemory`).
 export fn zt_compile(p: [*]const u8, n: usize, flags: u32) i32 {
     if (re) |*r| r.deinit();
     re = null;
@@ -104,6 +104,7 @@ export fn zt_compile(p: [*]const u8, n: usize, flags: u32) i32 {
         .multiline = flags & 2 != 0,
         .dot_all = flags & 4 != 0,
         .extended = flags & 8 != 0,
+        .unicode = flags & 16 != 0,
     }) catch |e| return fail(e);
     return 0;
 }

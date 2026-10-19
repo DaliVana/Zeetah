@@ -320,10 +320,12 @@ export fn phoneMatches(ptr: [*]const u8, len: usize) i32 {
 patterns bake a minimized DFA, non-regular ones (lookaround, backreferences,
 atomic/possessive, `\b`, `(?m)`, captures-with-submatches) bake the same bounded
 backtracker into `.rodata`. The only `@compileError`s are constructs genuinely
-unsupported anywhere in the engine (the `.unicode` flag, `\p` scripts / `\p` under
-`(?i)`, an unknown POSIX class, or a pattern past an internal construction ceiling),
-since a `Pattern` has no runtime fallback; for those, use the runtime `Regex` shim
-above.
+unsupported anywhere in the engine (`\p` scripts / `\p` under `(?i)` in byte mode,
+an unknown property or POSIX class, or a pattern past an internal construction
+ceiling), since a `Pattern` has no runtime fallback; for those, use the runtime
+`Regex` shim above. Codepoint mode is `.{ .unicode = true }` on either front end;
+its Unicode tables add ~180 KB of read-only data to a module that compiles
+patterns at runtime.
 
 ---
 
