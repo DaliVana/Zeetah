@@ -84,6 +84,15 @@ Key points:
 - **There is no AST.** The parser (`parser.zig`) produces **HIR** (`hir.zig`)
   directly — a flat, index-addressed high-level IR. Everything downstream
   (analysis, NFA construction, the planner) reads HIR.
+- **Codepoint classes are one HIR node.** Under `(?u)` a class with non-ASCII
+  members is a `.uclass` (an interned, normalized codepoint range set); an
+  ASCII-only class is still a byte `.set`, so every byte fast path keeps
+  applying. `thompson.zig` lowers a `.uclass` to a **suffix-shared UTF-8 byte
+  automaton** (a port of regex-automata's `Utf8Compiler`: Daciuk's incremental
+  minimal-automaton construction over the sorted byte-range sequences, so
+  `\p{L}` is a few hundred states rather than thousands), and the DFA tier
+  never knows the difference. The backtracking tier decodes one scalar per
+  class test instead (`utf8.decodeAt` + an ASCII bitmap / binary search).
 - **The NFA is a construction artifact.** `thompson.zig` lowers HIR to a
   Thompson NFA with ε-transitions. That NFA is then turned into a DFA by subset
   construction (in `src/exec/`); it is *not* simulated thread-by-thread at match
@@ -406,8 +415,9 @@ A `Pattern` bakes one matcher with **no runtime fallback**, so the constructs
 genuinely unsupported *anywhere* in the engine are a hard `@compileError` rather
 than a recoverable runtime `error.NotImplemented`:
 
-- the `.unicode` (codepoint-mode) flag, `\p` scripts / binary props / `\p` under
-  `(?i)`,
+- `\p` scripts / binary props / `\p` under `(?i)` in byte mode (codepoint mode,
+  `.{ .unicode = true }`, supports them; a wide `(?u)` class that overflows the
+  comptime NFA ceiling bakes the compiled backtracker instead),
 - an unknown POSIX class name,
 - patterns that overflow an internal construction ceiling (`>1000`-count
   repetition; a DFA over the 256-state ceiling). *Exception:* a large keyword
@@ -670,7 +680,8 @@ intentional, not an accident of layering.
 | `exec/split_alt.zig` | mixed regular/non-regular top-level alternation |
 | `exec/dupword.zig` | adjacent-duplicate-word linear recognizer |
 | `exec/charclass.zig` | shared character-class helpers |
-| `unicode_class.zig`, `unicode_tables.zig` | Latin-1 `\p` General_Category resolution |
+| `unicode_class.zig`, `unicode_tables.zig` | `\p` property resolution (gc / Script / Script_Extensions / binary properties, UAX #44 loose names) over the generated Unicode 17.0.0 tables; byte mode uses the Latin-1 gc slice |
+| `unicode_set.zig`, `utf8.zig` | allocation-free codepoint range-set algebra (`RangeBuf`, complement / intersect / difference / simple case folding) and strict UTF-8 decode / `\w` / fold-canon helpers for codepoint mode |
 | `cache.zig`, `thread_safety.zig` | per-`Regex` scratch pools (`cache.Pool`); thread-safety helpers |
 | `match.zig`, `common.zig`, `errors.zig`, `builder.zig` | `Match`/`Group`, shared types/flags, `RegexError`, fluent builder |
 

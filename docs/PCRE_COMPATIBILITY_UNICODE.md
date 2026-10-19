@@ -2,151 +2,171 @@
 
 The Unicode slice of the Zeetah ↔ **PCRE2 10.x** comparison. For syntax,
 escapes, quantifiers, groups, anchors, and Perl control constructs, see
-[PCRE_COMPATIBILITY.md](PCRE_COMPATIBILITY.md).
+[PCRE_COMPATIBILITY.md](PCRE_COMPATIBILITY.md). The research behind the
+design (what PCRE2, Oniguruma, RE2, Rust `regex`, .NET and PyPI `regex`
+actually do) is in [UNICODE_RESEARCH.md](UNICODE_RESEARCH.md); the design
+itself in [UNICODE_PLAN.md](UNICODE_PLAN.md).
 
-Verified against the real engine source — `src/parser.zig`,
-`src/unicode_class.zig`, `src/exec/charclass.zig`.
+Verified against the engine source — `src/parser.zig`, `src/unicode_class.zig`,
+`src/unicode_set.zig`, `src/utf8.zig`, `src/thompson.zig` — and the suite in
+`tests/feat_unicode.zig`.
 
 ---
 
 ## Executive summary
 
-Zeetah is **byte-oriented end to end**: the matcher runs over a 256-symbol (byte)
-alphabet and **no matcher decodes UTF-8**. This is exactly **Rust `regex` / RE2
-with Unicode mode off**. PCRE2, by contrast, offers full codepoint matching and
-Unicode property tables under its UTF + UCP options.
+Zeetah has **two modes**, chosen per pattern (or per scope):
 
-The headline:
+- **Byte mode** — the default, and a frozen contract: the matcher runs over a
+  256-symbol byte alphabet, `.` is one byte, `\d \w \s \b` are ASCII, `\p` is
+  General_Category restricted to Latin-1. This is exactly **Rust `regex` / RE2
+  with Unicode mode off**, and it is also what PCRE2 does **without**
+  `PCRE2_UTF`/`PCRE2_UCP` (the configuration the cross-engine benchmark runs).
+- **Codepoint mode** — `Regex.compileWithFlags(…, .{ .unicode = true })`,
+  `Pattern(…, .{ .unicode = true })`, or inline `(?u)` / `(?u:…)` (`(?-u)`
+  turns it off again). The match unit becomes one UTF-8-encoded scalar value
+  and every Unicode construct gets its UTS #18 Level 1 meaning. Semantically
+  this is **Rust `regex` with Unicode on**, which is close to — but not
+  identical with — PCRE2 with **`PCRE2_UTF | PCRE2_UCP`**. The differences are
+  listed below.
 
-- **Byte mode is the permanent, committed default** — it will not change.
-- **Codepoint mode is reserved, not implemented** — `(?u)` / `.unicode` both
-  return `error.NotImplemented` today, and when shipped they will *add*
-  codepoint behavior **only when opted in**, never altering the byte default.
-  So a future Unicode phase is an additive, non-breaking change.
-- The one Unicode feature that *does* work today is `\p{…}` General_Category,
-  but **only restricted to the Latin-1 byte range** (U+0000–U+00FF).
-
-Therefore Unicode-heavy PCRE patterns are the **least portable** category. If
-your inputs are ASCII / byte protocols (HTTP, logs, config, identifiers,
-numbers), none of this matters and the two engines agree.
+So a PCRE2 pattern compiled with `PCRE2_UTF|PCRE2_UCP` ports to Zeetah by
+setting `.unicode = true`; one compiled without them ports as-is.
 
 ---
 
-## 1. Core semantics: byte vs. codepoint
+## 1. Core semantics
 
-| Capability | PCRE2 (UTF + UCP) | Zeetah | Compat |
-|---|---|---|---|
-| Subject alphabet | Codepoints | **Bytes** (256 symbols), no UTF-8 decode in matcher | ⚠️ RE2 Unicode-off |
-| `.` granularity | One codepoint | **One byte** | ⚠️ a multibyte char = N `.` matches |
-| `\w` / `\d` / `\s` | Unicode-aware | **ASCII only** (`[A-Za-z0-9_]`, `[0-9]`, ASCII WS) | ⚠️ |
-| `\b` / `\B` | Unicode word boundary | **ASCII word boundary** (`isWord` = `[A-Za-z0-9_]`) | ⚠️ |
-| `\X` (extended grapheme cluster) | ✅ | ❌ `NotImplemented` | ❌ |
-| Case-insensitive `(?i)` fold | Unicode simple/full fold | **ASCII-only fold** (`a–z` ↔ `A–Z`), done at set construction | ⚠️ |
+| Capability | PCRE2 (UTF+UCP) | Zeetah `(?u)` | Zeetah byte mode | Compat |
+|---|---|---|---|---|
+| Subject alphabet | codepoints | **scalars** (UTF-8 decoded; invalid bytes never match) | bytes | ✅ / ⚠️ |
+| `.` | one codepoint (not `\n`) | one scalar (not `\n`; `(?s)` adds it) | one byte | ✅ |
+| Quantifiers | per codepoint | per scalar (`.{3}` = 3 characters) | per byte | ✅ |
+| `\d` | `\p{Nd}` | `\p{Nd}` | `[0-9]` | ✅ |
+| `\s` | `\p{Z}` ∪ `\h` ∪ `\v` | `\p{White_Space}` | ASCII | ⚠️ ¹ |
+| `\w` | `\p{L}` ∪ `\p{N}` ∪ `\p{Mn}` ∪ `\p{Pc}` | Alphabetic ∪ **M** ∪ **Nd** ∪ Pc ∪ Join_Control (UTS #18 Annex C) | `[A-Za-z0-9_]` | ⚠️ ² |
+| `\b` / `\B` | from `\w` | from `\w` (undecodable neighbour = non-word) | ASCII | ⚠️ ² |
+| `\h \v \R` | Unicode lists (always) | Unicode lists | PCRE 8-bit lists | ✅ |
+| `\X` | ✅ | ❌ `NotImplemented` | ❌ | ❌ |
+| Case-insensitive `(?i)` | simple fold + `K`/`S` ↔ Kelvin / long-s (unless `CASELESS_RESTRICT`) | Unicode **simple** folding (CaseFolding C+S), incl. Kelvin / long-s / `σΣς` | ASCII fold | ✅ |
+| Full case folding (`ß` ≡ `ss`) | ❌ | ❌ | ❌ | ✅ (both lack it) |
+| `(?i)\p{Lu}` | matches `Lc` (10.45+) | property folded ⇒ every cased letter | `NotImplemented` | ✅ |
+| Invalid UTF-8 in the subject | error unless `MATCH_INVALID_UTF` | never matches a codepoint construct, never an error | matched as bytes | ⚠️ |
 
-Evidence:
-
-- `src/common.zig`: `pub const Char = u8;` — the entire class machinery is
-  byte-typed; character sets are 256-bit bitmaps (`[32]u8`).
-- `src/exec/charclass.zig`: `isWord(c)` = `[A-Za-z0-9_]` exactly; `\b` is
-  `bw != aw` over that ASCII predicate.
-- `src/parser.zig` `foldCaseBitmap`: folds only `'a'..'z'` ↔ `'A'..'Z'`.
-
-**Practical consequence:** a pattern like `\w+` applied to `"café"` matches
-`"caf"` plus the two bytes of `é` are *not* word characters — so it stops at
-`caf`. PCRE in UTF+UCP mode matches the whole word. Byte mode also means `.`
-over UTF-8 text counts bytes, not characters.
+¹ `\s`: PCRE2-UCP's set is `\p{Z} ∪ \h ∪ \v`; Zeetah's is `White_Space`. They
+agree on every common character (space, tab, NEL, NBSP, U+2000–U+200A,
+U+2028/9, U+3000, …) and differ only on U+180E MONGOLIAN VOWEL SEPARATOR
+(in `\h`, not White_Space) and U+200B ZERO WIDTH SPACE (in neither).
+² `\w`: PCRE2 includes *all* numbers (`No` too: ½, ²) and only non-spacing
+marks; Zeetah (Rust/UTS #18) excludes `No` but includes all marks (`Mc`, `Me`)
+plus `Join_Control` (ZWJ/ZWNJ); letter-numbers (`Nl`, Ⅻ) are in both (via
+`Alphabetic`). Letters, digits, `_`, CJK and combining accents agree. The same
+delta applies to `\b`.
 
 ---
 
 ## 2. Unicode properties `\p{…}` / `\P{…}`
 
-Supported **syntactically**, but resolved to a **Latin-1 byte restriction** of
-the property — codepoints above U+00FF are silently dropped from the generated
-bitmap.
-
-| `\p` capability | PCRE2 | Zeetah | Notes |
+| `\p` capability | PCRE2 | Zeetah `(?u)` | Zeetah byte mode |
 |---|---|---|---|
-| General_Category, one/two-letter (`\pL`, `\p{Lu}`, `\p{Nd}`, `\p{L}`…) | ✅ full Unicode | ⚠️ **only codepoints ≤ U+00FF** | the only working `\p` path |
-| `\pL` shorthand (no braces) | ✅ | ✅ (Latin-1) | |
-| Negation `\P{…}`, `\p{^…}`, enclosing `[^\p{…}]` | ✅ | ✅ (Latin-1) | |
-| `\p{…}` inside a class `[\p{L}_]` | ✅ | ✅ (Latin-1) | |
-| Scripts `\p{Greek}`, `\p{Han}` | ✅ | ❌ `NotImplemented` | `UnsupportedUnicodeProperty` → `NotImplemented` |
-| Script extensions `\p{scx:…}` | ✅ | ❌ `NotImplemented` | |
-| Binary properties `\p{White_Space}`, `\p{Alphabetic}` | ✅ | ❌ `NotImplemented` | |
-| Unknown / misspelled property name | error | ❌ `NotImplemented` | `UnknownUnicodeProperty` → `NotImplemented` |
-| `\p{…}` under `(?i)` | ✅ Unicode fold | ❌ `NotImplemented` | guarded: `if (p.ci) return Error.Unsupported;` |
-
-Evidence: `src/unicode_class.zig` `resolveLatin1Bitmap()` clamps ranges to
-`0xFF`; `src/parser.zig` `readPropBitmap()` catches
-`UnknownUnicodeProperty` / `UnsupportedUnicodeProperty` and maps them to
-`Error.Unsupported` → `NotImplemented`. The `(?i)` guard is in `parsePropClass`.
-
-> So `\p{L}` "works", but only as *the Latin-1 letters* (A–Z, a–z, plus the
-> accented Latin-1 block) — not as Unicode `Letter`. For ASCII/Latin-1 text this
-> is often enough; for anything beyond, it under-matches relative to PCRE.
+| General_Category short names (`\pL`, `\p{Lu}`, `\p{Nd}`, `L&`) | ✅ | ✅ | ✅ Latin-1 only |
+| Long names / aliases (`\p{Letter}`, `\p{Uppercase_Letter}`, `gc=Lu`, `gc:Lu`) | ❌ short only | ✅ (UAX #44, loose matching) | ✅ Latin-1 only |
+| `Is` prefix (`\p{IsGreek}`) | ❌ | ✅ | ✅ (gc) |
+| Scripts (`\p{Greek}`, `\p{Han}`, `sc=Grek`, `Script:Latin`) | ✅ | ✅ (Unicode 17.0.0) | ❌ `NotImplemented` |
+| Script extensions (`\p{scx:Hira}`) | ✅ | ✅ | ❌ |
+| Binary properties | few (`Bidi_Control`, …) | ~55 (`Alphabetic`, `White_Space`, `Dash`, `Emoji*`, `ID_Start`, `Math`, …) | ❌ |
+| `Any`, `ASCII`, `Assigned` | `Any` | ✅ all three | ✅ |
+| Bidi_Class (`\p{Bidi_Class:AL}`) | ✅ | ❌ | ❌ |
+| PCRE specials `Xan Xps Xsp Xwd Xuc` | ✅ | ❌ | ❌ |
+| Blocks (`\p{InGreek}`), `Age` | ❌ | ❌ | ❌ |
+| Negation `\P{…}`, `\p{^…}` | ✅ | ✅ (+ `\p{gc!=L}`, `\p{Alphabetic=No}`) | ✅ |
+| `\p` inside `[…]` | ✅ | ✅ | ✅ |
+| Unknown / misspelled name | error | `NotImplemented` | `NotImplemented` |
 
 ---
 
-## 3. Unicode mode flags
+## 3. Character classes
 
-| Flag / option | PCRE2 | Zeetah |
+| Feature | PCRE2 (UTF) | Zeetah `(?u)` |
 |---|---|---|
-| UTF mode (`(*UTF)`, `PCRE2_UTF`) / inline `(?u)` | ✅ codepoint matching | ❌ `(?u)` → `NotImplemented` |
-| UCP (`PCRE2_UCP`) — Unicode props for `\w\d\s\b` | ✅ | ❌ |
-| ASCII mode `(?a)` | ✅ | ❌ `NotImplemented` |
-| `.unicode` compile flag | n/a (PCRE uses options) | ❌ `error.NotImplemented` (reserved) |
+| Codepoint members and ranges (`[à-ÿ]`, `[😀-🙏]`) | ✅ | ✅ |
+| `\x{…}` / `\N{U+…}` members | ✅ | ✅ |
+| `\d \w \s \h \v \p` members | ✅ | ✅ |
+| POSIX `[:alpha:]` | ASCII; Unicode under UCP | ASCII (UTS #18 RL1.2a, like Rust); `[:^alpha:]` complements the whole universe |
+| Nested classes `[[a-z]…]` | ❌ | ✅ |
+| Set operations `&&` `--` `~~` | ❌ (`[a--b]` is a range error) | ✅ Rust precedence: everything so far ∘ the rest |
+| Negation of the whole class | ✅ | ✅ (after folding under `(?i)`) |
 
-The reserved-but-not-implemented contract is explicit in the engine: `(?u)` and
-`.unicode` parse to a dedicated unsupported path rather than being ignored, so a
-pattern that *needs* Unicode fails loudly instead of silently matching as bytes.
-
----
-
-## 4. When this matters (and when it doesn't)
-
-**Doesn't matter — full parity with PCRE:**
-
-- ASCII text and byte protocols: HTTP headers, log lines, config files,
-  identifiers, numbers, hex, CSV/TSV, most structured-extraction workloads.
-- Patterns whose only "Unicode" need is matching specific Latin-1 bytes.
-
-**Does matter — Zeetah under-matches or rejects vs PCRE:**
-
-1. `\w+`, `\b`, `\d` expected to span non-ASCII letters/digits → ASCII-only here.
-2. `\p{Script}` / binary properties (`\p{Han}`, `\p{Alphabetic}`) → rejected.
-3. `\p{L}` expected to mean Unicode `Letter` → only Latin-1 here.
-4. `(?i)` over non-ASCII (e.g. `ß`, `İ`, `Σ`/`σ`) → ASCII fold only; `(?i)\p{…}`
-   rejected.
-5. Codepoint-granular `.` over UTF-8 → counts bytes, not characters.
-6. `\X` grapheme clusters → unsupported.
-
-**Workarounds today:**
-
-- Match raw UTF-8 byte sequences explicitly when you know the encoding (e.g. the
-  two bytes `\xC3\xA9` for `é` — but note Zeetah has no `\x` escape either, so
-  you must use the literal bytes in the pattern string).
-- Normalize/transliterate input to ASCII before matching where acceptable.
-- Use `[…]` byte classes that enumerate the Latin-1 bytes you care about.
-- For anything genuinely Unicode-aware, Zeetah is **not a drop-in today** — wait
-  for the opt-in codepoint phase, or keep that pattern on PCRE.
+A pattern that uses `--` as two literal hyphens in a PCRE class (rare) must
+escape one of them under `(?u)`; byte mode is unchanged.
 
 ---
 
-## 5. Note for CTRE / cross-engine readers
+## 4. Escapes
 
-In Zeetah's own cross-engine benchmark, CTRE is *skipped* on the
-Unicode-property workloads because those patterns don't compile under it either —
-so the practical gap between Zeetah and the C++ compile-time baseline on Unicode
-is narrower than it first appears. The real Unicode comparison is against PCRE2,
-ICU, and Rust's `regex` with Unicode **on**, where Zeetah is intentionally a
-byte-mode engine.
+| Escape | PCRE2 (UTF) | Zeetah `(?u)` | Zeetah byte mode |
+|---|---|---|---|
+| `\xHH` | codepoint U+00HH | scalar U+00HH (UTF-8 encoded) | the byte `0xHH` |
+| `\x{…}`, `\o{…}` | codepoint ≤ U+10FFFF | scalar ≤ U+10FFFF; surrogates / larger → `InvalidPattern` | ≤ 0xFF, larger → `NotImplemented` |
+| `\N{U+hhhh}` | ✅ | ✅ | ❌ |
+| `\N{name}` | ❌ | ❌ `NotImplemented` | ❌ |
+| `\C` (one code unit) | ✅ | ❌ (use a `(?-u:.)` scope) | n/a |
+| Literal non-ASCII in the pattern | one character | one character (malformed UTF-8 in the *pattern* → `InvalidPattern`) | its bytes |
+
+---
+
+## 5. Mode selection
+
+| Mechanism | PCRE2 | Zeetah |
+|---|---|---|
+| Whole pattern | `PCRE2_UTF` + `PCRE2_UCP` options; `(*UTF)` / `(*UCP)` leaders | `.unicode = true` (`CompileFlags` / `PatternOptions`) |
+| Inline | — (UTF cannot be scoped) | `(?u)` toggle, `(?u:…)` scope, `(?-u)` off |
+| Per-escape ASCII overrides | `PCRE2_EXTRA_ASCII_BSD/BSS/BSW`, `(?aD)` … | scope with `(?-u:…)` |
+| Mixing byte and codepoint constructs | not possible | allowed (`(?u)\w+(?-u)\xFF`) |
+
+Zeetah's `(?u)` is one flag covering both PCRE2 roles (UTF *and* UCP): there
+is no "UTF without UCP" mode where `.` is a codepoint but `\w` stays ASCII. To
+get that, write `(?u)` and use explicit ASCII classes (`[A-Za-z0-9_]`) where
+PCRE2 would have used `\w`.
+
+---
+
+## 6. Performance characteristics worth knowing
+
+- Codepoint classes compile to UTF-8 **byte automata** (suffix-shared; `\p{L}`
+  is ~300 NFA states) and run on the regular DFA / lazy-DFA engines; ASCII-only
+  classes are still byte classes with every byte fast path.
+- The SIMD class-run paths (`class_span`, `class_seq`, Teddy for `(?i)`
+  literals) do not apply to wide codepoint classes: on ASCII text `(?u)\w+`
+  runs at lazy-DFA speed (~100 MB/s on the benchmark corpus) where byte-mode
+  `\w+` runs at ~30 GB/s; `(?iu)sherlock` is a DFA (Kelvin sign in `k`), not a
+  Teddy scan.
+- Unicode `\b` patterns run on the bounded backtracker / PikeVM; the look-aware
+  lazy DFA only models one byte of context.
+- PCRE2 itself notes that `\p` matching and UCP `\w`/`\b` are "noticeably
+  slower"; both engines pay for Unicode, in different places.
+
+---
+
+## 7. When this matters (and when it doesn't)
+
+**Doesn't matter — parity with PCRE2 in both modes:** ASCII text and byte
+protocols (HTTP, logs, config, identifiers, numbers, CSV), structured
+extraction over Latin-1 bytes.
+
+**Needs `(?u)` to match PCRE2 UTF/UCP:** `\w+`/`\b`/`\d` over non-Latin text;
+`\p{Script}` / binary properties; `\p{L}` meaning all letters; `(?i)` over
+non-ASCII (`ß`, `İ`, `Σ`/`σ`, Kelvin); codepoint-granular `.`.
+
+**Still not available anywhere:** `\X`, full case folding, normalization,
+script runs, `Bidi_Class`, blocks.
 
 ---
 
 ## See also
 
-- [PCRE_COMPATIBILITY.md](PCRE_COMPATIBILITY.md) — everything non-Unicode
-  (escapes, classes, quantifiers, groups, anchors, Perl control constructs).
-- [CTRE_TO_ZEETAH.md](CTRE_TO_ZEETAH.md) — the byte-vs-codepoint discussion from
-  the CTRE migration angle (§7 there).
-- [ARCHITECTURE.md](ARCHITECTURE.md) — the meta-engine routing.
+- [PCRE_COMPATIBILITY.md](PCRE_COMPATIBILITY.md) — everything non-Unicode.
+- [UNICODE_RESEARCH.md](UNICODE_RESEARCH.md) — probed behaviour of PCRE2,
+  Oniguruma, RE2, Rust `regex`, PyPI `regex` and the design decisions.
+- [UNICODE_PLAN.md](UNICODE_PLAN.md) — the implementation design.
+- [ARCHITECTURE.md](ARCHITECTURE.md) — the `.uclass` node and the UTF-8 compiler.

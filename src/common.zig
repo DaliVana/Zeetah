@@ -184,10 +184,11 @@ pub const CompileFlags = packed struct {
     multiline: bool = false,
     dot_all: bool = false,
     extended: bool = false,
-    /// Codepoint-aware matching (the inline `(?u)` mode): full-Unicode `\p`,
-    /// scripts, simple case folding, codepoint-granular `.`, Unicode `\b`, and
-    /// character-class set operations. Reserved follow-on — currently rejected
-    /// with `error.NotImplemented` (see `tests/feat_unicode.zig`).
+    /// Codepoint mode (the peer of inline `(?u)`): the match unit is one
+    /// UTF-8-encoded scalar; full-Unicode `\p` (gc, scripts, scx, binary
+    /// properties), UTS #18 `\d \w \s \b`, simple case folding, codepoint
+    /// classes with nesting and `&& -- ~~`, scalar-valued `\x{…}`. See
+    /// `parser.ParseFlags.unicode` and `tests/feat_unicode.zig`.
     ///
     /// INVARIANT — byte-mode is frozen, Unicode is always opt-in.
     /// The default (this flag off) is a byte-oriented engine: `.`/`\d`/`\w`/`\b`
@@ -197,9 +198,9 @@ pub const CompileFlags = packed struct {
     /// meaning today (e.g. `&&`/`--` as literals inside `[...]`) — lives behind
     /// this flag and is never retrofitted into the default. This is what lets
     /// the extension be purely additive and breaks zero existing patterns.
-    /// Corollary: keep the reserved-syntax rejections (`(?u)`, `\x{>0xFF}`,
-    /// `\p{Script}`, …) erroring rather than silently matching, so no pattern
-    /// can come to depend on a byte-meaning the extension would later reinterpret.
+    /// Corollary: the byte-mode rejections (`\x{>0xFF}`, `\p{Script}`,
+    /// `(?i)\p`) stay errors rather than silently matching, so no byte-mode
+    /// pattern can come to depend on a meaning only codepoint mode defines.
     unicode: bool = false,
 };
 

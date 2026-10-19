@@ -347,8 +347,9 @@ for (samples) |s| {
 }
 ```
 
-> Only the `.unicode` flag is **not yet implemented** — passing
-> `.unicode = true` returns `error.NotImplemented`. All other flags work.
+> `.unicode = true` (or inline `(?u)`) selects codepoint mode: `.` is one
+> character, `\w`/`\b`/`\p{…}` are Unicode-aware, `(?i)` folds by Unicode rules.
+> All flags work.
 
 ### Multiline anchors
 
@@ -472,10 +473,10 @@ The comptime path now covers the **same feature surface as the runtime `Regex`**
 regular patterns bake a minimized DFA, non-regular ones (captures, lookaround,
 backreferences, atomic/possessive, `\b`, `(?m)`, lazy-plus-end-anchor) bake the
 same bounded backtracker. The only `@compileError`s are the constructs genuinely
-unsupported *anywhere* in the engine — the `.unicode` flag, `\p` scripts / `\p`
-under `(?i)`, an unknown POSIX class, or a pattern past an internal construction
-ceiling — since a `Pattern` has no runtime fallback. For those, use the runtime
-`Regex`.
+unsupported *anywhere* in the engine — `\p` scripts / `\p` under `(?i)` in byte
+mode, an unknown property or POSIX class, or a pattern past an internal
+construction ceiling — since a `Pattern` has no runtime fallback. For those, use
+the runtime `Regex`. Codepoint mode is `.{ .unicode = true }`.
 
 > `on_oversize = .allow_oversized` only bakes an over-budget but
 > representable DFA for a large *regular* pattern; it does **not** make a

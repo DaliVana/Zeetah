@@ -1,11 +1,12 @@
 //! GPT-4 (cl100k_base) pre-tokenizer workload — correctness gate + throughput.
 //!
 //! tiktoken's cl100k_base pre-tokenizer regex uses possessive quantifiers
-//! (`?+` / `++`), which Zeetah deliberately rejects (possessive != greedy in
-//! general — see the feature table). Here they are rewritten to plain greedy
-//! `?` / `+`, which is EXACTLY equivalent for THIS regex because each
-//! possessive class is disjoint from whatever follows it, so the engine never
-//! needs to backtrack into it:
+//! (`?+` / `++`) and full-Unicode `\p`. Zeetah runs it verbatim in codepoint
+//! mode (`.unicode = true`, on the backtracker tier — see the `test` below);
+//! the benchmark keeps the historical byte-mode variant with the possessives
+//! rewritten to plain greedy `?` / `+`, which is EXACTLY equivalent for THIS
+//! regex because each possessive class is disjoint from whatever follows it, so
+//! the engine never needs to backtrack into it:
 //!
 //!   * `[^\r\n\p{L}\p{N}]?+ \p{L}+`  — the optional class excludes letters and
 //!     `\p{L}+` requires them                          → disjoint.
@@ -58,6 +59,28 @@ test "cl100k pre-tokenization: every branch segments as the reference does" {
     try expectTokens(&re, "  hi", &.{ " ", " hi" });
     // Underscore is not \p{L}, so it starts a fresh "word".
     try expectTokens(&re, "foo_bar", &.{ "foo", "_bar" });
+}
+
+/// The regex exactly as tiktoken ships it (possessive quantifiers, full `\p`).
+pub const CL100K_VERBATIM =
+    "'(?i:[sdmt]|ll|ve|re)|[^\\r\\n\\p{L}\\p{N}]?+\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]++[\\r\\n]*|\\s*[\\r\\n]|\\s+(?!\\S)|\\s+";
+
+test "cl100k verbatim under .unicode: same segmentation as the greedy byte variant on ASCII, scalar-granular beyond" {
+    const a = std.testing.allocator;
+    var u = try zeetah.Regex.compileWithFlags(a, CL100K_VERBATIM, .{ .unicode = true });
+    defer u.deinit();
+    var b = try zeetah.Regex.compile(a, CL100K);
+    defer b.deinit();
+    const tu = try u.findAll(a, SAMPLE);
+    defer a.free(tu);
+    const tb = try b.findAll(a, SAMPLE);
+    defer a.free(tb);
+    try std.testing.expectEqual(tb.len, tu.len);
+    for (tb, tu) |x, y| try std.testing.expectEqualStrings(x.slice, y.slice);
+    // Multibyte text: letters of any script form one word token, digits of any
+    // script chunk by three — the reference cl100k behaviour.
+    try expectTokens(&u, "Grüße 世界!", &.{ "Grüße", " 世界", "!" });
+    try expectTokens(&u, "١٢٣٤ x", &.{ "١٢٣", "٤", " x" });
 }
 
 test "cl100k: a mixed line segments correctly end-to-end" {

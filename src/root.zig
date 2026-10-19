@@ -20,9 +20,10 @@
 //! submatches with `captures`/`capturesAll`/`capturesIterator`.
 //!
 //! Semantics are **byte-oriented** (committed default): `.` matches one byte,
-//! `\d`/`\w`/`\b` are ASCII, `\p` is Latin-1. Codepoint-aware mode is reserved
-//! behind the `.unicode` flag / inline `(?u)` — currently `error.NotImplemented`,
-//! and opt-in-only when added (so it will be additive, not a semantics change).
+//! `\d`/`\w`/`\b` are ASCII, `\p` is Latin-1. Codepoint mode is opt-in behind
+//! the `.unicode` flag / `PatternOptions.unicode` / inline `(?u)`: one scalar per
+//! `.`, Unicode `\d \w \s \b \p`, simple case folding, codepoint classes with
+//! set operations — purely additive, never a change to the byte default.
 //!
 //! Engine internals (parser, NFA/DFA compilers, planner, executors,
 //! prefilters) are deliberately NOT exported here. They are
@@ -36,9 +37,8 @@ const std = @import("std");
 pub const Regex = @import("regex.zig").Regex;
 
 /// Flags for `Regex.compileWithFlags` (struct peers of inline `(?i)`/`(?s)`/
-/// `(?x)`/`(?m)`): `case_insensitive`, `dot_all`, `extended`, `multiline`.
-/// `unicode` is reserved (see the Unicode note in the docs) and currently
-/// returns `error.NotImplemented`.
+/// `(?x)`/`(?m)`/`(?u)`): `case_insensitive`, `dot_all`, `extended`,
+/// `multiline`, `unicode` (codepoint mode — see the Unicode note in the docs).
 pub const CompileFlags = @import("common.zig").CompileFlags;
 
 /// The result of a successful match: the matched `slice` and its half-open

@@ -639,7 +639,7 @@ fields default to `false`.
     .multiline        = false, // `^`/`$` also match at line boundaries
     .dot_all          = false, // `.` also matches `\n`
     .extended         = false, // verbose mode: ignore unescaped whitespace
-    .unicode          = false, // NOT IMPLEMENTED — see below
+    .unicode          = false, // codepoint mode: `.`/classes match one scalar, Unicode \d \w \s \b \p, simple case folding
 }
 ```
 
@@ -649,19 +649,17 @@ fields default to `false`.
 | `multiline` | Routes `^` / `$` to line anchors — an exact peer of inline `(?m)`. | Works |
 | `dot_all` | `.` also matches newline. Equivalent to inline `(?s)`. | Works |
 | `extended` | Verbose / `x` mode: unescaped whitespace in the pattern is ignored. Equivalent to inline `(?x)`. | Works |
-| `unicode` | Codepoint-aware mode — **reserved** (see below). | **`error.NotImplemented`** |
+| `unicode` | Codepoint mode — the peer of inline `(?u)`: the match unit is one UTF-8-encoded scalar, `\d \w \s \b` and `\p{…}` take their Unicode definitions, classes gain codepoint ranges / nesting / `&& -- ~~`, `(?i)` is simple case folding. | Works |
 
-> `unicode` is the **only** rejected flag — passing `.unicode = true` (or inline
-> `(?u)`) returns `error.NotImplemented`. `multiline` **works**; it is not
-> rejected. The inline forms `(?i)`, `(?s)`, `(?x)`, `(?m)` are all honored too,
-> in both scoped (`(?i:…)`) and toggle (`(?i)`) styles.
+> Every flag works; the inline forms `(?i)`, `(?s)`, `(?x)`, `(?m)`, `(?u)` are
+> honored too, in both scoped (`(?i:…)`) and toggle (`(?i)`) styles.
 >
-> **Reserved-semantics contract (alpha):** matching is **byte-oriented** by
-> default — `.` matches one byte, `\d`/`\w`/`\b` are ASCII, `\p` is Latin-1.
-> That default is committed and will not change. `.unicode` / `(?u)` is the
-> reserved opt-in for codepoint-aware mode; when implemented it will *add* that
-> behaviour only when set, never alter the byte default — so the future Unicode
-> phase is additive and non-breaking, not a silent semantics shift.
+> **Byte mode is the committed default:** `.` matches one byte, `\d`/`\w`/`\b`
+> are ASCII, `\p` is Latin-1 General_Category only. Codepoint mode is strictly
+> opt-in and purely additive — no pattern changes meaning unless `.unicode` /
+> `(?u)` is set. The full semantics (UTS #18 Level 1, Rust `regex`-compatible),
+> the property list and the performance characteristics are in the README's
+> Unicode footnote and in `docs/PCRE_COMPATIBILITY_UNICODE.md`.
 
 ```zig
 var regex = try Regex.compileWithFlags(
@@ -771,9 +769,9 @@ Because a `Pattern` bakes a single matcher with **no runtime fallback**, the
 constructs that are genuinely unsupported *anywhere* in the engine are a hard
 `@compileError` (rather than a recoverable runtime `error.NotImplemented`):
 
-- the `.unicode` (codepoint-mode) flag,
-- `\p` scripts / binary properties / `\p` under `(?i)`,
-- an unknown POSIX class name,
+- `\p` scripts / binary properties / `\p` under `(?i)` **in byte mode** (set
+  `.{ .unicode = true }` for them),
+- an unknown property or POSIX class name,
 - a pattern that overflows an internal construction ceiling (e.g. `>1000`-count
   repetition, or a DFA that blows the 256-state ceiling — note a *large keyword
   alternation* like `\b(?:kw|…)\b` that would blow `MAX_NFA` instead routes to the
@@ -931,10 +929,10 @@ names rather than fine-grained parser variants.
   (`abc[`), a malformed or inverted `{m,n}` (`a{,2}`, `a{3,2}`), an empty or
   duplicate group name, or an invalid back-reference (`\0`, `\k<undefined>`).
 - **`error.NotImplemented`** — **well-formed but not-yet-supported features**:
-  the `.unicode` flag; `\p` scripts / binary properties / unknown names / `\p`
-  under `(?i)`; an unknown POSIX class name; repetition counts greater than
-  1000; an unrecognised `(?…)` group construct (e.g. atomic groups); an
-  unsupported escape.
+  `\p` scripts / binary properties / `\p` under `(?i)` in byte mode (they work
+  under `(?u)`); an unknown property name; an unknown POSIX class name;
+  `\N{name}` (only `\N{U+hhhh}` is supported); repetition counts greater than
+  1000; an unrecognised `(?…)` group construct; an unsupported escape.
 - **`error.PatternTooComplex`** — a construction ceiling overflowed **at
   compile time** (NFA states 256, edges 2048, DFA states 256, HIR nodes 4096,
   capture groups 32). Distinct from the match-time budget error below.

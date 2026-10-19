@@ -150,8 +150,8 @@ var re = try zeetah.Regex.compileWithFlags(allocator, "^item", .{
 defer re.deinit();
 ```
 
-The only rejected flag is `.unicode` (codepoint-aware mode), which returns
-`error.NotImplemented`; there is no `(?u)` inline equivalent yet either.
+The fifth flag, `.unicode`, selects codepoint mode (inline peer `(?u)`); see
+[Unicode `\p` scope](#unicode-p-scope) below.
 
 ## Building patterns: Builder & Patterns
 
@@ -373,8 +373,9 @@ A `Pattern` bakes one matcher with **no runtime fallback**, so the constructs th
 are genuinely unsupported *anywhere* in the engine are a hard `@compileError`
 (rather than a recoverable runtime `error.NotImplemented`):
 
-- the `.unicode` flag, `\p` scripts / binary properties / `\p` under `(?i)`;
-- an unknown POSIX class name;
+- `\p` scripts / binary properties / `\p` under `(?i)` in byte mode (use
+  `.{ .unicode = true }`);
+- an unknown property or POSIX class name;
 - a pattern that overflows an internal construction ceiling (`>1000`-count
   repetition; a DFA over the 256-state ceiling — though a big `\b(?:kw|…)\b`
   keyword list that would blow `MAX_NFA` instead routes to the backtracker and
@@ -454,36 +455,70 @@ _ = r catch |e| switch (e) {
 
 ## Unicode `\p` scope
 
-`\p{…}`, `\P{…}`, and the `\pL` shorthand are supported as the **Latin-1 byte
-restriction of General_Category** — codepoints `0x00`–`0xFF` only. This
-matches Rust/RE2 behavior with Unicode mode *off*, and is a direct consequence
-of Zeetah being byte-oriented end-to-end (the DFA runs over a 256-symbol byte
-alphabet; no matcher decodes UTF-8).
+Zeetah has two modes. **Byte mode** (the default, frozen) is byte-oriented
+end-to-end: `\p{…}`, `\P{…}` and the `\pL` shorthand are the **Latin-1 byte
+restriction of General_Category** — codepoints `0x00`–`0xFF` only, exactly
+Rust/RE2 with Unicode mode *off*; scripts, binary properties and `\p` under
+`(?i)` are `error.NotImplemented` there.
 
-What works:
-
-- one- and two-letter categories — `L`, `Lu`, `Ll`, `N`, `Nd`, … ;
-- the `\pL` shorthand;
-- negation via `\P{…}`, `\p{^…}`, or an enclosing `[^…]`;
-- `\p` **inside** a character class (`[\p{L}0-9]`).
+**Codepoint mode** — the `.unicode` flag, `PatternOptions.unicode`, or an
+inline `(?u)` / `(?u:…)` scope — switches the match unit to one UTF-8-encoded
+scalar value and gives every Unicode construct its UTS #18 Level 1 meaning
+(the Rust `regex` semantics):
 
 ```zig
-var re = try zeetah.Regex.compile(allocator, "\\p{L}+");
+var re = try zeetah.Regex.compileWithFlags(allocator, "\\p{Greek}+|\\b\\w+\\b", .{ .unicode = true });
 defer re.deinit();
-_ = try re.isMatch("héllo"); // matches the Latin-1 letters
+_ = try re.find("naïve αβγ"); // "naïve" — a Unicode word; "αβγ" is Greek script
+
+// Inline, scoped, mixed with byte mode:
+var mixed = try zeetah.Regex.compile(allocator, "(?u)[\\p{L}--\\p{Lu}]+(?-u)\\xFF");
+defer mixed.deinit();
+
+// Comptime:
+const Word = zeetah.Pattern("\\w+", .{ .unicode = true });
 ```
 
-Rejected with `error.NotImplemented`:
+In codepoint mode:
 
-- scripts (`\p{Greek}`) and script extensions;
-- binary properties (`\p{White_Space}`);
-- unknown property names;
-- `\p` under `(?i)` (Unicode case folding is not implemented).
+- `.` / `\N` match any scalar except `\n` (`(?s)` adds it); a literal `é` or
+  `😀` in the pattern is one character; `\xHH`, `\x{…}`, `\o{…}`, `\N{U+…}`
+  denote scalars (`\x{1F600}`); `.{3}` is three characters;
+- `\d` = `\p{Nd}`, `\s` = `\p{White_Space}`, `\w` = Alphabetic ∪ Mark ∪ Nd ∪
+  Pc ∪ Join_Control, `\b` / `\B` are defined from that `\w`;
+  `\h \v \R` use PCRE's Unicode lists (U+2028/2029, U+3000, …);
+- `\p{…}`: General_Category with every UAX #44 alias (`L`, `Letter`,
+  `gc=Lu`, `L&`), `Script` (`Greek`, `sc=Grek`, `IsCyrillic`),
+  `Script_Extensions` (`scx=Hira`), the binary properties of PropList /
+  DerivedCoreProperties / emoji-data (`Alphabetic`, `White_Space`, `Dash`,
+  `Emoji_Presentation`, `XID_Start`, …), `Any` / `ASCII` / `Assigned`;
+  negation via `\P`, `\p{^…}`, `\p{gc!=L}`, `\p{Alphabetic=No}`; names are
+  matched loosely (case, `_`, `-`, spaces ignored; optional `Is` prefix).
+  Data: Unicode 17.0.0;
+- `[…]`: codepoint members and ranges (`[à-ÿ]`), nested classes, intersection
+  `&&`, difference `--`, symmetric difference `~~`
+  (`[\p{L}--\p{Lu}]`, `[[a-z]&&[^aeiou]]`); negation applies to the whole
+  class; POSIX `[:alpha:]` classes stay ASCII (RL1.2a, like Rust);
+- `(?i)` is Unicode **simple** case folding — `k` ≡ `K` ≡ U+212A (Kelvin), `σ` ≡
+  `Σ` ≡ `ς`, `\p{Lu}` under `(?i)` matches every cased letter — applied to a
+  class *before* negation (`(?i)[^k]` excludes the Kelvin sign) and to
+  backreferences (`(?iu)(k)\1` matches `k` followed by U+212A). Full folding
+  (`ß` ≡ `ss`) is not done;
+- invalid UTF-8 in the haystack is never an error: it simply never matches a
+  codepoint construct, and an undecodable neighbour of `\b` is non-word.
 
-A full codepoint-aware mode — multibyte `\p`, scripts, binary properties,
-codepoint-granular `.`/`\d`/`\w`/`\b`, and Unicode case folding — is the
-documented `(?u)` follow-on and is **not yet implemented**. Until then the
-`.unicode` compile flag returns `error.NotImplemented`.
+How it runs: a codepoint class is one HIR node lowered to a suffix-shared
+UTF-8 byte automaton (`\p{L}` ≈ 300 NFA states), so the DFA tier is unchanged;
+an ASCII-only class is still a plain byte class. The backtracking tier decodes
+one scalar per class test (with an ASCII bitmap fast path). Unicode `\b`
+patterns run on the bounded backtracker / PikeVM (not the look-aware lazy DFA).
+Expect lazy-DFA throughput for wide classes — on ASCII text `(?u)\w+` runs at
+~100 MB/s where byte-mode `\w+` hits ~30 GB/s via the SIMD class-run path.
+
+Not in this release: `\X` grapheme clusters, full case folding, normalization,
+blocks (`InGreek`), `Age`, `Bidi_Class`, `\N{name}`. The engine comparison and
+the design notes are in `docs/PCRE_COMPATIBILITY_UNICODE.md`,
+`docs/UNICODE_RESEARCH.md` and `docs/UNICODE_PLAN.md`.
 
 ## Prefilters & performance machinery
 

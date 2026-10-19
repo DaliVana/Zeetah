@@ -382,9 +382,12 @@ The harness spans a wide spread of real and synthetic shapes:
 ### GPT-4 tokenizer workload
 
 The tiktoken `cl100k_base` pre-tokenizer regex uses possessive quantifiers
-(`?+`/`++`), which Zeetah rejects (possessive ≠ greedy in general — see the
-feature table). For this regex the possessive operators are **provably
-equivalent to plain greedy**, because each possessive class is disjoint from
+(`?+`/`++`) and full-Unicode `\p`. Zeetah compiles it **verbatim** in codepoint
+mode (`.unicode = true`; `tools/bench_tokenizer.zig` gates that the verbatim
+and the byte-mode variants segment ASCII identically, and that multibyte text
+segments per scalar). The benchmark keeps the byte-mode variant with the
+possessive operators rewritten to plain greedy — for this regex that is
+**provably equivalent**, because each possessive class is disjoint from
 whatever follows it (so the engine never backtracks into it):
 
 - `[^\r\n\p{L}\p{N}]?+\p{L}+` — the optional class excludes letters, `\p{L}+`
@@ -404,9 +407,12 @@ zig build test              # correctness gate: pre-token boundaries
 The correctness gate (`tools/bench_tokenizer.zig`) asserts the exact pre-token
 boundaries for every alternation branch (contractions, words, numbers,
 punctuation runs, the two-space rule), so the segmentation can't silently drift.
-(Zeetah's `\p` is the Latin-1 byte restriction, so the boundaries match the
-reference cl100k exactly on ASCII/Latin-1 text; multibyte UTF-8 is matched
-per-byte — see the README Unicode note.)
+(In byte mode `\p` is the Latin-1 byte restriction, so the boundaries match
+the reference cl100k exactly on ASCII/Latin-1 text and multibyte UTF-8 is
+matched per-byte; the `.unicode` variant matches per scalar. On the 1 MiB
+ASCII corpus the codepoint-mode verbatim regex runs at roughly a third of the
+byte-mode variant's throughput — the backtracker decodes scalars and loses the
+SIMD class-run fast path — see the README Unicode note.)
 
 ---
 

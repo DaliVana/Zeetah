@@ -4,6 +4,44 @@ Companion to [UNICODE_RESEARCH.md](UNICODE_RESEARCH.md) (what the compared
 engines do and why the decisions below were taken). This document is the design
 the `research` branch implements.
 
+## Status (2026-10-19)
+
+Shipped on the `research` branch, all sections below as designed:
+`.unicode` / `PatternOptions.unicode` / `(?u)`; scalar `.`, literals and
+escapes; UTS #18 `\d \w \s \b`; PCRE `\h \v \R` lists; `\p` for gc / Script /
+Script_Extensions / ~55 binary properties with aliases, `=`/`:`/`!=`;
+codepoint classes with nesting and `&& -- ~~`; simple case folding incl.
+folded backreferences; the `.uclass` HIR node, the suffix-shared UTF-8 NFA
+compiler and the decode-at-match backtrackers; comptime `Pattern` with the
+compiled-backtracker fallback for wide classes. Unicode 17.0.0 tables.
+
+Found and fixed along the way: the PikeVM followed only the first byte edge of
+a thread state (UTF-8 class states have several — Unicode `\b` on inputs past
+the bounded backtracker's budget lost matches); the seek prefilter spent
+~100 ms determinizing the tokenizer's ~2 400-state relaxed NFA for no
+match-speed gain (now skipped past 1 024 states for `(?u)` patterns).
+
+Measured on the 1 MiB benchmark corpus (ASCII), ReleaseFast, Apple Silicon:
+
+| pattern | byte mode | `(?u)` | note |
+|---|---:|---:|---|
+| `[\p{L}\p{N}_]+` / `\w+` | ~18–30 GB/s (class_span) | ~125 MB/s (lazy DFA) | same as a byte-mode pattern routed to the lazy DFA (`(?:\w\w?){1,80}`: 123 MB/s) |
+| `\b\w+\b` | ~30 GB/s (class_span) | ~14 MB/s (PikeVM on 1 MiB) | Unicode `\b` is not on the lazy DFA |
+| `.` | 2.6 GB/s | 130 MB/s (DFA, 1 M one-byte matches) | per-match overhead |
+| cl100k tokenizer (verbatim, possessive) | 77 MB/s (greedy rewrite) | 23 MB/s | backtracker decodes scalars |
+| `(?i)sherlock` | 11.6 GB/s (Teddy) | 490 MB/s (DFA) | `k` folds to the 3-byte Kelvin sign |
+| `\p{Greek}+` (no matches) | n/a | 590 MB/s (DFA) | |
+| compile, cl100k tokenizer | 0.3 ms | 0.9 ms | was 105 ms before the seek gate |
+
+Binary size: a ReleaseSmall executable that compiles one regex grows from
+942 KB to 1 177 KB (+179 KB `__const` for the tables, +27 KB code) — in line
+with the ≈ 200–250 KB budget in §1.
+
+Deferred (documented): `\X`, full case folding, normalization, blocks, `Age`,
+`Bidi_Class`, `\N{name}`, PCRE `Xan`-style specials, a lazy-DFA path for
+Unicode `\b` (Rust's quit-on-non-ASCII trick), an ASCII-run SIMD fast path for
+wide-class repeats, folded-literal Teddy prefilters under `(?iu)`.
+
 ## 0. Contract
 
 * **Byte mode is frozen.** Every behaviour below is reachable only through the

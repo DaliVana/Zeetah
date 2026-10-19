@@ -11,10 +11,10 @@ const std = @import("std");
 ///   - `InvalidPattern`    — malformed syntax: unbalanced/empty/duplicate
 ///                           groups, dangling/double/possessive quantifiers,
 ///                           malformed or inverted `{m,n}`, bad back-references.
-///   - `NotImplemented`    — well-formed but unsupported: the `.unicode` flag,
-///                           `\p` scripts/binary/`(?i)`, unknown POSIX class,
-///                           counts > 1000, possessive quantifiers, unrecognised
-///                           `(?…)` constructs.
+///   - `NotImplemented`    — well-formed but unsupported: byte-mode `\p`
+///                           scripts/binary/`(?i)` (use `(?u)`), unknown
+///                           property / POSIX class names, `\N{name}`,
+///                           counts > 1000, unrecognised `(?…)` constructs.
 ///   - `PatternTooComplex` — a construction ceiling overflowed at compile time.
 /// Match time (`find` / `isMatch` / `captures`):
 ///   - `MatchBudgetExceeded` — a backtracking pattern (backreference /

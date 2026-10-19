@@ -15,9 +15,11 @@
 //! `exec/bounded_bt.zig` (PikeVM past the budget) rebuilds the slots over just
 //! that span; the non-regular tier (lookaround / backref) runs on
 //! `exec/backtrack.zig` (whole-pattern `backtrack` or per-segment `split_alt`)
-//! under a step budget that surfaces as `RegexError.MatchBudgetExceeded`. Still-unmodelled surface
-//! (Unicode `\b`, POSIX classes, `(?m)`/`(?s)` interactions) is reported as
-//! `RegexError.NotImplemented` rather than silently mis-handled, and a violated
+//! under a step budget that surfaces as `RegexError.MatchBudgetExceeded`. Codepoint
+//! mode (`.unicode` / `(?u)`) lowers its classes to UTF-8 byte automata in the
+//! NFA, so every engine below runs unchanged; a Unicode `\b` pattern takes the
+//! `bt_look` tier. Still-unmodelled surface (byte-mode `\p` scripts, `\N{name}`)
+//! is reported as `RegexError.NotImplemented` rather than silently mis-handled, and a violated
 //! engine invariant (an engine disagreement) as `RegexError.Internal` rather
 //! than an `unreachable` or a silently wrong answer.
 

@@ -234,9 +234,13 @@ defer re.deinit();
 > honored, in both scoped `(?i:…)` and toggle `(?i)` forms. The matching struct
 > flags are exact peers — `.multiline` behaves like a leading `(?m)`.
 >
-> Only the `.unicode` **compile flag** (codepoint-aware mode) is **not yet
-> implemented** and returns `error.NotImplemented` — see
-> [Feature support](#feature-support) for what that mode would add.
+> **Codepoint mode** is the fifth flag: `.unicode = true` (or inline `(?u)` /
+> `(?u:…)`) makes the match unit one UTF-8-encoded Unicode scalar — `.` is a
+> character, `\d \w \s \b` and `\p{…}` take their Unicode definitions (scripts,
+> binary properties, …), `[…]` gains codepoint ranges and set operations, and
+> `(?i)` is Unicode simple case folding. Off by default: the byte-mode
+> semantics below are a frozen contract. See [Feature support](#feature-support)
+> and footnote ⁵.
 
 ## The meta engine
 
@@ -308,13 +312,13 @@ reproduce it via the [comparison harness](docs/BENCHMARKS.md#the-comparison-harn
 | Lazy quantifiers | `*?`, `+?`, `??`, `{m,n}?` | ✅ including lazy **+ end-anchor** (`a*?$`), on the DFA path |
 | Possessive quantifiers | `*+`, `++`, `?+`, `{m,n}+` | ✅ lower to atomic groups; run on the backtracker (match-budget bounded)¹ |
 | Alternation | `a\|b\|c` | ✅ |
-| Predefined classes | `\d \w \s \D \W \S` | ✅ (including inside `[…]`) |
-| Whitespace / line-break | `\h \H \v \V \R \N` | ✅ DFA path; PCRE 8-bit sets (`\h`+NBSP, `\v`+NEL); `\R` ≈ `(?:\r\n\|[\n\x0B\f\r\x85])`⁶ |
-| Custom classes | `[abc]`, `[a-z]`, `[^0-9]`, `[[:alpha:]]` | ✅ unknown POSIX name → `NotImplemented` |
-| Unicode properties | `\p{L}`, `\P{Nd}`, `\pL`, `[^\p{L}]` | ⚠️ **General_Category, Latin-1 bytes only**²; scripts/binary props/`\p` under `(?i)`/multibyte codepoints → `NotImplemented`⁵ |
-| Inline flags | `(?i)`, `(?s)`, `(?x)`, `(?m)` and scoped `(?i:…)` | ✅ |
-| Anchors | `^`, `$`, `\A`, `\z`, `\Z`, `\b`, `\B` | ✅ work at runtime **and** comptime³ |
-| Wildcard | `.` | ✅ excludes `\n` unless `(?s)` |
+| Predefined classes | `\d \w \s \D \W \S` | ✅ ASCII (including inside `[…]`); UTS #18 Unicode definitions under `(?u)`⁵ |
+| Whitespace / line-break | `\h \H \v \V \R \N` | ✅ DFA path; PCRE 8-bit sets (`\h`+NBSP, `\v`+NEL); `\R` ≈ `(?:\r\n\|[\n\x0B\f\r\x85])`⁶; PCRE's full Unicode lists (U+2028/9, U+3000, …) under `(?u)` |
+| Custom classes | `[abc]`, `[a-z]`, `[^0-9]`, `[[:alpha:]]` | ✅ unknown POSIX name → `NotImplemented`; under `(?u)`: codepoint members/ranges, nested `[…]`, `&&` `--` `~~`⁵ |
+| Unicode properties | `\p{L}`, `\P{Nd}`, `\pL`, `\p{Greek}`, `\p{scx=Hira}`, `\p{Alphabetic}` | ✅ under `(?u)`: General_Category, Script, Script_Extensions, binary properties, all UAX #44 aliases⁵. Byte mode: **General_Category, Latin-1 bytes only**²; scripts / binary props / `\p` under `(?i)` → `NotImplemented` |
+| Inline flags | `(?i)`, `(?s)`, `(?x)`, `(?m)`, `(?u)` and scoped `(?i:…)` | ✅ |
+| Anchors | `^`, `$`, `\A`, `\z`, `\Z`, `\b`, `\B` | ✅ work at runtime **and** comptime³; `\b`/`\B` are Unicode word boundaries under `(?u)`⁵ |
+| Wildcard | `.` | ✅ one byte, excludes `\n` unless `(?s)`; one scalar under `(?u)` |
 | Capturing groups | `(...)` | ✅ slices via opt-in `captures()`⁴ |
 | Named groups | `(?<name>...)`, `(?P<name>...)` | ✅ duplicate name → `InvalidPattern` |
 | Non-capturing | `(?:...)` | ✅ |
@@ -322,9 +326,9 @@ reproduce it via the [comparison harness](docs/BENCHMARKS.md#the-comparison-harn
 | Lookbehind | `(?<=...)`, `(?<!...)` | ⚠️ **fixed-width only**; variable-width → `MatchBudgetExceeded` at match |
 | Backreferences | `\1`, `\k<name>` | ✅ step-budgeted; runtime **and** comptime; unset group matches empty string |
 | Compile flags | `.case_insensitive`, `.dot_all`, `.extended`, `.multiline` | ✅ peers of `(?i)`/`(?s)`/`(?x)`/`(?m)` |
-| Compile flags | `.unicode` (codepoint mode) | ❌ `NotImplemented`⁵ |
+| Compile flags | `.unicode` (codepoint mode) | ✅ peer of `(?u)`; also `PatternOptions.unicode`⁵ |
 | Escaping | `\\`, `\.`, `\n`, `\t`, `\r` | ✅ |
-| Byte escapes | `\xHH`, `\x{…}`, `\0`, `\0oo`, `\o{…}` | ✅ single byte; a `\x{…}`/`\o{…}` value > `0xFF` → `NotImplemented` (codepoint `(?u)` follow-on)⁶ |
+| Byte / codepoint escapes | `\xHH`, `\x{…}`, `\0`, `\0oo`, `\o{…}`, `\N{U+…}` | ✅ single byte; a `\x{…}`/`\o{…}` value > `0xFF` → `NotImplemented` in byte mode; under `(?u)` every form denotes a scalar up to U+10FFFF⁶ |
 
 > **¹ Possessive quantifiers** (`*+`/`++`/`?+`/`{m,n}+`) lower to **atomic
 > groups** (`a*+` ≡ `(?>a*)`) with true atomic semantics — they commit and never
@@ -333,25 +337,48 @@ reproduce it via the [comparison harness](docs/BENCHMARKS.md#the-comparison-harn
 > DFA — at runtime **and** at comptime, where [`Pattern`](#compile-time-patterns)
 > bakes that backtracker into `.rodata` (see that section).
 >
-> **² Unicode `\p`** currently covers **General_Category** for codepoints in the
-> Latin-1 range (bytes `0x00`–`0xFF`): one/two-letter categories (`L`, `Lu`,
+> **² Unicode `\p` in byte mode** covers **General_Category** for codepoints in
+> the Latin-1 range (bytes `0x00`–`0xFF`): one/two-letter categories (`L`, `Lu`,
 > `Ll`, `N`, `Nd`, …), the `\pL` shorthand, negation (`\P{…}`, `\p{^…}`, or an
 > enclosing `[^…]`), and `\p` inside a `[…]` class. Scripts, script extensions,
-> binary properties, unknown names, and `\p` under `(?i)` are rejected with
-> `error.NotImplemented`.
+> binary properties and `\p` under `(?i)` are rejected with
+> `error.NotImplemented` in byte mode — switch on `(?u)` for them (footnote ⁵).
+> Unknown property names are `NotImplemented` in both modes.
 >
-> **⁵ Byte-oriented matching is a stable, reserved contract.** Zeetah is
-> **byte-oriented** end-to-end — the DFA runs over a 256-symbol (byte) alphabet
-> and no matcher decodes UTF-8 — so `.` matches one byte, `\d`/`\w`/`\b` are
-> ASCII, and `\p` resolves to the Latin-1 byte restriction of the property
-> (exactly Rust/RE2 with Unicode-mode *off*). **This byte default is the
-> committed semantics and will not change.** Codepoint-aware Unicode is
-> **reserved** behind the `.unicode` flag / inline `(?u)`: both currently return
-> `error.NotImplemented`, and when implemented they will *add* codepoint mode
-> (multibyte `\p`, scripts, binary properties, codepoint-granular
-> `.`/`\d`/`\w`/`\b`, `(?i)\p{…}` folding) **only when opted in** — never
-> altering the byte-mode default. So a future Unicode phase is an additive,
-> non-breaking change, not a silent semantics shift. Tracked, not scheduled.
+> **⁵ Byte mode is the committed default; `(?u)` is the opt-in codepoint mode.**
+> By default Zeetah is **byte-oriented** end-to-end — the DFA runs over a
+> 256-symbol (byte) alphabet — so `.` matches one byte, `\d`/`\w`/`\b` are ASCII,
+> and `\p` resolves to the Latin-1 byte restriction of the property (exactly
+> Rust/RE2 with Unicode-mode *off*). **That default will not change.** The
+> `.unicode` compile flag, `PatternOptions.unicode`, or an inline `(?u)` /
+> `(?u:…)` scope (`(?-u)` turns it back off) selects **codepoint mode**, with
+> Rust `regex` / UTS #18 Level 1 semantics:
+>
+> - the match unit is one UTF-8-encoded scalar value: `.`/`\N` (any scalar
+>   except `\n`; `(?s)` adds it), literal characters, `\x{1F600}`, `\N{U+E9}`,
+>   quantifiers (`.{3}` is three characters);
+> - `\d` = `\p{Nd}`, `\s` = `\p{White_Space}`, `\w` = Alphabetic ∪ Mark ∪ Nd ∪
+>   Pc ∪ Join_Control (UTS #18 Annex C), `\b`/`\B` defined from that `\w`;
+> - `\p{…}`: General_Category (`L`, `Letter`, `gc=Lu`, `L&`, …), `Script`
+>   (`\p{Greek}`, `sc=Grek`), `Script_Extensions` (`scx=Hira`), ~55 binary
+>   properties (`Alphabetic`, `White_Space`, `Emoji_Presentation`, …),
+>   `Any`/`ASCII`/`Assigned`; `\P`, `\p{^…}`, `name!=value`, `prop=No`; loose
+>   name matching with an optional `Is` prefix (Unicode 17.0.0 data);
+> - `[…]`: codepoint members and ranges, nested classes, intersection `&&`,
+>   difference `--`, symmetric difference `~~`; POSIX classes stay ASCII;
+> - `(?i)` is Unicode **simple** case folding (`k` ≡ `K` ≡ U+212A, `σ` ≡ `Σ` ≡
+>   `ς`), applied to every class *before* negation and to backreferences;
+> - invalid UTF-8 in the haystack never matches a codepoint construct (never an
+>   error); an undecodable neighbour of `\b` counts as non-word.
+>
+> Codepoint classes compile to UTF-8 byte automata (suffix-shared, so `\p{L}`
+> is a few hundred NFA states) and run on the same DFA / lazy-DFA engines; an
+> ASCII-only class is still a plain byte class. Expect lazy-DFA throughput, not
+> the SIMD class-run fast paths: on ASCII text `(?u)\w+` runs at the speed of a
+> lazy DFA (~100 MB/s here) where byte-mode `\w+` hits ~30 GB/s, and a Unicode
+> `\b` pattern runs on the bounded backtracker / PikeVM. Not in this release:
+> `\X` grapheme clusters, full case folding (`ß` ≡ `ss`), normalization,
+> blocks, `Age`, `Bidi_Class`.
 >
 > **³ Look-assertions** (`\b`, `\B`, mid-pattern `^`/`$`, lookahead, lookbehind)
 > run on the bounded backtracker — at runtime **and** under the compile-time
@@ -366,9 +393,11 @@ reproduce it via the [comparison harness](docs/BENCHMARKS.md#the-comparison-harn
 > **⁶ Byte / whitespace escapes** are pure byte-level sugar and stay on the DFA
 > path (no backtracker). `\xHH` takes up to two hex digits (`\x` alone ⇒ NUL);
 > `\x{…}` / `\o{…}` are braced; `\0` plus up to two octal digits is the
-> leading-zero octal form (`\1`–`\9` remain backreferences, never octal). A
-> braced value above `0xFF` is `NotImplemented`, reserved for the codepoint
-> `(?u)` phase — never silently truncated. `\h`/`\v` use the **PCRE 8-bit**
+> leading-zero octal form (`\1`–`\9` remain backreferences, never octal). In
+> byte mode a braced value above `0xFF` is `NotImplemented` — never silently
+> truncated; under `(?u)` every escape denotes a scalar value (`\xE9` is `é`,
+> `\x{1F600}` is 😀, `\N{U+hhhh}` too; surrogates and values past U+10FFFF are
+> `InvalidPattern`). `\h`/`\v` use the **PCRE 8-bit**
 > definitions (`\h` = TAB/SPACE/NBSP `0xA0`; `\v` = LF/VT/FF/CR/NEL `0x85`);
 > `\h \H \v \V` are also valid `[…]` members and byte escapes work as range
 > endpoints (`[\x00-\x1F]`). `\N` is "any byte except `\n`" (unaffected by
@@ -382,9 +411,10 @@ patterns can tell them apart:
 
 - **`error.InvalidPattern`** — malformed syntax (`abc(`, `*abc`, `a{3,2}`, a
   duplicate group name, a bad back-reference). "This regex is broken."
-- **`error.NotImplemented`** — a well-formed but not-yet-supported feature (the
-  `.unicode` flag, `\p` scripts, an unknown POSIX class, counts > 1000…).
-  "Valid regex, unsupported here."
+- **`error.NotImplemented`** — a well-formed but not-yet-supported feature (a
+  `\p` script / binary property or `(?i)\p` in byte mode, an unknown property
+  or POSIX class name, `\N{name}`, counts > 1000…). "Valid regex, unsupported
+  here."
 - **`error.PatternTooComplex`** — a construction ceiling overflowed at compile
   time (too large to build).
 - **`error.EmptyPattern`** — the pattern was `""`.
@@ -463,6 +493,7 @@ pub const Options = struct {
     on_oversize: enum { compile_error, allow_oversized } = .compile_error, // over-budget (but representable) DFA
     case_insensitive: bool = false,                              // peer of (?i)
     multiline: bool = false,                                     // peer of (?m): ^/$ match at line boundaries
+    unicode: bool = false,                                       // peer of (?u): codepoint mode
 };
 ```
 
@@ -473,10 +504,12 @@ word boundary, `(?m)` line anchor, lazy-with-end-anchor) bakes the same bounded
 tree-backtracker the runtime uses, with capture extraction (`captures` /
 `capturesAll`, numbered **and** `(?<name>)` named) and the seek/over-approximation
 prefilters, all into `.rodata`. There is **no runtime fallback** inside a `Pattern`,
-so the few constructs that are genuinely unsupported anywhere in the engine (the
-`.unicode` flag, `\p` scripts, an unknown POSIX class) are a **`@compileError`**
-rather than a runtime `error.NotImplemented` — use the runtime `Regex` if you need
-the error to be recoverable. The match-budget (ReDoS) bound applies identically;
+so the few constructs that are genuinely unsupported anywhere in the engine (a
+`\p` script in byte mode, an unknown property or POSIX class name) are a
+**`@compileError`** rather than a runtime `error.NotImplemented` — use the
+runtime `Regex` if you need the error to be recoverable. Codepoint mode is
+`.{ .unicode = true }`: a wide class that overflows the comptime NFA ceiling
+bakes the compiled backtracker instead of failing the build. The match-budget (ReDoS) bound applies identically;
 since the comptime API is non-erroring, a budget exceedance surfaces as "no match"
 rather than `error.MatchBudgetExceeded`.
 
