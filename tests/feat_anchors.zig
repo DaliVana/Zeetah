@@ -267,3 +267,21 @@ test "anchors: ^(alt)$ captures and the lazy-DFA route" {
         try std.testing.expect(!try rx.isMatch("b"));
     }
 }
+
+test "(?m) combined with other inline flags still makes ^/$ line anchors" {
+    const a = std.testing.allocator;
+    // The anchored prescan's flag scanner must accept every letter the flag
+    // grammar does: with `u` missing, `(?um)a$` parsed `$` as end-of-text.
+    for ([_][]const u8{ "(?m)a$", "(?um)a$", "(?mu)a$", "(?ium)a$", "(?m-u)a$", "(?xm)a$", "(?smi)a$" }) |p| {
+        var rx = try Regex.compile(a, p);
+        defer rx.deinit();
+        try std.testing.expectEqual(@as(usize, 1), try rx.count("a\nc"));
+    }
+    for ([_][]const u8{ "(?m)^c", "(?um)^c", "(?mu)^c" }) |p| {
+        var rx = try Regex.compile(a, p);
+        defer rx.deinit();
+        try std.testing.expectEqual(@as(usize, 1), try rx.count("a\nc"));
+    }
+    const P = regex.Pattern("(?um)a$", .{});
+    try std.testing.expectEqual(@as(usize, 1), P.count("a\nc"));
+}

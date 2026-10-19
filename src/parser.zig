@@ -196,10 +196,21 @@ fn orClassInto(bm: *[32]u8, cc: common.CharClass) void {
 
 const Pre = struct { body: []const u8, a_start: bool, a_end: bool };
 
+/// Letters an inline flag group `(?flags)` / `(?flags:…)` accepts. One list
+/// for the grammar (`parsePrimary`) and the multiline prescan below, so the
+/// two cannot drift: `u` was once added to the grammar alone, the scanner
+/// stopped at it, and `(?um)a$` / `(?mu)a$` kept the whole-text `$`.
+const flag_letters = "imsxu";
+
+fn isFlagLetter(c: u8) bool {
+    return std.mem.indexOfScalar(u8, flag_letters, c) != null;
+}
+
 /// Heuristic pre-scan: does the pattern contain an inline `(?…m…)` /
-/// `(?…m…:` flag group enabling multiline? Mirrors the parser's own flag
-/// grammar; a rare false positive only forgoes the anchored fast path (still
-/// correct — `^`/`$` then parse as look nodes).
+/// `(?…m…:` flag group enabling multiline? Accepts exactly the parser's flag
+/// letters (`flag_letters`) plus `-`; a rare false positive (`(?-m)`) only
+/// forgoes the anchored fast path (still correct — `^`/`$` then parse as
+/// look nodes).
 fn containsMultilineFlag(pat: []const u8) bool {
     var i: usize = 0;
     while (i + 1 < pat.len) : (i += 1) {
@@ -207,12 +218,10 @@ fn containsMultilineFlag(pat: []const u8) bool {
         var j = i + 2;
         var saw_m = false;
         while (j < pat.len) : (j += 1) {
-            switch (pat[j]) {
-                'm' => saw_m = true,
-                'i', 's', 'x', '-' => {},
-                ':', ')' => break,
-                else => break,
-            }
+            const c = pat[j];
+            if (c == 'm') {
+                saw_m = true;
+            } else if (c != '-' and !isFlagLetter(c)) break;
         }
         if (saw_m and j < pat.len and (pat[j] == ':' or pat[j] == ')')) return true;
     }
@@ -1011,7 +1020,7 @@ fn Parser(comptime cap: ?usize) type {
                             p.i += 1;
                             return inner;
                         }
-                        if (k == 'i' or k == 'm' or k == 's' or k == 'x' or k == 'u' or k == '-') {
+                        if (k == '-' or isFlagLetter(k)) {
                             var want_ci = p.ci;
                             var want_dot = p.dot_all;
                             var want_ext = p.extended;
@@ -1026,7 +1035,11 @@ fn Parser(comptime cap: ?usize) type {
                                     'x' => want_ext = !clearing,
                                     'm' => want_ml = !clearing,
                                     'u' => want_uni = !clearing,
-                                    else => break,
+                                    // Every `flag_letters` entry has an arm above.
+                                    else => {
+                                        std.debug.assert(!isFlagLetter(fc));
+                                        break;
+                                    },
                                 }
                                 p.i += 1;
                             }
@@ -1157,6 +1170,17 @@ fn Parser(comptime cap: ?usize) type {
         }
 
         /// Emit a leaf for a normalized, negation-applied codepoint set.
+        /// Append `rs` to the union accumulator `out`, merging `out` first once
+        /// the raw list reaches half the comptime `WORK_CAP`. A class's items
+        /// are only normalized at its `]`, so several wide properties listed in
+        /// one class (`[\p{L}\p{Lu}\p{Ll}…]`, ~650 ranges each) would otherwise
+        /// pile duplicates the final set does not contain against the cap — a
+        /// comptime `TooComplex` for a class the runtime parser accepts.
+        fn appendUnion(out: *Buf, rs: []const common.CodepointRange) Error!void {
+            if (out.len() + rs.len > WORK_CAP / 2) try uset.normalize(out);
+            try out.appendSlice(rs);
+        }
+
         fn uclassLeaf(p: *Self, set: *const Buf) Error!NodeRef {
             const items = set.items();
             if (uset.isAscii(items)) {
@@ -1227,7 +1251,7 @@ fn Parser(comptime cap: ?usize) type {
             }
             try uset.normalize(&t);
             if (std.ascii.isUpper(which)) try p.complementInPlace(&t);
-            try out.appendSlice(t.items());
+            try appendUnion(out, t.items());
         }
 
         /// Append `\p{spec}` (`negated` ⇔ `\P`) to `out`: the positive property,
@@ -1244,7 +1268,7 @@ fn Parser(comptime cap: ?usize) type {
             try unicode_class.resolveInto(&t, &scratch, positive);
             if (p.ci) try uset.foldSimple(&t);
             if (parsed.negated) try p.complementInPlace(&t);
-            try out.appendSlice(t.items());
+            try appendUnion(out, t.items());
         }
 
         /// Codepoint-mode escapes (caller consumed `\` and `e`).
@@ -1476,7 +1500,7 @@ fn Parser(comptime cap: ?usize) type {
                 const neg = try p.parseUClassBody(&inner);
                 if (p.ci) try uset.foldSimple(&inner);
                 if (neg) try p.complementInPlace(&inner);
-                return out.appendSlice(inner.items());
+                return appendUnion(out, inner.items());
             }
             if (c == '\\' and p.i + 1 < p.pat.len) {
                 const e = p.pat[p.i + 1];
@@ -1557,7 +1581,7 @@ fn Parser(comptime cap: ?usize) type {
             for (pc.ranges) |r| try t.append(.{ .lo = r.start, .hi = r.end });
             try uset.normalize(&t);
             if (neg) try p.complementInPlace(&t);
-            try out.appendSlice(t.items());
+            try appendUnion(out, t.items());
         }
 
         /// `\p{Name}` / `\P{Name}` / `\pL` — resolve the General_Category

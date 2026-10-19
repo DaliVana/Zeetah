@@ -279,6 +279,11 @@ pub const PikeVm = struct {
                 var k = lo;
                 while (k < hi) : (k += 1) {
                     const ei = self.idx.order[k];
+                    // The builder never mixes an ε/look edge into a consume
+                    // state (`EdgeIndex.build` checks it once per NFA); a
+                    // mixed state would read `e_set` = 0 for its ε edges and
+                    // spawn threads on `sets[0]`.
+                    std.debug.assert(nfa.e_kind[ei] == .consume);
                     if (cc.hasBit(&nfa.sets[nfa.e_set[ei]], input[at])) {
                         @memcpy(sc.cur[0..nsl], clist.row(s, nsl));
                         try self.addThread(nlist, nfa.e_to[ei], at + 1, input);

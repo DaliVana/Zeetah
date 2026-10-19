@@ -226,6 +226,7 @@
         let hi = p.slice(atomEnd + 1, hiEnd);
         if (hi === '\\') {
           const e = readEscape(p, atomEnd + 1, true, uni);
+          if (e.type === 'error') return { end: e.end, type: 'error', desc: e.desc };
           hi = e.lit !== undefined ? e.lit : e.item;
           hiEnd = e.end;
         }

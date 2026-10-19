@@ -330,7 +330,7 @@ parser bound: `error.NotImplemented`) at **compile time**, not match time:
 | Ceiling | Runtime `Regex` | Comptime `Pattern` | Source |
 |---------|---------------:|-------------------:|--------|
 | NFA states | 32 767 | 256 | `thompson.MAX_NFA_RUNTIME` / `MAX_NFA` |
-| NFA edges | 65 535 | 1024 | `thompson.MAX_EDGES_RUNTIME` / `MAX_EDGES` |
+| NFA edges | 524 288 | 1024 | `thompson.MAX_EDGES_RUNTIME` / `MAX_EDGES` |
 | NFA byte sets | 65 535 | 256 | `thompson.MAX_SETS_RUNTIME` / `MAX_SETS` |
 | Eager DFA states | 256 | 256 | internal `MAX_DFA` (runtime: over it ⇒ lazy DFA, not an error) |
 | HIR nodes / sets | 131 072 / 65 535 | 4096 / 4096 | `hir.MAX_NODES_RUNTIME` / `MAX_NODES` … |

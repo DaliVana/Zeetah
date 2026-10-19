@@ -179,6 +179,12 @@ test('explainer locates obvious syntax errors', () => {
   assert.match(parse('a{3,2}').error.desc, /out of order/);
 });
 
+test('explainer reports a rejected escape at a range end instead of throwing', () => {
+  assert.match(parse('[a-\\x{100}]', '').error.desc, /needs Unicode mode/);
+  assert.match(parse('[a-\\N{foo}]', 'u').error.desc, /only \\N\{U\+hhhh\}/);
+  assert.equal(parse('[a-\\x{100}]', 'u').error, null);
+});
+
 test('explainer understands the u flag', () => {
   assert.equal(parse('(?u)[\\p{L}--\\p{Lu}]+\\N{U+1F600}', '').error, null);
   assert.equal(parse('[a-z&&[^aeiou]]+\\x{1F600}', 'u').error, null);

@@ -40,6 +40,9 @@ pub const MAX_EDGES: usize = 1024;
 // shrinking `sets` from 64 KB (`[2048][32]u8`) to 8 KB — on every NFA, the
 // transient build, the retained runtime heap copy, and the comptime `.rodata`
 // bake alike. (Decoupled from `MAX_EDGES`, which still bounds edges/`e_set`.)
+// A `.uclass` automaton adds one set per *distinct* byte range in the build
+// (`SetMap`: a few hundred for `\p{L}`, shared by every copy and class), not
+// one per edge — `\p{Lu}` (76 states, 649 edges) fits where it did not.
 pub const MAX_SETS: usize = 256;
 
 pub const Frag = struct { start: usize, accept: usize };
@@ -58,9 +61,18 @@ pub const EdgeKind = enum(u8) { eps, consume, look };
 /// runtime NFA is served by the lazy DFA, bounded backtracker and PikeVM,
 /// whose scratch is sized per NFA. Bounds: state ids are `u16` and the lazy
 /// DFA's look mode tags a state list with a trailer word ≥ 0x8000, so states
-/// stay < 0x8000; edge and set ids are `u16`.
+/// stay < 0x8000; set ids are `u16` (`e_set`). Edge ids are `u32`/`usize`
+/// everywhere (`EdgeIndex`, the lazy DFA's CSR offsets), so the edge ceiling
+/// is a memory bound, not a width bound. It matters for codepoint mode: a
+/// `.uclass` automaton carries ~4–9 edges per state (`\w`: 326 states, 1 323
+/// edges), so `{m,n}` copies of one hit a 16-bit edge cap (`\w{1,99}`) long
+/// before the state cap. 2¹⁹ edges covers the densest trie at the full state
+/// ceiling (0x7FFF × 8 ≈ 262 k) at ~12 B/edge of NFA arrays. The state
+/// ceiling is what remains: ~100 copies of `\w`/`\p{L}` (`\p{L}{1,1000}` ⇒
+/// `TooComplex`); lifting it means 32-bit state ids through the lazy DFA
+/// memo and the backtracker — a separate change.
 pub const MAX_NFA_RUNTIME: usize = 0x7FFF;
-pub const MAX_EDGES_RUNTIME: usize = 0xFFFF;
+pub const MAX_EDGES_RUNTIME: usize = 1 << 19;
 pub const MAX_SETS_RUNTIME: usize = 0xFFFF;
 
 /// Flat NFA. Field shapes mirror the old `Builder` so `full_dfa` can lift the
@@ -164,16 +176,29 @@ pub fn Nfa(comptime cap: ?usize) type {
             b.n_edges += 1;
         }
 
-        fn addSetEdge(b: *Self, from: usize, to: usize, set: [32]u8) Error!void {
-            if (b.n_edges >= MAX_EDGES or b.n_sets >= MAX_SETS) return Error.TooComplex;
+        /// Append a byte set; returns its id (an `e_set` value).
+        fn addSet(b: *Self, set: [32]u8) Error!usize {
+            if (b.n_sets >= MAX_SETS) return Error.TooComplex;
             b.sets[b.n_sets] = set;
+            b.n_sets += 1;
+            return b.n_sets - 1;
+        }
+
+        /// A byte-consuming edge over an existing set id (sets are shared:
+        /// the UTF-8 class compiler interns its byte ranges).
+        fn addConsumeEdge(b: *Self, from: usize, to: usize, set: usize) Error!void {
+            if (b.n_edges >= MAX_EDGES) return Error.TooComplex;
             b.e_from[b.n_edges] = @intCast(from);
             b.e_to[b.n_edges] = @intCast(to);
             b.e_kind[b.n_edges] = .consume;
-            b.e_set[b.n_edges] = @intCast(b.n_sets);
+            b.e_set[b.n_edges] = @intCast(set);
             b.e_slot[b.n_edges] = -1;
-            b.n_sets += 1;
             b.n_edges += 1;
+        }
+
+        fn addSetEdge(b: *Self, from: usize, to: usize, set: [32]u8) Error!void {
+            if (b.n_edges >= MAX_EDGES or b.n_sets >= MAX_SETS) return Error.TooComplex;
+            return b.addConsumeEdge(from, to, try b.addSet(set));
         }
 
         // Edge accessors for the UTF-8 compiler's state-dedup verification.
@@ -196,6 +221,8 @@ const RtBuilder = struct {
     pub const E = Error || std.mem.Allocator.Error;
 
     a: std.mem.Allocator,
+    /// State budget for this build (≤ `MAX_NFA_RUNTIME`; see `buildAllocBounded`).
+    max_states: usize = MAX_NFA_RUNTIME,
     n_states: usize = 0,
     e_from: std.ArrayListUnmanaged(u16) = .empty,
     e_to: std.ArrayListUnmanaged(u16) = .empty,
@@ -216,7 +243,7 @@ const RtBuilder = struct {
     }
 
     fn addState(b: *RtBuilder) E!usize {
-        if (b.n_states >= MAX_NFA_RUNTIME) return Error.TooComplex;
+        if (b.n_states >= b.max_states) return Error.TooComplex;
         const id = b.n_states;
         b.n_states += 1;
         return id;
@@ -244,10 +271,18 @@ const RtBuilder = struct {
         return b.addEdge(from, to, .look, 0, kind, -1);
     }
 
-    fn addSetEdge(b: *RtBuilder, from: usize, to: usize, set: [32]u8) E!void {
+    fn addSet(b: *RtBuilder, set: [32]u8) E!usize {
         if (b.sets.items.len >= MAX_SETS_RUNTIME) return Error.TooComplex;
-        try b.addEdge(from, to, .consume, @intCast(b.sets.items.len), 0, -1);
         try b.sets.append(b.a, set);
+        return b.sets.items.len - 1;
+    }
+
+    fn addConsumeEdge(b: *RtBuilder, from: usize, to: usize, set: usize) E!void {
+        return b.addEdge(from, to, .consume, @intCast(set), 0, -1);
+    }
+
+    fn addSetEdge(b: *RtBuilder, from: usize, to: usize, set: [32]u8) E!void {
+        return b.addConsumeEdge(from, to, try b.addSet(set));
     }
 
     fn edgeCount(b: *const RtBuilder) usize {
@@ -320,6 +355,43 @@ const Utf8Node = struct {
 const UTF8_MAP_SIZE = 1024;
 const Utf8MapEntry = struct { hash: u64 = 0, state: u16 = 0, first_edge: u32 = 0, n: u16 = 0, used: bool = false };
 
+/// Interned byte-range sets of one NFA build. A UTF-8 trie's transitions draw
+/// on the distinct `[lo-hi]` byte ranges of its sequences — a few hundred for
+/// `\w`/`\p{L}` (mostly trailing-byte ranges), and the same few hundred in
+/// every copy — but `\w` has 1 323 edges, and one 32-byte set per edge put a
+/// single `\w` at 1 323 sets: `{m,n}` copies then tripped `MAX_SETS_RUNTIME`,
+/// and the comptime `MAX_SETS` rejected classes whose states fit `MAX_NFA`
+/// (`\p{Lu}`: 76 states, 649 edges). One table per build, so the copies of a
+/// class and different classes share. Open addressing keyed by `(lo, hi)`;
+/// 2048 slots keep a build's few hundred ranges at a low load (a full table
+/// just stops interning — never a build failure).
+const SET_MAP_SIZE = 2048;
+const NO_SET: u32 = std.math.maxInt(u32);
+const SetMapEntry = struct { lo: u8 = 0, hi: u8 = 0, set: u32 = NO_SET };
+const SetMap = struct {
+    entries: [SET_MAP_SIZE]SetMapEntry = @splat(.{}),
+
+    /// The set id for the byte range `[lo-hi]` in builder `b`, appended on
+    /// first use.
+    fn setFor(self: *SetMap, b: anytype, lo: u8, hi: u8) @TypeOf(b.*).E!usize {
+        comptime std.debug.assert(SET_MAP_SIZE == 2048);
+        const key: u32 = (@as(u32, lo) << 8) | hi;
+        var slot: usize = (key *% 0x9E3779B1) >> 21; // top 11 bits of the hash
+        var probes: usize = 0;
+        while (probes < SET_MAP_SIZE) : (probes += 1) {
+            const e = &self.entries[slot];
+            if (e.set == NO_SET) {
+                const id = try b.addSet(rangeSet(lo, hi));
+                e.* = .{ .lo = lo, .hi = hi, .set = @intCast(id) };
+                return id;
+            }
+            if (e.lo == lo and e.hi == hi) return e.set;
+            slot = (slot + 1) % SET_MAP_SIZE;
+        }
+        return b.addSet(rangeSet(lo, hi)); // table full: a fresh set
+    }
+};
+
 fn rangeSet(lo: u8, hi: u8) [32]u8 {
     var s: [32]u8 = @splat(0);
     var c: usize = lo;
@@ -338,9 +410,11 @@ fn Utf8Compiler(comptime B: type) type {
         uncompiled: [5]Utf8Node = undefined,
         depth: usize = 0,
         map: [UTF8_MAP_SIZE]Utf8MapEntry = @splat(.{}),
+        /// The build's shared byte-range set table.
+        sm: *SetMap,
 
-        fn init(b: *B, target: usize) Self {
-            var self = Self{ .b = b, .target = target };
+        fn init(b: *B, target: usize, sm: *SetMap) Self {
+            var self = Self{ .b = b, .target = target, .sm = sm };
             self.uncompiled[0] = .{};
             self.depth = 1;
             return self;
@@ -387,7 +461,7 @@ fn Utf8Compiler(comptime B: type) type {
             if (e.used and e.hash == h and e.n == trans.len and self.verify(e.*, trans)) return e.state;
             const s = try self.b.addState();
             const first = self.b.edgeCount();
-            for (trans) |t| try self.b.addSetEdge(s, t.next, rangeSet(t.lo, t.hi));
+            for (trans) |t| try self.b.addConsumeEdge(s, t.next, try self.sm.setFor(self.b, t.lo, t.hi));
             e.* = .{ .hash = h, .state = @intCast(s), .first_edge = @intCast(first), .n = @intCast(trans.len), .used = true };
             return s;
         }
@@ -426,9 +500,9 @@ fn Utf8Compiler(comptime B: type) type {
 }
 
 /// Lower a `.uclass` member set into a UTF-8 byte automaton fragment.
-fn lowerUClass(b: anytype, ranges: []const hir.CodepointRange) @TypeOf(b.*).E!Frag {
+fn lowerUClass(b: anytype, sm: *SetMap, ranges: []const hir.CodepointRange) @TypeOf(b.*).E!Frag {
     const accept = try b.addState();
-    var uc = Utf8Compiler(@TypeOf(b.*)).init(b, accept);
+    var uc = Utf8Compiler(@TypeOf(b.*)).init(b, accept, sm);
     for (ranges) |r| {
         var it = utf8.SeqIter.init(r.lo, r.hi);
         while (it.next()) |seq| try uc.add(seq.slice());
@@ -437,10 +511,11 @@ fn lowerUClass(b: anytype, ranges: []const hir.CodepointRange) @TypeOf(b.*).E!Fr
     return .{ .start = start, .accept = accept };
 }
 
-/// Lower `ref` into builder `b` (comptime `Nfa(N)` or runtime `RtBuilder`).
-/// Emission order is identical for both, so state numbering and edge priority
-/// never depend on the front-end.
-fn lower(b: anytype, comptime hcap: ?usize, h: *const hir.Hir(hcap), ref: NodeRef) @TypeOf(b.*).E!Frag {
+/// Lower `ref` into builder `b` (comptime `Nfa(N)` or runtime `RtBuilder`);
+/// `sm` is the build's shared byte-range set table (see `SetMap`). Emission
+/// order is identical for both, so state numbering and edge priority never
+/// depend on the front-end.
+fn lower(b: anytype, sm: *SetMap, comptime hcap: ?usize, h: *const hir.Hir(hcap), ref: NodeRef) @TypeOf(b.*).E!Frag {
     const nd = h.node(ref);
     switch (nd.tag) {
         .empty => {
@@ -455,7 +530,7 @@ fn lower(b: anytype, comptime hcap: ?usize, h: *const hir.Hir(hcap), ref: NodeRe
             try b.addSetEdge(s, a, h.setBitmap(nd.set_idx));
             return .{ .start = s, .accept = a };
         },
-        .uclass => return lowerUClass(b, h.uclassRanges(nd.set_idx)),
+        .uclass => return lowerUClass(b, sm, h.uclassRanges(nd.set_idx)),
         .look => {
             const s = try b.addState();
             const a = try b.addState();
@@ -471,7 +546,7 @@ fn lower(b: anytype, comptime hcap: ?usize, h: *const hir.Hir(hcap), ref: NodeRe
             // group g uses slots [2g, 2g+1]; both are kind-0 epsilons
             // (DFA-transparent) carrying the save id.
             const g: i32 = @intCast(nd.set_idx);
-            const child = try lower(b, hcap, h, nd.a);
+            const child = try lower(b, sm, hcap, h, nd.a);
             const s = try b.addState();
             const a = try b.addState();
             try b.addSaveEps(s, child.start, 2 * g);
@@ -479,14 +554,14 @@ fn lower(b: anytype, comptime hcap: ?usize, h: *const hir.Hir(hcap), ref: NodeRe
             return .{ .start = s, .accept = a };
         },
         .concat => {
-            const fa = try lower(b, hcap, h, nd.a);
-            const fb = try lower(b, hcap, h, nd.b);
+            const fa = try lower(b, sm, hcap, h, nd.a);
+            const fb = try lower(b, sm, hcap, h, nd.b);
             try b.addEps(fa.accept, fb.start);
             return .{ .start = fa.start, .accept = fb.accept };
         },
         .alt => {
-            const fl = try lower(b, hcap, h, nd.a);
-            const fr = try lower(b, hcap, h, nd.b);
+            const fl = try lower(b, sm, hcap, h, nd.a);
+            const fr = try lower(b, sm, hcap, h, nd.b);
             const s = try b.addState();
             const a = try b.addState();
             try b.addEps(s, fl.start);
@@ -496,7 +571,7 @@ fn lower(b: anytype, comptime hcap: ?usize, h: *const hir.Hir(hcap), ref: NodeRe
             return .{ .start = s, .accept = a };
         },
         .star => {
-            const child = try lower(b, hcap, h, nd.a);
+            const child = try lower(b, sm, hcap, h, nd.a);
             const s = try b.addState();
             const a = try b.addState();
             if (nd.greedy) {
@@ -513,7 +588,7 @@ fn lower(b: anytype, comptime hcap: ?usize, h: *const hir.Hir(hcap), ref: NodeRe
             return .{ .start = s, .accept = a };
         },
         .plus => {
-            const child = try lower(b, hcap, h, nd.a);
+            const child = try lower(b, sm, hcap, h, nd.a);
             const s = try b.addState();
             const a = try b.addState();
             try b.addEps(s, child.start); // ≥1 required (unconditional)
@@ -527,7 +602,7 @@ fn lower(b: anytype, comptime hcap: ?usize, h: *const hir.Hir(hcap), ref: NodeRe
             return .{ .start = s, .accept = a };
         },
         .opt => {
-            const child = try lower(b, hcap, h, nd.a);
+            const child = try lower(b, sm, hcap, h, nd.a);
             const s = try b.addState();
             const a = try b.addState();
             if (nd.greedy) {
@@ -549,7 +624,8 @@ fn lower(b: anytype, comptime hcap: ?usize, h: *const hir.Hir(hcap), ref: NodeRe
 pub fn build(comptime cap: ?usize, h: *const hir.Hir(cap)) Error!Nfa(cap) {
     if (cap == null) @compileError("runtime NFA: use thompson.buildAlloc(allocator, h)");
     var nfa = Nfa(cap){};
-    const frag = try lower(&nfa, cap, h, h.root);
+    var sm: SetMap = .{};
+    const frag = try lower(&nfa, &sm, cap, h, h.root);
     nfa.start = frag.start;
     nfa.accept = frag.accept;
     return nfa;
@@ -560,9 +636,19 @@ pub const BuildError = RtBuilder.E;
 /// Build the runtime NFA for `h.root` into exact-size heap slices (caller owns;
 /// `deinit` frees). `error.TooComplex` past the `MAX_*_RUNTIME` ceilings.
 pub fn buildAlloc(allocator: std.mem.Allocator, h: *const hir.Hir(null)) BuildError!Nfa(null) {
-    var b = RtBuilder{ .a = allocator };
+    return buildAllocBounded(allocator, h, MAX_NFA_RUNTIME);
+}
+
+/// `buildAlloc` under a caller-chosen state budget (clamped to
+/// `MAX_NFA_RUNTIME`): the lowering fails with `error.TooComplex` at the first
+/// state past it instead of constructing the whole NFA and letting the caller
+/// measure and discard it — for callers that only want an NFA up to some size
+/// (the seek prefilter's codepoint-mode cap).
+pub fn buildAllocBounded(allocator: std.mem.Allocator, h: *const hir.Hir(null), max_states: usize) BuildError!Nfa(null) {
+    var b = RtBuilder{ .a = allocator, .max_states = @min(max_states, MAX_NFA_RUNTIME) };
     defer b.deinit(); // empty after a successful `finish`
-    const frag = try lower(&b, null, h, h.root);
+    var sm: SetMap = .{};
+    const frag = try lower(&b, &sm, null, h, h.root);
     return b.finish(frag);
 }
 
@@ -575,4 +661,29 @@ test "thompson: 'ab' yields 4 states, 2 set edges, 1 eps" {
     try std.testing.expectEqual(@as(usize, 4), nfa.n_states);
     try std.testing.expectEqual(@as(usize, 3), nfa.n_edges); // setA, setB, eps
     try std.testing.expectEqual(@as(usize, 2), nfa.n_sets);
+}
+
+test "thompson: a UTF-8 class automaton interns its byte-range sets; a budgeted build stops early" {
+    const parser = @import("parser.zig");
+    const a = std.testing.allocator;
+    var h = hir.Hir(null).initRuntime();
+    defer h.deinit(a);
+    try parser.parse(null, &h, a, "\\w", .{ .unicode = true });
+    var nfa = try buildAlloc(a, &h);
+    defer nfa.deinit(a);
+    // ~1 300 edges over a few hundred distinct `[lo-hi]` ranges (was one set
+    // per edge) …
+    try std.testing.expect(nfa.n_edges > 1000);
+    try std.testing.expect(nfa.n_sets < nfa.n_edges / 2);
+    try std.testing.expectError(error.TooComplex, buildAllocBounded(a, &h, 64));
+    // … and a second copy of the class adds states and edges but no sets.
+    // (Not exactly 2× the states: the trie dedup map hashes absolute state
+    // ids, so its collisions — and a lost share or two — differ per copy.)
+    var h2 = hir.Hir(null).initRuntime();
+    defer h2.deinit(a);
+    try parser.parse(null, &h2, a, "\\w\\w", .{ .unicode = true });
+    var nfa2 = try buildAlloc(a, &h2);
+    defer nfa2.deinit(a);
+    try std.testing.expect(nfa2.n_states > nfa.n_states + nfa.n_states / 2);
+    try std.testing.expectEqual(nfa.n_sets, nfa2.n_sets);
 }

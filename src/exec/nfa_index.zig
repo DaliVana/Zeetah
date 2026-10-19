@@ -45,6 +45,22 @@ pub const EdgeIndex = struct {
         s = n;
         while (s > 0) : (s -= 1) off[s] = off[s - 1];
         off[0] = 0;
+        // Structural invariant the engines lean on (the PikeVM classifies a
+        // state by its FIRST out-edge, then advances a thread over all of
+        // them, or expands all of them as ε/look): a state's out-edges are
+        // either all byte edges or none. `thompson.lower` only emits that
+        // shape — a `.set` state carries one byte edge, a UTF-8 trie state
+        // several, every ε/look state none — and this is where it is
+        // checked, once per NFA, in safe builds.
+        if (std.debug.runtime_safety) {
+            s = 0;
+            while (s < n) : (s += 1) {
+                const es = order[off[s]..off[s + 1]];
+                if (es.len == 0) continue;
+                const consume = nfa.e_kind[es[0]] == .consume;
+                for (es) |e| std.debug.assert((nfa.e_kind[e] == .consume) == consume);
+            }
+        }
         return .{ .off = off, .order = order };
     }
 

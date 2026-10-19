@@ -210,17 +210,18 @@ pub fn build(allocator: std.mem.Allocator, h: *const H) ?*Seek {
     // modsec) keeps the filter, where the dense engine genuinely skips.
     if (properties.nonSelectiveApprox(null, &oh, oh.root)) return null;
 
-    var nfa = thompson.buildAlloc(allocator, &oh) catch return null;
-    defer nfa.deinit(allocator);
-
     // Codepoint-mode classes lower to UTF-8 automata of a few hundred states
     // each; determinizing a relaxation that holds several (the cl100k
     // tokenizer: ~2 400 NFA states) costs ~100 ms of compile time for a
     // prefilter that is near-`Σ*` anyway (measured: no match-speed change
     // without it). Keep the seek for small Unicode patterns (`\p{Greek}+…`
-    // skips whole Latin texts), skip it past this size. Byte-mode patterns
-    // never carry a `.uclass`, so their routing is untouched.
-    if (h.uclass_count > 0 and nfa.n_states > SEEK_MAX_UCLASS_NFA) return null;
+    // skips whole Latin texts), skip it past this size — applied as the
+    // build's state budget, so the lowering stops at the cap instead of
+    // constructing (and freeing) the whole relaxation first. Byte-mode
+    // patterns never carry a `.uclass`, so their routing is untouched.
+    const budget: usize = if (h.uclass_count > 0) SEEK_MAX_UCLASS_NFA else thompson.MAX_NFA_RUNTIME;
+    var nfa = thompson.buildAllocBounded(allocator, &oh, budget) catch return null;
+    defer nfa.deinit(allocator);
 
     // `$`/`\z`-anchored over-approximation: every real match must end at
     // `input.len`, so a single O(n) REVERSE pass over the relaxation is a sound

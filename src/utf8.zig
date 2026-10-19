@@ -267,6 +267,15 @@ pub const SeqIter = struct {
                     continue :outer;
                 }
             }
+            // ASCII range: one byte, one sequence. Without this the
+            // continuation split below cuts it at the 0x40 boundary
+            // (`[0B-7F]` → `[0B-3F]` + `[40-7F]`): an extra edge (and set) in
+            // every mixed class (regex-syntax's `as_ascii` shortcut).
+            if (end <= 0x7F) {
+                var seq: Seq = .{ .len = 1 };
+                seq.parts[0] = .{ .lo = @intCast(start), .hi = @intCast(end) };
+                return seq;
+            }
             // Split so each continuation-byte position spans a clean range.
             i = 1;
             while (i < 4) : (i += 1) {
@@ -434,4 +443,12 @@ test "SeqIter: sequences come out in ascending lexicographic order" {
         }
         prev = seq;
     }
+}
+
+test "SeqIter: an ASCII range is one sequence, not split at 0x40" {
+    var it = SeqIter.init(0x0B, 0x7F);
+    const s = it.next().?;
+    try testing.expectEqual(@as(u3, 1), s.len);
+    try testing.expectEqual(ByteRange{ .lo = 0x0B, .hi = 0x7F }, s.parts[0]);
+    try testing.expect(it.next() == null);
 }

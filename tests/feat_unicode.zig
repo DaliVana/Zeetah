@@ -485,3 +485,30 @@ test "(?u): comptime Pattern — small classes bake a DFA, wide ones the compile
     comptime std.debug.assert(regex.compilesWith("\\p{Greek}+", .{ .unicode = true }));
     comptime std.debug.assert(!regex.compilesWith("\\p{Greek}+", .{})); // byte mode: still rejected
 }
+
+test "(?u): counted repeats of a wide class compile; the state ceiling stays a typed error" {
+    const a = std.testing.allocator;
+    // `\w` lowers to ~330 states and ~1 300 edges; with one 32-byte set per
+    // edge, `\w{1,99}` tripped the edge/set ceilings that byte-mode `\w{1,100}`
+    // never reaches. Sets are interned per class automaton and the edge
+    // ceiling is sized for tries, so ~100 copies compile.
+    inline for (.{ "\\w{1,100}", "\\p{L}{1,100}" }) |p| {
+        var rx = try compileU(a, p);
+        defer rx.deinit();
+        var m = (try rx.find("  héllo wörld  ")).?;
+        defer m.deinit(a);
+        try std.testing.expectEqualStrings("héllo", m.slice);
+    }
+    // The 16-bit state-id ceiling remains (lazy DFA memo / backtracker).
+    try std.testing.expectError(error.PatternTooComplex, compileU(a, "\\p{L}{1,1000}"));
+}
+
+test "(?u): a class listing wide properties many times stays within the comptime work cap" {
+    // Class items are merged as they accumulate, so duplicates never pile up
+    // against the comptime `WORK_CAP` before the final normalize.
+    const p = "[\\p{L}\\p{L}\\p{L}\\p{L}\\p{L}\\p{L}\\p{L}\\p{L}\\p{L}\\p{L}]+";
+    comptime std.debug.assert(regex.compilesWith(p, .{ .unicode = true }));
+    const P = regex.Pattern(p, .{ .unicode = true });
+    try std.testing.expectEqualStrings("日本語", P.find("12 日本語 x").?.slice);
+    comptime std.debug.assert(regex.compilesWith("(?i)[\\w\\p{L}\\p{L&}]+", .{ .unicode = true }));
+}
