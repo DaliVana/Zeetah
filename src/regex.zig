@@ -965,6 +965,32 @@ pub const Regex = struct {
         return false;
     }
 
+    /// The planner's pure-literal route (`.literal`: Teddy only, no DFA table)
+    /// for a caller that has no eager table — null unless the whole pattern is
+    /// exact literal(s) the Teddy can hold. Mirrors the `.literal` arm of
+    /// `buildRegularDfa`, which never reads the table for that route either.
+    fn tryPureLiteral(allocator: std.mem.Allocator, nfa: *const thompson.Nfa(null), nheap: ?*thompson.Nfa(null), owned: []const u8, flags: common.CompileFlags, ng: usize, gnames: GNames, props: properties.Properties, a_start: bool, a_end: bool) ?Regex {
+        const strat = planner.plan(props, .{ .case_insensitive = flags.case_insensitive });
+        const seq = switch (strat) {
+            .literal => |s| s,
+            else => return null,
+        };
+        const td = core.buildLiteral(&seq) orelse return null;
+        return Regex{
+            .allocator = allocator,
+            .pattern = owned,
+            .flags = flags,
+            .kind = .literal,
+            .teddy = td,
+            .nfa = nheap,
+            .bt_a_start = a_start,
+            .bt_a_end = a_end,
+            .n_groups = ng,
+            .gnames = gnames,
+            .op_onepass = props.needs_captures and onepass.isCaptureOnePass(null, nfa),
+        };
+    }
+
     /// Regular DFA tier route: pack the eager DFA and emit a `.literal` (Teddy
     /// only) / `.reverse_suffix` / `.lit_prefix` / plain `.dfa` `Regex` per the
     /// shared `planner.resolve` route. `op_onepass` gates the zero-alloc one-pass
@@ -1154,6 +1180,13 @@ pub const Regex = struct {
 
         var d = full_dfa.compute(null, &nfa, h.anchored_start, h.anchored_end);
         if (d.outcome != .ok) {
+            // A pure literal / literal alternation whose bytes overflow the
+            // eager table (five Cyrillic names ≈ 135 bytes ⇒ 274 NFA states,
+            // past `MAX_NFA`) needs no automaton at all: Teddy is the whole
+            // engine, exactly as when the table fits. Decide that here, or the
+            // lazy fallback below would scan it as a DFA — 17x slower than the
+            // Latin alternation of the same shape.
+            if (tryPureLiteral(allocator, &nfa, nheap, owned, flags, ng, gnames, props, h.anchored_start, h.anchored_end)) |r| return withPools(r, pools);
             // Eager DFA blew the `MAX_DFA` ceiling. Fall back to the lazy
             // DFA: the *identical* subset construction evaluated on demand
             // (bit-for-bit agreement with `full_dfa` is pinned by
@@ -2463,4 +2496,52 @@ test "regex(meta): (?m)^ line scan past the backtracker's visited budget stays o
     const m = (try rx.findFrom(buf.items, 5)).?;
     try std.testing.expectEqual(@as(usize, line3), m.start);
     try std.testing.expectEqual(@as(usize, line3 + 27), m.end);
+}
+
+test "regex(meta): a literal alternation too long for the eager table still routes to Teddy" {
+    const a = std.testing.allocator;
+    const needles = [_][]const u8{ "Шерлок Холмс", "Джон Уотсон", "Ирен Адлер", "инспектор Лестрейд", "профессор Мориарти" };
+    const pat = "Шерлок Холмс|Джон Уотсон|Ирен Адлер|инспектор Лестрейд|профессор Мориарти";
+    var re = try Regex.compile(a, pat);
+    defer re.deinit();
+    try std.testing.expectEqual(MetaKind.literal, re.kind);
+    const hay = "— Джон Уотсон, — сказал Шерлок Холмс. профессор Мориарти и инспектор Лестрейд; Ирен Адлер. Шерлок";
+    // Reference: leftmost-first over the needles by hand.
+    var want: usize = 0;
+    var pos: usize = 0;
+    while (pos < hay.len) {
+        var best: ?usize = null;
+        var blen: usize = 0;
+        for (needles) |n| {
+            if (std.mem.indexOfPos(u8, hay, pos, n)) |s| {
+                if (best == null or s < best.?) {
+                    best = s;
+                    blen = n.len;
+                }
+            }
+        }
+        const s = best orelse break;
+        want += 1;
+        pos = s + blen;
+    }
+    try std.testing.expectEqual(@as(usize, 5), want);
+    try std.testing.expectEqual(want, try re.count(hay));
+    var m = (try re.find(hay)).?;
+    defer m.deinit(a);
+    try std.testing.expectEqualStrings("Джон Уотсон", m.slice);
+    try std.testing.expect(try re.isMatch("…Ирен Адлер…"));
+    try std.testing.expect(!try re.isMatch("Шерлок Холм"));
+}
+
+test "regex(meta): a (?iu) Cyrillic literal takes the lit_prefix route through its folded-class prefix" {
+    const a = std.testing.allocator;
+    var re = try Regex.compileWithFlags(a, "Шерлок Холмс", .{ .case_insensitive = true, .unicode = true });
+    defer re.deinit();
+    try std.testing.expectEqual(MetaKind.lit_prefix, re.kind);
+    const hay = "шерлок холмс, ШЕРЛОК ХОЛМС и Шерлок Холмс; шерлок холм";
+    try std.testing.expectEqual(@as(usize, 3), try re.count(hay));
+    var m = (try re.find("x ШЕРЛОК холмс y")).?;
+    defer m.deinit(a);
+    try std.testing.expectEqualStrings("ШЕРЛОК холмс", m.slice);
+    try std.testing.expect(!try re.isMatch("Шерлок  Холмс"));
 }

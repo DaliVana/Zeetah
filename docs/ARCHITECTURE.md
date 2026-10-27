@@ -93,6 +93,10 @@ Key points:
   `\p{L}` is a few hundred states rather than thousands), and the DFA tier
   never knows the difference. The backtracking tier decodes one scalar per
   class test instead (`utf8.decodeAt` + an ASCII bitmap / binary search).
+  The literal extractor (`seq_extract.zig`) expands a `.uclass` of at most
+  four scalars into its UTF-8 alternatives, so a `(?iu)` literal — each
+  letter its fold orbit, `[Шш]` — still yields a multi-needle prefix and
+  takes the Teddy-locate + DFA-verify `.lit_prefix` route.
 - **The NFA is a construction artifact.** `thompson.zig` lowers HIR to a
   Thompson NFA with ε-transitions. That NFA is then turned into a DFA by subset
   construction (in `src/exec/`); it is *not* simulated thread-by-thread at match

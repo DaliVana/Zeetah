@@ -16,6 +16,7 @@ const pf = @import("../prefilter.zig");
 const cc = @import("charclass.zig");
 const search = @import("search.zig");
 const word_set = @import("word_set.zig");
+const utf8 = @import("../utf8.zig");
 
 const NodeRef = hir.NodeRef;
 
@@ -379,6 +380,31 @@ fn smallClassSet(comptime cap: ?usize, h: *const hir.Hir(cap), set_idx: u32) ?Li
     return out;
 }
 
+/// A codepoint class of `1..SMALL_CLASS_MAX` scalars as UTF-8 alternatives,
+/// else null — the codepoint-mode peer of `smallClassSet`. Under `(?iu)` a
+/// cased letter is its simple-fold orbit (`[Шш]`, `[sSſ]`), so a
+/// case-insensitive Cyrillic literal is a concat of two-member classes: its
+/// first few letters expand into a selective multi-needle prefix and the
+/// pattern takes the Teddy-locate + DFA-verify `.lit_prefix` route instead of
+/// the prefilter-less dense scan (`(?iu)Шерлок Холмс`: 0.4 GB/s → GB/s).
+/// Bounded: the member walk stops at the `SMALL_CLASS_MAX + 1`th scalar.
+fn smallUClassSet(comptime cap: ?usize, h: *const hir.Hir(cap), idx: u32) ?LitSet {
+    var out = LitSet{};
+    for (h.uclassRanges(idx)) |r| {
+        var cp: u32 = r.lo;
+        while (cp <= r.hi) : (cp += 1) {
+            if (out.n >= SMALL_CLASS_MAX) return null;
+            var enc: [4]u8 = undefined;
+            const n = utf8.encode(@intCast(cp), &enc);
+            @memcpy(out.lits[out.n][0..n], enc[0..n]);
+            out.lens[out.n] = n;
+            out.n += 1;
+        }
+    }
+    if (out.n == 0) return null;
+    return out;
+}
+
 /// The *complete* finite set of literal strings a subtree can match, or null if
 /// it is not boundedly literal (unbounded repetition, a wide class, look,
 /// backref, or an overflow of the `MAX_ALTS`/`MAX_LIT` budget).
@@ -405,6 +431,7 @@ fn expandNode(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) ?LitSe
             litByte(b)
         else
             smallClassSet(cap, h, nd.set_idx),
+        .uclass => return smallUClassSet(cap, h, nd.set_idx),
         .concat => return concatSets(
             expandNode(cap, h, nd.a) orelse return null,
             expandNode(cap, h, nd.b) orelse return null,
@@ -415,7 +442,7 @@ fn expandNode(comptime cap: ?usize, h: *const hir.Hir(cap), ref: NodeRef) ?LitSe
         ),
         .opt => return unionSets(litEmpty(), expandNode(cap, h, nd.a) orelse return null),
         .cap, .atomic => return expandNode(cap, h, nd.a), // transparent
-        .star, .plus, .look, .look_around, .backref, .uclass => return null,
+        .star, .plus, .look, .look_around, .backref => return null,
     }
 }
 
@@ -1219,4 +1246,19 @@ test "seq_extract: cross-product over budget stops with the prefix so far" {
     try std.testing.expectEqual(@as(u8, 8), p.n);
     try std.testing.expect(!p.exact);
     try std.testing.expectEqual(@as(usize, 3), p.minLen());
+}
+
+test "seq_extract: (?iu) codepoint classes expand into a multi-needle prefix" {
+    const parser = @import("../parser.zig");
+    const H = hir.Hir(256);
+    var h = H.initComptime();
+    try parser.parse(256, &h, undefined, "Шерлок Холмс", .{ .ci = true, .unicode = true });
+    const p = prefix(256, &h);
+    // 3 letters × 2 cases = 8 alternatives of 6 bytes; the 4th letter would
+    // overflow MAX_ALTS, so the prefix is inexact (the DFA verifies the rest).
+    try std.testing.expectEqual(@as(u8, 8), p.n);
+    try std.testing.expect(!p.exact);
+    try std.testing.expectEqual(@as(usize, 6), p.minLen());
+    try std.testing.expectEqualStrings("ШЕР", p.alt(0));
+    try std.testing.expectEqualStrings("шер", p.alt(7));
 }

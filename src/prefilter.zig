@@ -19,6 +19,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const common = @import("common.zig");
 const simd = @import("simd.zig");
+const utf8 = @import("utf8.zig");
 
 /// Vector lane count, chosen per target at comptime. `orelse 16` guards
 /// targets where the query returns null (128-bit baseline).
@@ -575,6 +576,58 @@ inline fn tileTable(m: [16]u8) VT {
     return out;
 }
 
+/// Probe pair for a non-ASCII-dominant single needle (at least half its bytes
+/// ≥ 0x80: a Cyrillic / Greek / CJK literal), or null to keep the ASCII
+/// scheme. `FREQ` rates every non-ASCII byte as rare and `robustlyRareProbe`
+/// would memchr one of them, but in text of that script the lead bytes
+/// (`D0`/`D1` for Cyrillic) are the commonest bytes of all, and a
+/// continuation byte recurs with its letter's frequency — `Шерлок Холмс`
+/// ran at 6 GB/s against 16 GB/s for its Latin peer. Two continuation bytes
+/// ANDed at fixed offsets are selective (each pins one letter within its
+/// block): the last byte of the two rarest scalars — uppercase letters first
+/// (a scalar that is its own fold canon with a non-empty orbit: rare in
+/// running text of any cased script), then the earliest and, for the second,
+/// the latest (spread apart). Scalar and comptime-evaluable.
+fn nonAsciiProbes(nd: []const u8) ?struct { o1: u8, o2: u8 } {
+    var non_ascii: usize = 0;
+    for (nd) |b| non_ascii += @intFromBool(b >= 0x80);
+    if (non_ascii * 2 < nd.len) return null;
+    const Cand = struct { off: usize, score: u8 };
+    var best: ?Cand = null;
+    var i: usize = 0;
+    while (i < nd.len) {
+        const d = utf8.decodeAt(nd, i) orelse {
+            i += 1;
+            continue;
+        };
+        const len: usize = d.len;
+        if (len >= 2) {
+            const upper = utf8.foldOrbit(d.cp).len > 0 and utf8.foldCanon(d.cp) == d.cp;
+            const c = Cand{ .off = i + len - 1, .score = if (upper) 0 else 1 };
+            if (best == null or c.score < best.?.score) best = c;
+        }
+        i += len;
+    }
+    const a = best orelse return null;
+    var second: ?Cand = null;
+    i = 0;
+    while (i < nd.len) {
+        const d = utf8.decodeAt(nd, i) orelse {
+            i += 1;
+            continue;
+        };
+        const len: usize = d.len;
+        if (len >= 2 and i + len - 1 != a.off) {
+            const upper = utf8.foldOrbit(d.cp).len > 0 and utf8.foldCanon(d.cp) == d.cp;
+            const c = Cand{ .off = i + len - 1, .score = if (upper) 0 else 1 };
+            if (second == null or c.score < second.?.score or (c.score == second.?.score and c.off > second.?.off)) second = c;
+        }
+        i += len;
+    }
+    const b = second orelse return null;
+    return .{ .o1 = @intCast(@min(a.off, b.off)), .o2 = @intCast(@max(a.off, b.off)) };
+}
+
 pub const Teddy = struct {
     pub const MAX_NEEDLES: usize = 8;
     pub const MAX_LEN: usize = 64;
@@ -585,9 +638,14 @@ pub const Teddy = struct {
     first: [32]u8 = @splat(0),
 
     // --- two-byte filter (rare-byte heuristic), one entry per needle ---
-    /// First byte of needle w (== pat[w][0]); kept explicit so the hot loop
-    /// never indexes `pat`.
+    /// First probe byte of needle w: `pat[w][o1[w]]` — byte 0, except for a
+    /// non-ASCII single needle (see `nonAsciiProbes`); kept explicit so the
+    /// hot loop never indexes `pat`.
     b1: [MAX_NEEDLES]u8 = @splat(0),
+    /// Offset of `b1` within needle w: 0 unless `nonAsciiProbes` chose a
+    /// continuation-byte pair (single needle only — the multi-needle filters
+    /// and `first` always key on byte 0).
+    o1: [MAX_NEEDLES]u8 = @splat(0),
     /// The statistically rarest byte within needle w (by `FREQ`).
     b2: [MAX_NEEDLES]u8 = @splat(0),
     /// Offset of `b2` within needle w. `0` sentinel when len==1 (unused).
@@ -700,6 +758,18 @@ pub const Teddy = struct {
                 }
                 t.o[i] = @intCast(best);
                 t.b2[i] = nd[best];
+                // A non-ASCII single needle swaps both probes for a
+                // continuation-byte pair (its lead bytes are the commonest
+                // bytes of its script, not rare ones) and stays on the
+                // two-byte SIMD filter.
+                if (needles.len == 1 and folds == null) {
+                    if (nonAsciiProbes(nd)) |pr| {
+                        t.o1[i] = pr.o1;
+                        t.b1[i] = nd[pr.o1];
+                        t.o[i] = pr.o2;
+                        t.b2[i] = nd[pr.o2];
+                    }
+                }
             } else {
                 ge2 = false;
                 t.o[i] = 0;
@@ -709,7 +779,7 @@ pub const Teddy = struct {
         }
         t.n = @intCast(needles.len);
         t.all_ge2 = ge2;
-        t.one_memchr = !t.folded and t.n == 1 and t.len[0] >= 2 and robustlyRareProbe(t.b2[0]);
+        t.one_memchr = !t.folded and t.n == 1 and t.len[0] >= 2 and t.o1[0] == 0 and robustlyRareProbe(t.b2[0]);
 
         // Adaptive prefix depth: start at the Slim-Teddy base, then deepen
         // while some needle pair shares the whole nm-byte prefix (the filter
@@ -762,7 +832,7 @@ pub const Teddy = struct {
             t.splat_b1[k] = @splat(t.b1[k]);
             t.splat_b2[k] = @splat(t.b2[k]);
             t.splat_bit[k] = @splat(@as(u8, 1) << @as(u3, @intCast(k)));
-            if (t.o[k] > t.maxo) t.maxo = t.o[k];
+            t.maxo = @max(t.maxo, @max(t.o[k], t.o1[k]));
         }
         for (0..t.nmask) |j| {
             t.tlv[j] = tileTable(t.mask_lo[j]);
@@ -855,18 +925,21 @@ pub const Teddy = struct {
         return null;
     }
 
-    /// Original two-byte SIMD filter (first byte AND rare byte at offset `o`),
-    /// then declared-order verify. Kept for single needles whose probe byte is
-    /// *common* (`one_memchr == false`): ANDing two byte tests stays selective
-    /// even when each byte alone is frequent, where a single-byte memchr would
-    /// stop at every occurrence and storm the verifier.
+    /// Original two-byte SIMD filter (probe `b1` at offset `o1` — byte 0
+    /// unless `nonAsciiProbes` chose otherwise — AND rare byte `b2` at offset
+    /// `o`), then declared-order verify. Kept for single needles whose probe
+    /// byte is *common* (`one_memchr == false`): ANDing two byte tests stays
+    /// selective even when each byte alone is frequent, where a single-byte
+    /// memchr would stop at every occurrence and storm the verifier.
     fn findOneSimd(self: *const Teddy, input: []const u8, pos: usize) ?Hit {
+        const o1: usize = self.o1[0];
         const o: usize = self.o[0];
+        const om: usize = @max(o1, o);
         const f: V = self.splat_b1[0];
         const s2: V = self.splat_b2[0];
         var i = pos;
-        while (i + o + VLEN <= input.len) : (i += VLEN) {
-            const c0: V = input[i..][0..VLEN].*;
+        while (i + om + VLEN <= input.len) : (i += VLEN) {
+            const c0: V = input[i + o1 ..][0..VLEN].*;
             const c1: V = input[i + o ..][0..VLEN].*;
             const cand: V = maskOf(c0 == f) & maskOf(c1 == s2);
             if (@reduce(.Or, cand) != 0) {
@@ -1508,5 +1581,44 @@ test "literal-alt scanner: leftmost-first over prefixes and substrings" {
             pos = m.end;
         }
         try std.testing.expectEqual(@as(usize, 4), n);
+    }
+}
+
+test "teddy: a non-ASCII single needle probes two continuation bytes, never memchr on a lead byte" {
+    const nd = "Шерлок Холмс";
+    const t = Teddy.build(&[_][]const u8{nd}).?;
+    try std.testing.expect(!t.one_memchr);
+    try std.testing.expect(t.o1[0] != t.o[0]);
+    try std.testing.expect(nd[t.o1[0]] >= 0x80 and nd[t.o1[0]] < 0xC0);
+    try std.testing.expect(nd[t.o[0]] >= 0x80 and nd[t.o[0]] < 0xC0);
+    // Uppercase letters first: Ш (last byte at 1) and Х (last byte at 14).
+    try std.testing.expectEqual(@as(u8, 1), t.o1[0]);
+    try std.testing.expectEqual(@as(u8, 14), t.o[0]);
+    // ASCII needles keep the first-byte scheme.
+    const ta = Teddy.build(&[_][]const u8{"Sherlock Holmes"}).?;
+    try std.testing.expectEqual(@as(u8, 0), ta.o1[0]);
+    // Every occurrence is found, at any alignment, against std's memmem.
+    const words = [_][]const u8{ "Шерлок Холмс", "шерлок холмс", "Шерлок", "Холмс", " ", "Джон Уотсон", "ШЕРЛОК ХОЛМС", "夏洛克", "x", "Шерлок ХолмсШерлок Холмс" };
+    var prng = std.Random.DefaultPrng.init(0x5E1);
+    const r = prng.random();
+    var buf: [1024]u8 = undefined;
+    for (0..300) |_| {
+        var n: usize = 0;
+        const len = r.uintLessThan(usize, buf.len);
+        while (n < len) {
+            const w = words[r.uintLessThan(usize, words.len)];
+            const k = @min(w.len, len - n);
+            @memcpy(buf[n .. n + k], w[0..k]);
+            n += k;
+        }
+        const hay = buf[0..len];
+        var pos: usize = 0;
+        while (true) {
+            const want = std.mem.indexOfPos(u8, hay, pos, nd);
+            const got = t.find(hay, pos);
+            try std.testing.expectEqual(want, if (got) |g| g.start else null);
+            const s = want orelse break;
+            pos = s + 1;
+        }
     }
 }
